@@ -97,7 +97,7 @@ void Tests::runTrainingWriteTests() {
     botSpec.nnEval = nnEval;
     botSpec.baseParams = params;
 
-    Board initialBoard(boardXLen,boardYLen);
+    Board initialBoard(boardXLen,boardYLen,rules);
     Player initialPla = P_BLACK;
     int initialEncorePhase = 0;
     BoardHistory initialHist(initialBoard,initialPla,rules,initialEncorePhase);
@@ -226,7 +226,7 @@ void Tests::runSelfplayInitTestsWithNN(const string& modelFile) {
     botSpec.nnEval = nnEval;
     botSpec.baseParams = params;
 
-    Board initialBoard(11,11);
+    Board initialBoard(11,11,rules);
     Player initialPla = P_BLACK;
     int initialEncorePhase = 0;
     BoardHistory initialHist(initialBoard,initialPla,rules,initialEncorePhase);
@@ -407,7 +407,7 @@ void Tests::runMoreSelfplayTestsWithNN(const string& modelFile) {
     botSpec.nnEval = nnEval;
     botSpec.baseParams = params;
 
-    Board initialBoard(11,11);
+    Board initialBoard(11,11,rules);
     Player initialPla = P_BLACK;
     int initialEncorePhase = 0;
     if(testHint) {
@@ -587,7 +587,7 @@ void Tests::runMoreSelfplayTestsWithNN(const string& modelFile) {
     botSpec.nnEval = nnEval;
     botSpec.baseParams = params;
 
-    Board initialBoard(11,11);
+    Board initialBoard(11,11,rules);
     Player initialPla = P_BLACK;
     int initialEncorePhase = 0;
     BoardHistory initialHist(initialBoard,initialPla,rules,initialEncorePhase);
@@ -1009,10 +1009,9 @@ xxxxxxxx.
     vector<Move> moves = sgf->moves;
 
     Rules initialRules = Rules::parseRules("chinese");
-    Board board;
     Player nextPla;
-    BoardHistory hist;
-    sgf->setupInitialBoardAndHist(initialRules, board, nextPla, hist);
+    BoardHistory hist = sgf->setupInitialBoardAndHist(initialRules, nextPla);
+    Board board = hist.initialBoard;
     for(size_t i = 0; i<moves.size(); i++) {
       if(i % 10 == 0) {
         bool doEndGameIfAllPassAlive = true;
@@ -1148,7 +1147,7 @@ xxxxxxxx.
       TrainingDataWriter dataWriter(&cout,inputsVersion, maxRows, firstFileMinRandProp, 9, 9, debugOnlyWriteEvery, seed);
 
       Sgf::PositionSample startPosSample;
-      startPosSample.board = Board(9,9);
+      startPosSample.board = Board(9,9,rules);
       startPosSample.nextPla = P_BLACK;
       startPosSample.moves = std::vector<Move>();
       startPosSample.initialTurnNumber = 0;
@@ -1179,7 +1178,7 @@ xxxxxxxx.
       TrainingDataWriter dataWriter(&cout,inputsVersion, maxRows, firstFileMinRandProp, 9, 9, debugOnlyWriteEvery, seed);
 
       Sgf::PositionSample startPosSample;
-      startPosSample.board = Board(9,9);
+      startPosSample.board = Board(9,9,rules);
       startPosSample.nextPla = P_BLACK;
       startPosSample.moves = std::vector<Move>();
       startPosSample.initialTurnNumber = 40;
@@ -2251,7 +2250,7 @@ void Tests::runSelfplayStatTestsWithNN(const string& modelFile) {
     playSettings.forSelfPlay = true;
 
     Sgf::PositionSample startPosSample;
-    startPosSample.board = Board(19,19);
+    startPosSample.board = Board(19,19,Rules::DEFAULT_GO);
     startPosSample.nextPla = P_BLACK;
     startPosSample.moves = std::vector<Move>();
     startPosSample.initialTurnNumber = 0;
@@ -2303,7 +2302,7 @@ void Tests::runSelfplayStatTestsWithNN(const string& modelFile) {
     playSettings.forSelfPlay = true;
 
     Sgf::PositionSample startPosSample;
-    startPosSample.board = Board(19,19);
+    startPosSample.board = Board(19,19,Rules::DEFAULT_GO);
     startPosSample.nextPla = P_BLACK;
     startPosSample.moves = std::vector<Move>();
     startPosSample.initialTurnNumber = 0;
@@ -2457,7 +2456,7 @@ oox.x....
     playSettings.forSelfPlay = true;
 
     Sgf::PositionSample startPosSample;
-    startPosSample.board = Board(19,19);
+    startPosSample.board = Board(19,19,Rules::DEFAULT_GO);
     startPosSample.nextPla = P_BLACK;
     startPosSample.moves = std::vector<Move>({
         Move(Location::getLoc(3,3,19),P_BLACK),
@@ -2512,7 +2511,7 @@ oox.x....
     playSettings.forSelfPlay = true;
 
     Sgf::PositionSample startPosSample;
-    startPosSample.board = Board(19,19);
+    startPosSample.board = Board(19,19,Rules::DEFAULT_GO);
     startPosSample.nextPla = P_BLACK;
     startPosSample.moves = std::vector<Move>({
         Move(Location::getLoc(3,3,19),P_BLACK),
@@ -2566,7 +2565,7 @@ oox.x....
     playSettings.forSelfPlay = true;
 
     Sgf::PositionSample startPosSample;
-    startPosSample.board = Board(19,19);
+    startPosSample.board = Board(19,19,Rules::DEFAULT_GO);
     startPosSample.nextPla = P_BLACK;
     startPosSample.moves = std::vector<Move>({
         Move(Location::getLoc(3,3,19),P_BLACK),
@@ -2621,7 +2620,7 @@ oox.x....
     playSettings.forSelfPlay = true;
 
     Sgf::PositionSample startPosSample;
-    startPosSample.board = Board(19,19);
+    startPosSample.board = Board(19,19,Rules::DEFAULT_GO);
     startPosSample.nextPla = P_BLACK;
     startPosSample.moves = std::vector<Move>({
         Move(Location::getLoc(3,3,19),P_BLACK),
@@ -2679,7 +2678,7 @@ oox.x....
     playSettings.forSelfPlay = true;
 
     Sgf::PositionSample startPosSample;
-    startPosSample.board = Board(19,19);
+    startPosSample.board = Board(19,19,Rules::DEFAULT_GO);
     startPosSample.nextPla = P_BLACK;
     startPosSample.moves = std::vector<Move>();
     startPosSample.initialTurnNumber = 0;
@@ -2766,16 +2765,14 @@ void Tests::runSekiTrainWriteTests(const string& modelFile) {
     botSpec.baseParams = params;
 
     CompactSgf* sgf = CompactSgf::parse(sgfStr);
-    Board initialBoard;
     Player initialPla;
-    BoardHistory initialHist;
 
     ExtraBlackAndKomi extraBlackAndKomi;
     extraBlackAndKomi.extraBlack = 0;
     extraBlackAndKomi.komiMean = rules.komi;
     extraBlackAndKomi.komiStdev = 0;
     int turnIdx = (int)sgf->moves.size();
-    sgf->setupBoardAndHistAssumeLegal(rules,initialBoard,initialPla,initialHist,turnIdx);
+    auto [initialHist, initialBoard] = sgf->setupBoardAndHistAssumeLegal(rules, initialPla, turnIdx);
 
     bool doEndGameIfAllPassAlive = true;
     bool clearBotAfterSearch = true;

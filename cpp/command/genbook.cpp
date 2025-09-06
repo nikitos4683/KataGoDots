@@ -355,7 +355,7 @@ int MainCmds::genbook(const vector<string>& args) {
   std::map<BookHash,double> expandBonusByHash;
   std::map<BookHash,double> visitsRequiredByHash;
   std::map<BookHash,int> branchRequiredByHash;
-  Board bonusInitialBoard;
+  Board bonusInitialBoard(rules);
   Player bonusInitialPla;
 
   maybeParseBonusFile(
@@ -1526,7 +1526,7 @@ int MainCmds::writebook(const vector<string>& args) {
   std::map<BookHash,double> expandBonusByHash;
   std::map<BookHash,double> visitsRequiredByHash;
   std::map<BookHash,int> branchRequiredByHash;
-  Board bonusInitialBoard;
+  Board bonusInitialBoard(rules);
   Player bonusInitialPla;
 
   maybeParseBonusFile(

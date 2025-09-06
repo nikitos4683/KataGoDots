@@ -424,7 +424,8 @@ int MainCmds::analysis(const vector<string>& args) {
   vector<AsyncBot*> bots;
   for(int threadIdx = 0; threadIdx<numAnalysisThreads; threadIdx++) {
     string searchRandSeed = Global::uint64ToHexString(seedRand.nextUInt64()) + Global::uint64ToHexString(seedRand.nextUInt64());
-    AsyncBot* bot = new AsyncBot(defaultParams, nnEval, humanEval, &logger, searchRandSeed);
+    // TODO: Fix for Dots game
+    AsyncBot* bot = new AsyncBot(defaultParams, nnEval, humanEval, &logger, searchRandSeed, Rules::DEFAULT_GO);
     bot->setCopyOfExternalPatternBonusTable(patternBonusTable);
     threads.push_back(std::thread(analysisLoopProtected,bot,threadIdx));
     bots.push_back(bot);
@@ -1103,8 +1104,7 @@ int MainCmds::analysis(const vector<string>& args) {
           continue;
       }
 
-
-      Board board(boardXSize,boardYSize);
+      Board board(boardXSize,boardYSize,rules);
       for(int i = 0; i<placements.size(); i++) {
         board.setStone(placements[i].loc,placements[i].pla);
       }

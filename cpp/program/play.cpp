@@ -15,8 +15,8 @@ using namespace std;
 
 //----------------------------------------------------------------------------------------------------------
 
-InitialPosition::InitialPosition()
-  :board(),hist(),pla(C_EMPTY)
+InitialPosition::InitialPosition(const Rules& rules)
+  :board(rules),hist(rules),pla(C_EMPTY)
 {}
 InitialPosition::InitialPosition(const Board& b, const BoardHistory& h, Player p, bool plainFork, bool sekiFork, bool hintFork, double tw)
   :board(b),hist(h),pla(p),isPlainFork(plainFork),isSekiFork(sekiFork),isHintFork(hintFork),trainingWeight(tw)
@@ -483,6 +483,9 @@ int GameInitializer::getMaxBoardXSize() const {
 }
 int GameInitializer::getMaxBoardYSize() const {
   return maxBoardYSize;
+}
+bool GameInitializer::isDotsGame() const {
+  return dotsGame;
 }
 
 Rules GameInitializer::createRules() {
@@ -1339,7 +1342,7 @@ FinishedGameData* Play::runGame(
   std::function<NNEvaluator*()> checkForNewNNEval,
   std::function<void(const Board&, const BoardHistory&, Player, Loc, const std::vector<double>&, const std::vector<double>&, const std::vector<double>&, const Search*)> onEachMove
 ) {
-  FinishedGameData* gameData = new FinishedGameData();
+  FinishedGameData* gameData = new FinishedGameData(startHist.rules);
 
   Board board(startBoard);
   BoardHistory hist(startHist);
@@ -2199,10 +2202,11 @@ void Play::maybeForkGame(
     ASSERT_UNREACHABLE;
   }
 
-  Board board;
+  const Rules& rules = finishedGameData->startHist.rules;
+  Board board(rules);
   Player pla;
-  BoardHistory hist;
-  replayGameUpToMove(finishedGameData, moveIdx, finishedGameData->startHist.rules, board, hist, pla);
+  BoardHistory hist(rules);
+  replayGameUpToMove(finishedGameData, moveIdx, rules, board, hist, pla);
   //Just in case if somehow the game is over now, don't actually do anything
   if(hist.isGameFinished)
     return;
@@ -2287,9 +2291,9 @@ void Play::maybeSekiForkGame(
       Rules rules = finishedGameData->startHist.rules;
       rules = gameInit->randomizeScoringAndTaxRules(rules,gameRand);
 
-      Board board;
+      Board board(rules);
       Player pla;
-      BoardHistory hist;
+      BoardHistory hist(rules);
       replayGameUpToMove(finishedGameData, moveIdx, rules, board, hist, pla);
       //Just in case if somehow the game is over now, don't actually do anything
       if(hist.isGameFinished)
@@ -2319,12 +2323,13 @@ void Play::maybeHintForkGame(
   if(!hintFork)
     return;
 
-  Board board;
+  const Rules& rules = finishedGameData->startHist.rules;
+  Board board(rules);
   Player pla;
-  BoardHistory hist;
+  BoardHistory hist(rules);
   testAssert(finishedGameData->startHist.moveHistory.size() < 0x1FFFffff);
   int moveIdxToReplayTo = (int)finishedGameData->startHist.moveHistory.size();
-  replayGameUpToMove(finishedGameData, moveIdxToReplayTo, finishedGameData->startHist.rules, board, hist, pla);
+  replayGameUpToMove(finishedGameData, moveIdxToReplayTo, rules, board, hist, pla);
   //Just in case if somehow the game is over now, don't actually do anything
   if(hist.isGameFinished)
     return;
@@ -2408,9 +2413,10 @@ FinishedGameData* GameRunner::runGame(
     }
   }
 
-  Board board;
+  const Rules& rules = Rules::getDefault(gameInit->isDotsGame());
+  Board board(rules);
   Player pla;
-  BoardHistory hist;
+  BoardHistory hist(rules);
   ExtraBlackAndKomi extraBlackAndKomi;
   OtherGameProperties otherGameProps;
   if(playSettings.forSelfPlay) {
@@ -2451,12 +2457,12 @@ FinishedGameData* GameRunner::runGame(
   Search* botB;
   Search* botW;
   if(botSpecB.botIdx == botSpecW.botIdx) {
-    botB = new Search(botSpecB.baseParams, botSpecB.nnEval, &logger, seed, hist.rules.isDots);
+    botB = new Search(botSpecB.baseParams, botSpecB.nnEval, &logger, seed, hist.rules);
     botW = botB;
   }
   else {
-    botB = new Search(botSpecB.baseParams, botSpecB.nnEval, &logger, seed + "@B", hist.rules.isDots);
-    botW = new Search(botSpecW.baseParams, botSpecW.nnEval, &logger, seed + "@W", hist.rules.isDots);
+    botB = new Search(botSpecB.baseParams, botSpecB.nnEval, &logger, seed + "@B", hist.rules);
+    botW = new Search(botSpecW.baseParams, botSpecW.nnEval, &logger, seed + "@W", hist.rules);
   }
   if(afterInitialization != nullptr) {
     if(botSpecB.botIdx == botSpecW.botIdx) {

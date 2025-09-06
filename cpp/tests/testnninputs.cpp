@@ -128,12 +128,11 @@ void Tests::runNNInputsV3V4Tests() {
 
     for(int version = minVersion; version <= maxVersion; version++) {
       cout << "VERSION " << version << endl;
-      Board board;
       Player nextPla;
-      BoardHistory hist;
       Rules initialRules = Rules::getTrompTaylorish();
       initialRules = sgf->getRulesOrFailAllowUnspecified(initialRules);
-      sgf->setupInitialBoardAndHist(initialRules, board, nextPla, hist);
+      BoardHistory hist = sgf->setupInitialBoardAndHist(initialRules, nextPla);
+      Board board = hist.initialBoard;
       vector<Move>& moves = sgf->moves;
 
       for(size_t i = 0; i<moves.size(); i++) {
@@ -190,12 +189,11 @@ void Tests::runNNInputsV3V4Tests() {
 
     for(int version = minVersion; version <= maxVersion; version++) {
       cout << "VERSION " << version << endl;
-      Board board;
       Player nextPla;
-      BoardHistory hist;
       Rules initialRules = Rules::getTrompTaylorish();
       initialRules = sgf->getRulesOrFailAllowUnspecified(initialRules);
-      sgf->setupInitialBoardAndHist(initialRules, board, nextPla, hist);
+      BoardHistory hist = sgf->setupInitialBoardAndHist(initialRules, nextPla);
+      Board board = hist.initialBoard;
       vector<Move>& moves = sgf->moves;
 
       for(size_t i = 0; i<moves.size(); i++) {
@@ -251,12 +249,11 @@ void Tests::runNNInputsV3V4Tests() {
 
     for(int version = minVersion; version <= maxVersion; version++) {
       cout << "VERSION " << version << endl;
-      Board board;
       Player nextPla;
-      BoardHistory hist;
       Rules initialRules = Rules::getTrompTaylorish();
       initialRules = sgf->getRulesOrFailAllowUnspecified(initialRules);
-      sgf->setupInitialBoardAndHist(initialRules, board, nextPla, hist);
+      BoardHistory hist =  sgf->setupInitialBoardAndHist(initialRules, nextPla);
+      Board board = hist.initialBoard;
       vector<Move>& moves = sgf->moves;
 
       for(size_t i = 0; i<moves.size(); i++) {
@@ -311,12 +308,11 @@ void Tests::runNNInputsV3V4Tests() {
 
     for(int version = minVersion; version <= maxVersion; version++) {
       cout << "VERSION " << version << endl;
-      Board board;
       Player nextPla;
-      BoardHistory hist;
       Rules initialRules = Rules::getTrompTaylorish();
       initialRules = sgf->getRulesOrFailAllowUnspecified(initialRules);
-      sgf->setupInitialBoardAndHist(initialRules, board, nextPla, hist);
+      BoardHistory hist = sgf->setupInitialBoardAndHist(initialRules, nextPla);
+      Board board = hist.initialBoard;
       vector<Move>& moves = sgf->moves;
 
       for(size_t i = 0; i<moves.size(); i++) {
@@ -433,7 +429,6 @@ xxx..xx
     cout << "-----------------------------------------------------------------" <<  endl;
 
     for(int size = 7; size >= 6; size--) {
-      Board board = Board(size,size);
       Player nextPla = P_BLACK;
 
       vector<Rules> rules = {
@@ -533,7 +528,9 @@ xxx..xx
           for(int c = 0; c<numFeaturesGlobal; c++) {
             for(int j = 0; j<24; j++) {
               testAssert(i + j < rules.size());
-              BoardHistory hist(board,nextPla,rules[i+j],0);
+              const Rules& currentRules = rules[i+j];
+              Board board = Board(size,size,currentRules);
+              BoardHistory hist(board,nextPla,currentRules,0);
               bool inputsUseNHWC = true;
               MiscNNInputParams nnInputParams;
               nnInputParams.drawEquivalentWinsForWhite = drawEquivalentWinsForWhite;
@@ -569,12 +566,11 @@ xxx..xx
       if(version == 5)
         continue;
       cout << "VERSION " << version << endl;
-      Board board;
       Player nextPla;
-      BoardHistory hist;
       Rules initialRules = Rules(Rules::KO_SIMPLE, Rules::SCORING_TERRITORY, Rules::TAX_SEKI, false, false, Rules::WHB_ZERO, false, 0.0f);
       initialRules = sgf->getRulesOrFailAllowUnspecified(initialRules);
-      sgf->setupInitialBoardAndHist(initialRules, board, nextPla, hist);
+      BoardHistory hist = sgf->setupInitialBoardAndHist(initialRules, nextPla);
+      Board board = hist.initialBoard;
 
       int nnXLen = 6;
       int nnYLen = 6;
@@ -647,12 +643,11 @@ xxx..xx
       if(version == 5)
         continue;
       cout << "VERSION " << version << endl;
-      Board board;
       Player nextPla;
-      BoardHistory hist;
       Rules initialRules;
       initialRules = sgf->getRulesOrFailAllowUnspecified(initialRules);
-      sgf->setupInitialBoardAndHist(initialRules, board, nextPla, hist);
+      BoardHistory hist = sgf->setupInitialBoardAndHist(initialRules, nextPla);
+      Board board = hist.initialBoard;
       vector<Move>& moves = sgf->moves;
 
       int nnXLen = 13;
@@ -825,9 +820,9 @@ o.xoo.x
       float* rowGlobal;
       allocateRows(version,nnXLen,nnYLen,numFeaturesBin,numFeaturesGlobal,rowBin,rowGlobal);
 
-      Board board = Board(9,1);
       Player nextPla = P_BLACK;
       Rules initialRules = Rules::getSimpleTerritory();
+      Board board = Board(9,1,initialRules);
       BoardHistory hist(board,nextPla,initialRules,0);
 
       auto run = [&](bool inputsUseNHWC) {
@@ -907,9 +902,9 @@ o.xoo.x
       };
 
       for(int i = 0; i<rules.size(); i++) {
-        Board board = Board(size,size);
         Player nextPla = P_BLACK;
-        Rules initialRules = rules[i];
+        const Rules& initialRules = rules[i];
+        Board board = Board(size,size,initialRules);
         BoardHistory hist(board,nextPla,initialRules,0);
         cout << "----------------------------------------" << endl;
         cout << "Black makes 3 moves in a row" << endl;
@@ -1344,11 +1339,10 @@ ooxooxo
             cout << "rules " << rulesToUse.toString() << endl;
             cout << "enablePassingHacks " << enablePassingHacks << " conservativePassAndIsRoot " << conservativePassAndIsRoot << endl;
             cout << "VERSION " << version << endl;
-            Board board;
             Player nextPla;
-            BoardHistory hist;
             Rules rules = sgf->getRulesOrFailAllowUnspecified(rulesToUse);
-            sgf->setupInitialBoardAndHist(rules, board, nextPla, hist);
+            BoardHistory hist = sgf->setupInitialBoardAndHist(rules, nextPla);
+            Board board = hist.initialBoard;
 
             int nnXLen = 9;
             int nnYLen = 9;

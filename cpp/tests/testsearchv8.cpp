@@ -22,11 +22,9 @@ static void runV8TestsSize9(NNEvaluator* nnEval, NNEvaluator* nnEval9, NNEvaluat
     string sgfStr = "(;FF[4]GM[1]SZ[9]HA[0]KM[7]RU[stonescoring];B[ef];W[ed];B[ge])";
     CompactSgf* sgf = CompactSgf::parse(sgfStr);
 
-    Board board;
     Player nextPla;
-    BoardHistory hist;
     Rules initialRules = sgf->getRulesOrFail();
-    sgf->setupBoardAndHistAssumeLegal(initialRules, board, nextPla, hist, 3);
+    auto [hist, board] = sgf->setupBoardAndHistAssumeLegal(initialRules, nextPla, 3);
 
     SearchParams params = SearchParams::forTestsV1();
     params.maxVisits = 200;
@@ -59,11 +57,9 @@ static void runV8TestsRandomSym(NNEvaluator* nnEval, NNEvaluator* nnEval19Exact,
     string sgfStr = "(;GM[1]FF[4]CA[UTF-8]RU[Japanese]SZ[19]KM[6.5];B[dd];W[qd];B[pq];W[dp];B[oc];W[pe];B[fq];W[jp];B[ph];W[cf];B[ck])";
     CompactSgf* sgf = CompactSgf::parse(sgfStr);
 
-    Board board;
     Player nextPla;
-    BoardHistory hist;
     Rules initialRules = sgf->getRulesOrFail();
-    sgf->setupBoardAndHistAssumeLegal(initialRules, board, nextPla, hist, 11);
+    auto [hist, board] = sgf->setupBoardAndHistAssumeLegal(initialRules, nextPla, 11);
 
     SearchParams params = SearchParams::forTestsV1();
     params.maxVisits = 200;
@@ -94,11 +90,9 @@ static void runV8TestsRandomSym(NNEvaluator* nnEval, NNEvaluator* nnEval19Exact,
     string sgfStr = "(;GM[1]FF[4]CA[UTF-8]RU[Japanese]SZ[19]KM[6.5];B[dd];W[qd];B[od];W[pq];B[dq];W[do];B[eo];W[oe])";
     CompactSgf* sgf = CompactSgf::parse(sgfStr);
 
-    Board board;
     Player nextPla;
-    BoardHistory hist;
     Rules initialRules = sgf->getRulesOrFail();
-    sgf->setupBoardAndHistAssumeLegal(initialRules, board, nextPla, hist, 8);
+    auto [hist, board] = sgf->setupBoardAndHistAssumeLegal(initialRules, nextPla, 8);
 
     SearchParams params = SearchParams::forTestsV1();
     params.rootNumSymmetriesToSample = 8;
@@ -130,11 +124,9 @@ static void runV8TestsRandomSym(NNEvaluator* nnEval, NNEvaluator* nnEval19Exact,
     string sgfStr = "(;GM[1]FF[4]CA[UTF-8]RU[AGA]SZ[19]KM[7.0];B[dd];W[pd];B[dp];W[pp];B[qc];W[qd];B[pc];W[nc];B[nb])";
     CompactSgf* sgf = CompactSgf::parse(sgfStr);
 
-    Board board;
     Player nextPla;
-    BoardHistory hist;
     Rules initialRules = sgf->getRulesOrFail();
-    sgf->setupBoardAndHistAssumeLegal(initialRules, board, nextPla, hist, 8);
+    auto [hist, board] = sgf->setupBoardAndHistAssumeLegal(initialRules, nextPla, 8);
 
     SearchParams paramsA = SearchParams::forTestsV1();
     SearchParams paramsB = SearchParams::forTestsV1();
@@ -532,11 +524,9 @@ static void runV8Tests(NNEvaluator* nnEval, Logger& logger)
     CompactSgf* sgf = CompactSgf::parse(sgfStr);
 
     {
-      Board board;
       Player nextPla;
-      BoardHistory hist;
       Rules initialRules = sgf->getRulesOrFailAllowUnspecified(Rules::getTrompTaylorish());
-      sgf->setupBoardAndHistAssumeLegal(initialRules, board, nextPla, hist, 24);
+      auto [hist, board] = sgf->setupBoardAndHistAssumeLegal(initialRules, nextPla, 24);
       SearchParams params = SearchParams::forTestsV1();
       params.maxVisits = 200;
       params.antiMirror = true;
@@ -547,11 +537,9 @@ static void runV8Tests(NNEvaluator* nnEval, Logger& logger)
       delete bot;
     }
     {
-      Board board;
       Player nextPla;
-      BoardHistory hist;
       Rules initialRules = sgf->getRulesOrFailAllowUnspecified(Rules::getTrompTaylorish());
-      sgf->setupBoardAndHistAssumeLegal(initialRules, board, nextPla, hist, 32);
+      auto [hist, board] = sgf->setupBoardAndHistAssumeLegal(initialRules, nextPla, 32);
       SearchParams params = SearchParams::forTestsV1();
       params.maxVisits = 200;
       params.antiMirror = true;
@@ -562,11 +550,9 @@ static void runV8Tests(NNEvaluator* nnEval, Logger& logger)
       delete bot;
     }
     {
-      Board board;
       Player nextPla;
-      BoardHistory hist;
       Rules initialRules = sgf->getRulesOrFailAllowUnspecified(Rules::getTrompTaylorish());
-      sgf->setupBoardAndHistAssumeLegal(initialRules, board, nextPla, hist, 124);
+      auto [hist, board] = sgf->setupBoardAndHistAssumeLegal(initialRules, nextPla, 124);
       SearchParams params = SearchParams::forTestsV1();
       params.maxVisits = 200;
       params.antiMirror = true;
@@ -589,11 +575,9 @@ static void runV8Tests(NNEvaluator* nnEval, Logger& logger)
     CompactSgf* sgf = CompactSgf::parse(sgfStr);
 
     {
-      Board board;
       Player nextPla;
-      BoardHistory hist;
       Rules initialRules = sgf->getRulesOrFailAllowUnspecified(Rules::getTrompTaylorish());
-      sgf->setupBoardAndHistAssumeLegal(initialRules, board, nextPla, hist, 29);
+      auto [hist, board] = sgf->setupBoardAndHistAssumeLegal(initialRules, nextPla, 29);
       SearchParams params = SearchParams::forTestsV1();
       params.maxVisits = 200;
       params.antiMirror = true;
@@ -604,11 +588,9 @@ static void runV8Tests(NNEvaluator* nnEval, Logger& logger)
       delete bot;
     }
     {
-      Board board;
       Player nextPla;
-      BoardHistory hist;
       Rules initialRules = sgf->getRulesOrFailAllowUnspecified(Rules::getTrompTaylorish());
-      sgf->setupBoardAndHistAssumeLegal(initialRules, board, nextPla, hist, 83);
+      auto [hist, board] = sgf->setupBoardAndHistAssumeLegal(initialRules, nextPla, 83);
       SearchParams params = SearchParams::forTestsV1();
       params.maxVisits = 200;
       params.antiMirror = true;
@@ -634,11 +616,9 @@ static void runMoreV8Tests(NNEvaluator* nnEval, Logger& logger)
     string sgfStr = "(;GM[1]FF[4]CA[UTF-8]RU[Japanese]SZ[9]KM[0];B[dc];W[ef];B[df];W[de];B[dg];W[eg];B[eh];W[fh];B[ee])";
     CompactSgf* sgf = CompactSgf::parse(sgfStr);
 
-    Board board;
     Player nextPla;
-    BoardHistory hist;
     Rules initialRules = sgf->getRulesOrFail();
-    sgf->setupBoardAndHistAssumeLegal(initialRules, board, nextPla, hist, 8);
+    auto [hist, board] = sgf->setupBoardAndHistAssumeLegal(initialRules, nextPla, 8);
 
     SearchParams params = SearchParams::forTestsV1();
     params.maxVisits = 20;
