@@ -1957,6 +1957,8 @@ void WriteSgf::writeSgf(
   int xSize = initialBoard.x_size;
   int ySize = initialBoard.y_size;
   out << "(;FF[4]";
+  out << "AP[katago]";
+
   out << "GM[" << (rules.isDots ? "40" : "1") << "]";
   if(xSize == ySize)
     out << "SZ[" << xSize << "]";
@@ -2057,6 +2059,10 @@ void WriteSgf::writeSgf(
       commentOut << "," << "wTimeUsed=" << gameData->wTimeUsed;
     }
     assert(endHist.moveHistory.size() <= startTurnIdx + gameData->whiteValueTargetsByTurn.size());
+  }
+
+  if (endHist.isPassAliveFinished) {
+    commentOut << "," << "passAliveFinished=true";
   }
 
   if(extraComments.size() > 0) {

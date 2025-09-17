@@ -48,6 +48,7 @@ static void writeLine(
     cout << PlayerIO::playerToString(baseHist.winner) << " ";
     cout << baseHist.isResignation << " ";
     cout << baseHist.finalWhiteMinusBlackScore << " ";
+    cout << baseHist.isPassAliveFinished << " ";
   }
   else {
     cout << "-" << " ";
