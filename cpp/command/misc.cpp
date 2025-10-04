@@ -466,6 +466,7 @@ int MainCmds::demoplay(const vector<string>& args) {
     int maxMovesPerGame = 1600;
     for(int i = 0; i<maxMovesPerGame; i++) {
       baseHist.endGameIfAllPassAlive(baseBoard);
+      baseHist.endGameIfNoLegalMoves(baseBoard);
       if(baseHist.isGameFinished)
         break;
 
@@ -3196,6 +3197,7 @@ int MainCmds::evalrandominits(const vector<string>& args) {
       pla = getOpp(pla);
 
       hist.endGameIfAllPassAlive(board);
+      hist.endGameIfNoLegalMoves(board);
       if(hist.isGameFinished)
         break;
     }
