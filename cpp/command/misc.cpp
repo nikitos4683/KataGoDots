@@ -45,7 +45,7 @@ static void writeLine(
   cout << nnYLen << " ";
   cout << baseHist.rules.komi << " ";
   if(baseHist.isGameFinished) {
-    cout << PlayerIO::playerToString(baseHist.winner) << " ";
+    cout << PlayerIO::playerToString(baseHist.winner,baseHist.rules.isDots) << " ";
     cout << baseHist.isResignation << " ";
     cout << baseHist.finalWhiteMinusBlackScore << " ";
     cout << baseHist.isPassAliveFinished << " ";
@@ -484,9 +484,10 @@ int MainCmds::demoplay(const vector<string>& args) {
       if(moveLoc == Board::NULL_LOC || !isLegal) {
         ostringstream sout;
         sout << "genmove null location or illegal move!?!" << "\n";
-        sout << bot->getRootBoard() << "\n";
-        sout << "Pla: " << PlayerIO::playerToString(pla) << "\n";
-        sout << "MoveLoc: " << Location::toString(moveLoc,bot->getRootBoard()) << "\n";
+        const auto rootBoard = bot->getRootBoard();
+        sout << rootBoard << "\n";
+        sout << "Pla: " << PlayerIO::playerToString(pla,rootBoard.isDots()) << "\n";
+        sout << "MoveLoc: " << Location::toString(moveLoc,rootBoard) << "\n";
         logger.write(sout.str());
         cerr << sout.str() << endl;
         throw StringError("illegal move");
@@ -1678,20 +1679,8 @@ int MainCmds::dataminesgfs(const vector<string>& args) {
     if(minTurn > 0 && (size_t)(sample.initialTurnNumber + sample.moves.size()) < minTurn)
       return 0.0;
 
-    {
-      int numStonesOnBoard = 0;
-      for(int y = 0; y<board.y_size; y++) {
-        for(int x = 0; x<board.x_size; x++) {
-          const Loc loc = Location::getLoc(x,y,board.x_size);
-          const Color color = board.isDots() ? getPlacedDotColor(board.getState(loc)) : board.colors[loc];
-          if(color != C_EMPTY) {
-            numStonesOnBoard += 1;
-          }
-        }
-      }
-      if(numStonesOnBoard < 6)
-        return 0.0;
-    }
+    if (board.numStonesOnBoard() < 6)
+      return 0.0;
 
     if(surpriseMode) {
       // TODO Very simple logic - If a full search gives a different move than a quick search and
@@ -2669,7 +2658,8 @@ int MainCmds::trystartposes(const vector<string>& args) {
         bool suc = maybeGetValuesAfterMove(search,hintLoc,pla,board,hist,1.0,values);
         (void)suc;
         assert(suc);
-        Board::printBoard(cout, search->getRootBoard(), search->getChosenMoveLoc(), &(search->getRootHist().moveHistory));
+        Board::printBoard(
+          cout, search->getRootBoard(), search->getChosenMoveLoc(), &(search->getRootHist().moveHistory));
         search->printTree(cout, search->rootNode, PrintTreeOptions().maxDepth(1),P_WHITE);
         cout << endl;
       }
@@ -2839,21 +2829,21 @@ int MainCmds::viewstartposes(const vector<string>& args) {
       }
     }
 
-    if(bot != NULL || !checkLegality) {
+    if(bot != nullptr || !checkLegality) {
       cout << "StartPos: " << s << "/" << startPoses.size() << "\n";
-      cout << "Next pla: " << PlayerIO::playerToString(pla) << "\n";
+      cout << "Next pla: " << PlayerIO::playerToString(pla,rules.isDots) << "\n";
       cout << "Weight: " << startPos.weight << "\n";
       cout << "TrainingWeight: " << startPos.trainingWeight << "\n";
-      cout << "StartPosInitialNextPla: " << PlayerIO::playerToString(startPos.nextPla) << "\n";
+      cout << "StartPosInitialNextPla: " << PlayerIO::playerToString(startPos.nextPla,rules.isDots) << "\n";
       cout << "StartPosMoves: ";
-      for(int i = 0; i<(int)startPos.moves.size(); i++)
-        cout << (startPos.moves[i].pla == P_WHITE ? "w" : "b") << Location::toString(startPos.moves[i].loc,board) << " ";
+      for(auto move : startPos.moves)
+        cout << (move.pla == P_WHITE ? "w" : "b") << Location::toString(move.loc,board) << " ";
       cout << "\n";
       cout << "Auto komi: " << hist.rules.komi << "\n";
       Board::printBoard(cout, board, hintLoc, &(hist.moveHistory));
       cout << endl;
 
-      if(bot != NULL) {
+      if(bot != nullptr) {
         bot->setPosition(pla,board,hist);
         if(hintLoc != Board::NULL_LOC)
           bot->setRootHintLoc(hintLoc);

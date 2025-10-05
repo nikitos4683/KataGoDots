@@ -1440,7 +1440,10 @@ static Sgf* maybeParseSgf(const string& str, int& pos) {
      && handicap <= 9
   ) {
     Board board(sgf->getRulesOrFail());
-    PlayUtils::placeFixedHandicap(board, handicap);
+    const auto& handicapLocs = PlayUtils::generateFixedHandicap(board, handicap);
+    for (const auto loc : handicapLocs) {
+      board.setStoneFailIfNoLibs(loc, P_BLACK);
+    }
     // Older fox sgfs used handicaps with side stones on the north and south rather than east and west
     if(handicap == 6 || handicap == 7) {
       if(sgf->hasRootProperty("DT")) {
@@ -1457,15 +1460,10 @@ static Sgf* maybeParseSgf(const string& str, int& pos) {
       }
     }
 
-    for(int y = 0; y<board.y_size; y++) {
-      for(int x = 0; x<board.x_size; x++) {
-        Loc loc = Location::getLoc(x,y,board.x_size);
-        if(board.colors[loc] == C_BLACK) {
-          ostringstream out;
-          writeSgfLoc(out, Location::getLoc(x,y,board.x_size), board.x_size, board.y_size);
-          sgf->addRootProperty("AB",out.str());
-        }
-      }
+    for (const auto loc : handicapLocs) {
+      ostringstream out;
+      writeSgfLoc(out, loc, board.x_size, board.y_size);
+      sgf->addRootProperty("AB",out.str());
     }
   }
   return sgf;
