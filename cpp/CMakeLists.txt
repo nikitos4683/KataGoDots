@@ -346,7 +346,7 @@ elseif(USE_BACKEND STREQUAL "TENSORRT")
   if((NOT TENSORRT_INCLUDE_DIR))
     message(FATAL_ERROR "${ColorBoldRed} NvInfer.h was NOT found, specify TENSORRT_INCLUDE_DIR to indicate where it is. ${ColorReset}")
   endif()
-  find_library(TENSORRT_LIBRARY nvinfer HINTS ${TENSORRT_ROOT_DIR} PATH_SUFFIXES lib)
+  find_library(TENSORRT_LIBRARY nvinfer_10 HINTS ${TENSORRT_ROOT_DIR} PATH_SUFFIXES lib)
 
   # Hackily extract out the version from the TensorRT header
   # In each case, try the old format and on failure try the new format.

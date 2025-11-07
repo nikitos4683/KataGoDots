@@ -31,7 +31,7 @@ shift
 #------------------------------------------------------------------------------
 set -x
 
-mkdir -p "$BASEDIR"/train/"$TRAININGNAME"
+mkdir -p "$BASEDIR/train/$TRAININGNAME"
 
 if [[ -n $(pwd | grep "^$BASEDIR/scripts/") ]]
 then
@@ -39,19 +39,19 @@ then
 else
     GITROOTDIR="$(git rev-parse --show-toplevel)"
 
-    git show --no-patch --no-color > "$BASEDIR"/train/"$TRAININGNAME"/version.txt
-    git diff --no-color > "$BASEDIR"/train/"$TRAININGNAME"/diff.txt
-    git diff --staged --no-color > "$BASEDIR"/train/"$TRAININGNAME"/diffstaged.txt
+    git show --no-patch --no-color > "$BASEDIR/train/$TRAININGNAME/version.txt"
+    git diff --no-color > "$BASEDIR/train/$TRAININGNAME/diff.txt"
+    git diff --staged --no-color > "$BASEDIR/train/$TRAININGNAME/diffstaged.txt"
 
     # For archival and logging purposes - you can look back and see exactly the python code on a particular date
     DATE_FOR_FILENAME=$(date "+%Y%m%d-%H%M%S")
-    DATED_ARCHIVE="$BASEDIR"/scripts/train/dated/"$DATE_FOR_FILENAME"
+    DATED_ARCHIVE="$BASEDIR/scripts/train/dated/$DATE_FOR_FILENAME"
     mkdir -p "$DATED_ARCHIVE"
-    cp "$GITROOTDIR"/python/*.py "$GITROOTDIR"/python/selfplay/train.sh "$DATED_ARCHIVE"
-    cp -r "$GITROOTDIR"/python/katago "$DATED_ARCHIVE"
-    git show --no-patch --no-color > "$DATED_ARCHIVE"/version.txt
-    git diff --no-color > "$DATED_ARCHIVE"/diff.txt
-    git diff --staged --no-color > "$DATED_ARCHIVE"/diffstaged.txt
+    cp "$GITROOTDIR/python/"*.py "$GITROOTDIR/python/selfplay/train.sh" "$DATED_ARCHIVE"
+    cp -r "$GITROOTDIR/python/katago" "$DATED_ARCHIVE"
+    git show --no-patch --no-color > "$DATED_ARCHIVE/version.txt"
+    git diff --no-color > "$DATED_ARCHIVE/diff.txt"
+    git diff --staged --no-color > "$DATED_ARCHIVE/diffstaged.txt"
     cd "$DATED_ARCHIVE"
 fi
 
@@ -72,17 +72,17 @@ else
     exit 1
 fi
 
-time python3 ./train.py \
-     -traindir "$BASEDIR"/train/"$TRAININGNAME" \
-     -latestdatadir "$BASEDIR"/shuffleddata/ \
-     -exportdir "$BASEDIR"/"$EXPORT_SUBDIR" \
+time python ./train.py \
+     -traindir "$BASEDIR/train/$TRAININGNAME" \
+     -latestdatadir "$BASEDIR/shuffleddata/" \
+     -exportdir "$BASEDIR/$EXPORT_SUBDIR" \
      -exportprefix "$TRAININGNAME" \
      -pos-len 39 \
      -batch-size "$BATCHSIZE" \
      -model-kind "$MODELKIND" \
      $EXTRAFLAG \
      "$@" \
-     2>&1 | tee -a "$BASEDIR"/train/"$TRAININGNAME"/stdout.txt
+     2>&1 | tee -a "$BASEDIR/train/$TRAININGNAME/stdout.txt"
 
 exit 0
 }
