@@ -366,7 +366,7 @@ void Search::downweightBadChildrenAndNormalizeWeight(
   }
 
   assert(numChildren <= NNPos::MAX_NN_POLICY_SIZE);
-  double stdevs[NNPos::MAX_NN_POLICY_SIZE];
+  double stdevs[NNPos::MAX_NN_POLICY_SIZE] = {0};
   double simpleValueSum = 0.0;
   for(int i = 0; i<numChildren; i++) {
     int64_t numVisits = statsBuf[i].stats.visits;

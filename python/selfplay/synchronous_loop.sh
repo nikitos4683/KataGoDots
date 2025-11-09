@@ -54,14 +54,14 @@ mkdir -p "$BASEDIR/gatekeepersgf"
 # you have strong hardware or are later into a run you may want to reduce the overhead by scaling
 # these numbers up and doing more games and training per cycle, exporting models less frequently, etc.
 
-NUM_GAMES_PER_CYCLE=400 # Every cycle, play this many games
+NUM_GAMES_PER_CYCLE=600 # Every cycle, play this many games
 NUM_THREADS_FOR_SHUFFLING=16
-NUM_TRAIN_SAMPLES_PER_EPOCH=50000  # Training will proceed in chunks of this many rows, subject to MAX_TRAIN_PER_DATA.
+NUM_TRAIN_SAMPLES_PER_EPOCH=100000  # Training will proceed in chunks of this many rows, subject to MAX_TRAIN_PER_DATA.
 MAX_TRAIN_PER_DATA=8 # On average, train only this many times on each data row. Larger numbers may cause overfitting.
-NUM_TRAIN_SAMPLES_PER_SWA=80000  # Stochastic weight averaging frequency.
-BATCHSIZE=128 # For lower-end GPUs 64 or smaller may be needed to avoid running out of GPU memory.
+NUM_TRAIN_SAMPLES_PER_SWA=100000  # Stochastic weight averaging frequency.
+BATCHSIZE=64 # For lower-end GPUs 64 or smaller may be needed to avoid running out of GPU memory.
 SHUFFLE_MINROWS=50000 # Require this many rows at the very start before beginning training.
-MAX_TRAIN_SAMPLES_PER_CYCLE=500000  # Each cycle will do at most this many training steps.
+MAX_TRAIN_SAMPLES_PER_CYCLE=800000  # Each cycle will do at most this many training steps.
 TAPER_WINDOW_SCALE=25000 # Parameter setting the scale at which the shuffler will make the training window grow sublinearly.
 SHUFFLE_KEEPROWS=600000 # Needs to be larger than MAX_TRAIN_SAMPLES_PER_CYCLE, so the shuffler samples enough rows each cycle for the training to use.
 

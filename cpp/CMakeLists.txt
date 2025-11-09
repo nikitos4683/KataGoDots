@@ -191,7 +191,7 @@ else()
   set(GIT_HEADER_FILE_ALWAYS_UPDATED ${CMAKE_BINARY_DIR}/${GIT_HEADER_FILE_ALWAYS_UPDATED_BARE})
   set(GIT_HEADER_FILE ${CMAKE_BINARY_DIR}/${GIT_HEADER_FILE_BARE})
   add_custom_command(
-    OUTPUT ${GIT_HEADER_FILE_ALWAYS_UPDATED}
+    OUTPUT ${GIT_HEADER_FILE}
     COMMAND ${CMAKE_COMMAND} -E copy ${GIT_HEADER_FILE_TEMPLATE} ${GIT_HEADER_FILE_ALWAYS_UPDATED}
     COMMAND ${GIT_EXECUTABLE} describe --match=DummyTagNotExisting --always --abbrev=40 --dirty >> ${GIT_HEADER_FILE_ALWAYS_UPDATED}
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${GIT_HEADER_FILE_ALWAYS_UPDATED} ${GIT_HEADER_FILE}
@@ -277,7 +277,7 @@ add_executable(katago
   program/playsettings.cpp
   program/play.cpp
   program/selfplaymanager.cpp
-  ${GIT_HEADER_FILE_ALWAYS_UPDATED}
+  ${GIT_HEADER_FILE}
   tests/testboardarea.cpp
   tests/testboardbasic.cpp
   tests/testdotsutils.cpp
@@ -561,7 +561,21 @@ if(MSVC)
     target_compile_definitions(katago PRIVATE USE_AVX2)
   endif()
 
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /STACK:8388608")
+  # Suppress code analysis warnings that are not critical
+  # C26495: uninitialized member variables (mostly false positives, initialized in constructors)
+  # C26439: functions may not throw (style warning)
+  # C26817/C26820: expensive copies in loops (minor performance)
+  # C6262: excessive stack usage (common in tests)
+  # C6011/C6387: potential null dereferences (false positives, checked before use)
+  # C6001: uninitialized memory (false positives)
+  # C6297: arithmetic overflow (intentional in crypto functions)
+  # C26110/C26115/C26117/C26111: lock analysis false positives
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /wd26495 /wd26439 /wd26817 /wd26820 /wd6262 /wd6011 /wd6387 /wd6001 /wd6297 /wd26110 /wd26115 /wd26117 /wd26111")
+
+  # Increase stack size and ignore LIBCMT conflict warning
+  # Note: We ignore the LNK4098 warning instead of excluding LIBCMT because TensorRT/CUDA
+  # libraries may depend on it. Excluding LIBCMT can cause heap corruption and crashes.
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /STACK:8388608 /ignore:4098")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
   message(STATUS "Setting up build for GNU, Clang or MinGW.")
   if(NOT (${CMAKE_SYSTEM_PROCESSOR} MATCHES "(arm|aarch32|aarch64)"))

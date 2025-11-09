@@ -71,6 +71,10 @@ void MD5::get(const uint8_t *initial_msg, size_t initial_len, uint32_t hash[4])
 
   // (we alloc also 128 extra bytes, just as a safety buffer)
   uint8_t* msg = (uint8_t*)calloc(new_len + 128, 1); // also appends "0" bits
+  if(msg == nullptr) {
+    fprintf(stderr, "MD5: Failed to allocate memory\n");
+    abort();
+  }
   memcpy(msg, initial_msg, initial_len);
   msg[initial_len] = 128; // write the "1" bit
 

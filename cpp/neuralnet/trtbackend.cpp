@@ -854,6 +854,7 @@ struct ModelParser {
     }
     else {
       ASSERT_UNREACHABLE;
+      return nullptr;
     }
   }
 
@@ -1350,7 +1351,7 @@ struct ComputeHandle {
       void* buffer = nullptr;
       auto name = engine->getIOTensorName(i);
       auto dims = engine->getTensorShape(name);
-      size_t bytes = accumulate(dims.d + 1, dims.d + dims.nbDims, maxBatchSize * sizeof(float), multiplies<size_t>());
+      size_t bytes = accumulate(dims.d + 1, dims.d + dims.nbDims, size_t(maxBatchSize) * sizeof(float), multiplies<size_t>());
       CUDA_ERR("ComputeHandle", cudaMalloc(&buffer, bytes));
       buffers.emplace(make_pair(name, buffer));
       exec->setTensorAddress(name, buffer);
@@ -1383,7 +1384,7 @@ struct ComputeHandle {
   size_t getBufferBytes(const char* name) {
     auto dims = engine->getTensorShape(name);
     if(dims.nbDims != -1) {
-      return accumulate(dims.d + 1, dims.d + dims.nbDims, maxBatchSize * sizeof(float), multiplies<size_t>());
+      return accumulate(dims.d + 1, dims.d + dims.nbDims, size_t(maxBatchSize) * sizeof(float), multiplies<size_t>());
     } else {
       throw StringError(Global::strprintf("ComputeHandle: unknown tensor name %s", name));
     }
@@ -1392,7 +1393,7 @@ struct ComputeHandle {
   size_t getBufferRowElts(const char* name) {
     auto dims = engine->getTensorShape(name);
     if(dims.nbDims != -1) {
-      return accumulate(dims.d + 1, dims.d + dims.nbDims, 1, multiplies<size_t>());
+      return accumulate(dims.d + 1, dims.d + dims.nbDims, size_t(1), multiplies<size_t>());
     } else {
       throw StringError(Global::strprintf("ComputeHandle: unknown tensor name %s", name));
     }
@@ -1414,7 +1415,7 @@ struct ComputeHandle {
       auto desc = debugOutput.second;
       auto dims = getBufferDynamicShape(name.c_str(), batchSize);
 
-      vector<float> values(accumulate(dims.d, dims.d + dims.nbDims, 1, multiplies<size_t>()));
+      vector<float> values(accumulate(dims.d, dims.d + dims.nbDims, size_t(1), multiplies<size_t>()));
       CUDA_ERR(
         "printDebugOutput",
         cudaMemcpy(values.data(), getBuffer(name.c_str()), values.size() * sizeof(float), cudaMemcpyDeviceToHost));
