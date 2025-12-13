@@ -588,7 +588,7 @@ bool Tests::runBackendErrorTest(
     loadedReferenceValuesFromFile = true;
   }
 #endif
-  (void)loadReferenceValuesFromFile;
+  (void)(&loadReferenceValuesFromFile);
 
   std::vector<std::shared_ptr<NNOutput>> fp32;
   std::vector<std::shared_ptr<NNOutput>> fp32Batched(hists.size());
@@ -708,7 +708,7 @@ bool Tests::runBackendErrorTest(
   if(referenceFileName != "")
     saveReferenceValuesToFile(referenceValues, referenceFileName, logger, verbose);
 #endif
-  (void)saveReferenceValuesToFile;
+  (void)(&saveReferenceValuesToFile);
 
   return success && fp32BatchSuccessBuf;
 
