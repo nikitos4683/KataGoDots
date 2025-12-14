@@ -14,7 +14,15 @@
 #include "../core/rand.h"
 
 #ifndef COMPILE_MAX_BOARD_LEN
-#define COMPILE_MAX_BOARD_LEN 39
+#define COMPILE_MAX_BOARD_LEN 19
+#endif
+
+#ifndef COMPILE_MAX_BOARD_LEN_X
+#define COMPILE_MAX_BOARD_LEN_X 19
+#endif
+
+#ifndef COMPILE_MAX_BOARD_LEN_Y
+#define COMPILE_MAX_BOARD_LEN_Y 19
 #endif
 
 #define FOREACHADJ(BLOCK) {int ADJOFFSET = -(x_size+1); {BLOCK}; ADJOFFSET = -1; {BLOCK}; ADJOFFSET = 1; {BLOCK}; ADJOFFSET = x_size+1; {BLOCK}};

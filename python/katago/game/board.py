@@ -35,9 +35,9 @@ class Board:
             self.y_size = size
         else:
             self.x_size, self.y_size = size
-        if self.x_size < 2 or self.x_size > 50:
+        if self.x_size < 2 or self.x_size > 39:
             raise ValueError("Invalid board size: " + str(size))
-        if self.y_size < 2 or self.y_size > 50:
+        if self.y_size < 2 or self.y_size > 32:
             raise ValueError("Invalid board size: " + str(size))
         self.arrsize = (self.x_size+1)*(self.y_size+2)+1
         self.dy = self.x_size+1

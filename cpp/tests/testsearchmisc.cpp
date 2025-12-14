@@ -217,14 +217,14 @@ void Tests::runNNBatchingTest(const string& modelFile, bool inputsNHWC, bool use
   };
   appendSgfPoses(sgf19x19);
   appendSgfPoses(sgf19x10);
-  appendSgfPoses(TestCommon::getBenchmarkSGFData(13));
-  appendSgfPoses(TestCommon::getBenchmarkSGFData(7));
+  appendSgfPoses(TestCommon::getBenchmarkSGFData(13, 13));
+  appendSgfPoses(TestCommon::getBenchmarkSGFData(7, 7));
   appendSgfPoses(sgf19x10);
-  appendSgfPoses(TestCommon::getBenchmarkSGFData(8));
-  appendSgfPoses(TestCommon::getBenchmarkSGFData(14));
+  appendSgfPoses(TestCommon::getBenchmarkSGFData(8, 8));
+  appendSgfPoses(TestCommon::getBenchmarkSGFData(14, 14));
   appendSgfPoses(sgf19x19);
   appendSgfPoses(sgf19x10);
-  appendSgfPoses(TestCommon::getBenchmarkSGFData(17));
+  appendSgfPoses(TestCommon::getBenchmarkSGFData(17, 17));
 
   vector<double> policyResults(items.size());
   vector<double> valueResults(items.size());

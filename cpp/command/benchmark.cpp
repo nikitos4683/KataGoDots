@@ -59,6 +59,8 @@ int MainCmds::benchmark(const vector<string>& args) {
   string modelFile;
   string sgfFile;
   int boardSize;
+  int boardXSize = -1;
+  int boardYSize = -1;
   int64_t maxVisits;
   vector<int> numThreadsToTest;
   int numPositionsPerGame;
@@ -74,13 +76,11 @@ int MainCmds::benchmark(const vector<string>& args) {
     TCLAP::ValueArg<string> threadsArg("t","threads","Test these many threads, comma-separated, e.g. '4,8,12,16' ",false,"","THREADS");
     TCLAP::ValueArg<int> numPositionsPerGameArg("n","numpositions","How many positions to sample from a game (default 10)",false,10,"NUM");
     TCLAP::ValueArg<string> sgfFileArg("","sgf", "Optional game to sample positions from (default: uses a built-in-set of positions)",false,string(),"FILE");
-    TCLAP::ValueArg<int> boardSizeArg(
+    TCLAP::ValueArg<string> boardSizeArg(
       "","boardsize",
-      "Size of board to benchmark on (" +
-      Global::intToString(TestCommon::MIN_BENCHMARK_SGF_DATA_SIZE) + "-" +
-      Global::intToString(TestCommon::MAX_BENCHMARK_SGF_DATA_SIZE) + "), default " +
+      "Size of board to benchmark on (e.g. 19, or 10x12), default " +
       Global::intToString(TestCommon::DEFAULT_BENCHMARK_SGF_DATA_SIZE),
-      false,-1,"SIZE"
+      false,"","SIZE"
     );
     TCLAP::SwitchArg autoTuneThreadsArg("s","tune","Automatically search for the optimal number of threads (default if not specifying specific numbers of threads)");
     TCLAP::ValueArg<int> fixedBatchSizeArg("","fixed-batch-size","Set max batch size to this fixed value",false,-1,"NUM");
@@ -109,7 +109,7 @@ int MainCmds::benchmark(const vector<string>& args) {
 
     modelFile = cmd.getModelFile();
     sgfFile = sgfFileArg.getValue();
-    boardSize = boardSizeArg.getValue();
+    string boardSizeStr = boardSizeArg.getValue();
     maxVisits = (int64_t)visitsArg.getValue();
     string desiredThreadsStr = threadsArg.getValue();
     numPositionsPerGame = numPositionsPerGameArg.getValue();
@@ -118,10 +118,33 @@ int MainCmds::benchmark(const vector<string>& args) {
     useHalfBatchSize = halfBatchSizeArg.getValue();
     secondsPerGameMove = secondsPerGameMoveArg.getValue();
 
-    if(boardSize != -1 && sgfFile != "")
+    if(boardSizeStr != "") {
+      bool suc = false;
+      if(boardSizeStr.find('x') != string::npos || boardSizeStr.find('X') != string::npos) {
+        vector<string> pieces = Global::split(boardSizeStr,'x');
+        if(pieces.size() == 1) pieces = Global::split(boardSizeStr,'X');
+        if(pieces.size() == 2) {
+          suc = Global::tryStringToInt(pieces[0], boardXSize) && Global::tryStringToInt(pieces[1], boardYSize);
+        }
+      }
+      else {
+        int size = -1;
+        suc = Global::tryStringToInt(boardSizeStr, size);
+        if(suc) {
+          boardXSize = size;
+          boardYSize = size;
+        }
+      }
+      if(!suc)
+        throw StringError("Board size to test: invalid value " + boardSizeStr);
+    }
+
+    if(boardXSize != -1 && sgfFile != "")
       throw StringError("Cannot specify both -sgf and -boardsize at the same time");
-    if(boardSize != -1 && (boardSize < TestCommon::MIN_BENCHMARK_SGF_DATA_SIZE || boardSize > TestCommon::MAX_BENCHMARK_SGF_DATA_SIZE))
-      throw StringError("Board size to test: invalid value " + Global::intToString(boardSize));
+    if(boardXSize != -1 && (boardXSize < TestCommon::MIN_BENCHMARK_SGF_DATA_SIZE || boardXSize > TestCommon::MAX_BENCHMARK_SGF_DATA_SIZE))
+      throw StringError("Board x size to test: invalid value " + Global::intToString(boardXSize));
+    if(boardYSize != -1 && (boardYSize < TestCommon::MIN_BENCHMARK_SGF_DATA_SIZE || boardYSize > TestCommon::MAX_BENCHMARK_SGF_DATA_SIZE))
+      throw StringError("Board y size to test: invalid value " + Global::intToString(boardYSize));
     if(maxVisits <= 1 || maxVisits >= 1000000000)
       throw StringError("Number of visits to use: invalid value " + Global::int64ToString(maxVisits));
     if(numPositionsPerGame <= 0 || numPositionsPerGame > 100000)
@@ -173,14 +196,15 @@ int MainCmds::benchmark(const vector<string>& args) {
     sgf = CompactSgf::loadFile(sgfFile);
   }
   else {
-    if(boardSize == -1) {
+    if(boardXSize == -1) {
       int defaultBoardXSize = TestCommon::DEFAULT_BENCHMARK_SGF_DATA_SIZE;
       int defaultBoardYSize = TestCommon::DEFAULT_BENCHMARK_SGF_DATA_SIZE;
       Setup::loadDefaultBoardXYSize(cfg,logger,defaultBoardXSize,defaultBoardYSize);
-      boardSize = std::max(defaultBoardXSize,defaultBoardYSize);
+      boardXSize = defaultBoardXSize;
+      boardYSize = defaultBoardYSize;
     }
-    logger.write("Testing with default positions for board size: " + Global::intToString(boardSize));
-    string sgfData = TestCommon::getBenchmarkSGFData(boardSize);
+    logger.write("Testing with default positions for board size: " + Global::intToString(boardXSize) + "x" + Global::intToString(boardYSize));
+    string sgfData = TestCommon::getBenchmarkSGFData(boardXSize, boardYSize);
     sgf = CompactSgf::parse(sgfData);
   }
 
@@ -622,7 +646,7 @@ int MainCmds::genconfig(const vector<string>& args, const string& firstCommand) 
   }
 
   int boardSize = TestCommon::DEFAULT_BENCHMARK_SGF_DATA_SIZE;
-  string sgfData = TestCommon::getBenchmarkSGFData(boardSize);
+  string sgfData = TestCommon::getBenchmarkSGFData(boardSize, boardSize);
   std::unique_ptr<CompactSgf> sgf = CompactSgf::parse(sgfData);
 
   Rules configRules;

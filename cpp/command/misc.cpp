@@ -81,9 +81,12 @@ int MainCmds::sampleinitializations(const vector<string>& args) {
       const bool defaultRequireExactNNLen = false;
       const bool disableFP16 = false;
       const string expectedSha256 = "";
+      int defaultBoardXSize = Board::MAX_LEN;
+      int defaultBoardYSize = Board::MAX_LEN;
+      Setup::loadDefaultBoardXYSize(cfg,logger,defaultBoardXSize,defaultBoardYSize);
       nnEval = Setup::initializeNNEvaluator(
         modelFile,modelFile,expectedSha256,cfg,logger,rand,expectedConcurrentEvals,
-        Board::MAX_LEN,Board::MAX_LEN,defaultMaxBatchSize,defaultRequireExactNNLen,disableFP16,
+        defaultBoardXSize,defaultBoardYSize,defaultMaxBatchSize,defaultRequireExactNNLen,disableFP16,
         Setup::SETUP_FOR_GTP
       );
     }
@@ -189,9 +192,12 @@ int MainCmds::evalrandominits(const vector<string>& args) {
       const bool defaultRequireExactNNLen = false;
       const bool disableFP16 = false;
       const string expectedSha256 = "";
+      int defaultBoardXSize = Board::MAX_LEN;
+      int defaultBoardYSize = Board::MAX_LEN;
+      Setup::loadDefaultBoardXYSize(cfg,logger,defaultBoardXSize,defaultBoardYSize);
       nnEval = Setup::initializeNNEvaluator(
         modelFile,modelFile,expectedSha256,cfg,logger,rand,expectedConcurrentEvals,
-        Board::MAX_LEN,Board::MAX_LEN,defaultMaxBatchSize,defaultRequireExactNNLen,disableFP16,
+        defaultBoardXSize,defaultBoardYSize,defaultMaxBatchSize,defaultRequireExactNNLen,disableFP16,
         Setup::SETUP_FOR_GTP
       );
     }

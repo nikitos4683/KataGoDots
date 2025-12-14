@@ -963,7 +963,7 @@ xxxxxxxx.
     nnEval->clearCache();
     nnEval->clearStats();
 
-    string sgfData = TestCommon::getBenchmarkSGFData(13);
+    string sgfData = TestCommon::getBenchmarkSGFData(13, 13);
     std::unique_ptr<CompactSgf> sgf = CompactSgf::parse(sgfData);
 
     SearchParams params = SearchParams::forTestsV1();
