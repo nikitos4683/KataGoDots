@@ -468,7 +468,7 @@ static std::shared_ptr<NNOutput> nnOutputOfJson(const std::string& s) {
   return nnOutput;
 }
 
-static void saveReferenceValuesToFile(const std::vector<std::shared_ptr<NNOutput>>& referenceValues, const string& referenceFileName, Logger& logger, bool verbose) {
+[[maybe_unused]] static void saveReferenceValuesToFile(const std::vector<std::shared_ptr<NNOutput>>& referenceValues, const string& referenceFileName, Logger& logger, bool verbose) {
   testAssert(referenceFileName != "");
   std::ofstream outFile;
   FileUtils::open(outFile,referenceFileName);
@@ -485,7 +485,7 @@ static void saveReferenceValuesToFile(const std::vector<std::shared_ptr<NNOutput
   outFile.close();
 }
 
-static void loadReferenceValuesFromFile(std::vector<std::shared_ptr<NNOutput>>& referenceValues, const string& referenceFileName, Logger& logger, bool verbose) {
+[[maybe_unused]] static void loadReferenceValuesFromFile(std::vector<std::shared_ptr<NNOutput>>& referenceValues, const string& referenceFileName, Logger& logger, bool verbose) {
   testAssert(referenceFileName != "");
   referenceValues.clear();
   std::vector<std::string> lines = FileUtils::readFileLines(referenceFileName,'\n');
@@ -588,7 +588,6 @@ bool Tests::runBackendErrorTest(
     loadedReferenceValuesFromFile = true;
   }
 #endif
-  (void)loadReferenceValuesFromFile;
 
   std::vector<std::shared_ptr<NNOutput>> fp32;
   std::vector<std::shared_ptr<NNOutput>> fp32Batched(hists.size());
@@ -708,7 +707,6 @@ bool Tests::runBackendErrorTest(
   if(referenceFileName != "")
     saveReferenceValuesToFile(referenceValues, referenceFileName, logger, verbose);
 #endif
-  (void)saveReferenceValuesToFile;
 
   return success && fp32BatchSuccessBuf;
 
