@@ -976,14 +976,19 @@ bool Setup::loadDefaultBoardXYSize(
   int& defaultBoardXSizeRet,
   int& defaultBoardYSizeRet
 ) {
-  const int defaultBoardXSize =
-    cfg.contains("defaultBoardXSize") ? cfg.getInt("defaultBoardXSize",2,Board::MAX_LEN_X) :
-    cfg.contains("defaultBoardSize") ? cfg.getInt("defaultBoardSize",2,Board::MAX_LEN_X) :
-    -1;
-  const int defaultBoardYSize =
-    cfg.contains("defaultBoardYSize") ? cfg.getInt("defaultBoardYSize",2,Board::MAX_LEN_Y) :
-    cfg.contains("defaultBoardSize") ? cfg.getInt("defaultBoardSize",2,Board::MAX_LEN_Y) :
-    -1;
+  int defaultBoardXSize = -1;
+  int defaultBoardYSize = -1;
+
+  if(cfg.contains("defaultBoardXSize"))
+    defaultBoardXSize = cfg.getInt("defaultBoardXSize",2,Board::MAX_LEN_X);
+  else if(cfg.contains("defaultBoardSize"))
+    defaultBoardXSize = cfg.getInt("defaultBoardSize",2,Board::MAX_LEN_X);
+
+  if(cfg.contains("defaultBoardYSize"))
+    defaultBoardYSize = cfg.getInt("defaultBoardYSize",2,Board::MAX_LEN_Y);
+  else if(cfg.contains("defaultBoardSize"))
+    defaultBoardYSize = cfg.getInt("defaultBoardSize",2,Board::MAX_LEN_Y);
+
   if((defaultBoardXSize == -1) != (defaultBoardYSize == -1))
     logger.write("Warning: Config specified only one of defaultBoardXSize or defaultBoardYSize and no other board size parameter, ignoring it");
 

@@ -131,7 +131,7 @@ namespace TestCommon {
   constexpr int MIN_BENCHMARK_SGF_DATA_SIZE = 7;
   constexpr int MAX_BENCHMARK_SGF_DATA_SIZE = 19;
   constexpr int DEFAULT_BENCHMARK_SGF_DATA_SIZE = std::min(std::max(Board::DEFAULT_LEN_X, Board::DEFAULT_LEN_Y),MAX_BENCHMARK_SGF_DATA_SIZE);
-  std::string getBenchmarkSGFData(int boardSize);
+  std::string getBenchmarkSGFData(int boardXSize, int boardYSize);
 
   std::vector<std::string> getMultiGameSize9Data();
   std::vector<std::string> getMultiGameSize13Data();

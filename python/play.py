@@ -35,6 +35,9 @@ parser = argparse.ArgumentParser(description=description)
 parser.add_argument('-checkpoint', help='Checkpoint to test', required=False)
 parser.add_argument('-use-swa', help='Use SWA model', action="store_true", required=False)
 parser.add_argument('-device', help='Pytorch device, like cpu or cuda:0', required=False)
+parser.add_argument('-size', help='Board size', type=int, default=19, required=False)
+parser.add_argument('-size-x', help='Board x size', type=int, required=False)
+parser.add_argument('-size-y', help='Board y size', type=int, required=False)
 
 args = vars(parser.parse_args())
 
@@ -42,8 +45,9 @@ checkpoint_file = args["checkpoint"]
 use_swa = args["use_swa"]
 device = args["device"]
 
-# Hardcoded max board size
-pos_len = 19
+pos_len = args["size"]
+pos_len_x = args["size_x"] or pos_len
+pos_len_y = args["size_y"] or pos_len
 
 # Model ----------------------------------------------------------------
 
@@ -58,7 +62,7 @@ logging.basicConfig(
 np.set_printoptions(linewidth=150)
 torch.set_printoptions(precision=7,sci_mode=False,linewidth=100000,edgeitems=1000,threshold=1000000)
 
-model, swa_model, _ = load_model(checkpoint_file, use_swa, device=device, pos_len_x=pos_len, pos_len_y=pos_len, verbose=True)
+model, swa_model, _ = load_model(checkpoint_file, use_swa, device=device, pos_len_x=pos_len_x, pos_len_y=pos_len_y, verbose=True)
 if swa_model is not None:
     model = swa_model
 model_config = model.config
@@ -381,7 +385,7 @@ known_analyze_commands = [
     'gfx/PassAlive/passalive',
 ]
 
-board_size = 19
+board_size = (pos_len_x, pos_len_y)
 gs = GameState(board_size, GameState.RULES_TT)
 
 input_feature_command_lookup = dict()
@@ -391,7 +395,7 @@ def add_input_feature_visualizations(layer_name, feature_idx, normalization_div)
     known_commands.append(command_name)
     known_analyze_commands.append("gfx/" + command_name + "/" + command_name)
     input_feature_command_lookup[command_name] = (feature_idx,normalization_div)
-for i in range(model.bin_input_shape[1]):
+for i in range(model.bin_input_shape[0]):
     add_input_feature_visualizations("input-" + str(i),i, normalization_div=1)
 
 attention_feature_command_lookup = dict()
@@ -413,7 +417,7 @@ with torch.no_grad():
 
 def get_board_matrix_str(matrix, scale, formatstr):
     ret = ""
-    matrix = matrix.reshape([features.pos_len_x, features.pos_len_y])
+    matrix = matrix.reshape([features.pos_len_y, features.pos_len_x])
     for y in range(features.pos_len_y):
         for x in range(features.pos_len_x):
             ret += formatstr % (scale * matrix[y,x])

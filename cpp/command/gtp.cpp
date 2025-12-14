@@ -3669,16 +3669,10 @@ int MainCmds::gtp(const vector<string>& args) {
           engine->stopAndWait();
           int boardSizeX = rootBoard.x_size;
           int boardSizeY = rootBoard.y_size;
-          if(boardSizeX != boardSizeY) {
-            responseIsError = true;
-            response =
-              "Current board size is " + Global::intToString(boardSizeX) + "x" + Global::intToString(boardSizeY) +
-              ", no built-in benchmarks for rectangular boards";
-          }
-          else {
+          {
             std::unique_ptr<CompactSgf> sgf = nullptr;
             try {
-              string sgfData = TestCommon::getBenchmarkSGFData(boardSizeX);
+              string sgfData = TestCommon::getBenchmarkSGFData(boardSizeX, boardSizeY);
               sgf = CompactSgf::parse(sgfData);
             }
             catch(const StringError& e) {

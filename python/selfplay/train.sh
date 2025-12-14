@@ -78,6 +78,8 @@ time python3 ./train.py \
      -exportdir "$BASEDIR"/"$EXPORT_SUBDIR" \
      -exportprefix "$TRAININGNAME" \
      -pos-len 39 \
+     -pos-len-x 39 \
+     -pos-len-y 32 \
      -games DOTS \
      -batch-size "$BATCHSIZE" \
      -model-kind "$MODELKIND" \

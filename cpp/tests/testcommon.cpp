@@ -13,12 +13,14 @@ bool TestCommon::boardsSeemEqual(const Board& b1, const Board& b2) {
   return true;
 }
 
-string TestCommon::getBenchmarkSGFData(int boardSize) {
+string TestCommon::getBenchmarkSGFData(int boardXSize, int boardYSize) {
   string sgfData;
   static_assert(MIN_BENCHMARK_SGF_DATA_SIZE == 7, "TestCommon::getBenchmarkSGFData MIN_BENCHMARK_SGF_DATA_SIZE == 7");
   static_assert(MAX_BENCHMARK_SGF_DATA_SIZE == 19, "TestCommon::getBenchmarkSGFData MAX_BENCHMARK_SGF_DATA_SIZE == 19");
 
-  if(boardSize == 19) {
+  if(boardXSize == boardYSize) {
+    int boardSize = boardXSize;
+    if(boardSize == 19) {
     sgfData = "(;FF[4]GM[1]SZ[19]HA[0]KM[7.5];B[dd];W[pp];B[dp];W[pd];B[qq];W[pq];B[qp];W[qo];B[ro];W[rn];B[qn];W[po];B[rm];W[rp];B[sn];W[rq];B[nc];W[oc];B[qr];W[rr];B[nd];W[pf];B[re];W[lc];B[jc];W[le];B[qc];W[qd];B[ob];W[pc];B[pb];W[rc];B[qb];W[rd];B[lb];W[mb];B[ld];W[kb];B[kc];W[la];B[mc];W[qi];B[ke];W[cc];B[dc];W[cd];B[cf];W[ce];B[de];W[bf];B[cb];W[bb];B[be];W[db];B[bc];W[ca];B[bd];W[cb];B[bg];W[df];B[cg];W[fc];B[nr];W[nq];B[pg];W[qg];B[of];W[ef];B[mq];W[cq];B[dq];W[cp];B[co];W[bo];B[bn];W[cn];B[do];W[bm];B[bp];W[an];B[bq];W[cr];B[br];W[kq];B[iq];W[ko];B[kr];W[cj];B[lq];W[bi];B[qj];W[ph];B[og];W[rf];B[gc];W[gd];B[hc];W[nb];B[rb];W[sb];B[lb];W[fe];B[ri];W[rh];B[pi];W[qh];B[af];W[lc];B[dn];W[dm];B[em];W[in];B[lb];W[fn];B[lc];W[en];B[fp];W[fm];B[pj];W[hp];B[hq];W[ij];B[di];W[dj];B[jl];W[il];B[jm];W[im];B[jk];W[jj];B[kj];W[ki];B[lj];W[li];B[mi];W[jh];B[pn];W[or];B[np];W[ie];B[dh];W[ei];B[eh];W[fh];B[kn];W[oo];B[mn];W[oh];B[ni];W[oq];B[fg];W[gh];B[hg];W[hh];B[ig];W[ih];B[fb];W[eb];B[gb];W[mj];B[mg];W[kf];B[lf];W[je];B[kg];W[kd];B[jg];W[ln];B[lm];W[lo];B[nn];W[ra];B[na];W[gp];B[gq];W[fo];B[rj];W[oe];B[me];W[mr];B[lr];W[ns];B[sp];W[on];B[om];W[pm];B[nm];W[ip];B[jp];W[jo];B[kp];W[lp];B[jq];W[ap];B[dr];W[ar];B[cs];W[aq];B[sr];W[qs];B[ab];W[ea];B[ec];W[fd];B[fa];W[ee];B[ke];W[oi];B[oj];W[le];B[ik];W[hk];B[ke];W[ep];B[fq];W[le];B[eo];W[ke];B[sq];W[pr];B[qm];W[ml];B[mk];W[lk];B[nj];W[kk];B[mj];W[km];B[kl];W[qa];B[hd];W[he];B[gf];W[ge];B[bh];W[nf];B[ng];W[ne];B[ci];W[ai];B[mf];W[eg];B[gg];W[dg];B[ch];W[si];B[ah];W[bj];B[sj];W[sh];B[ma];W[sc];B[pa];W[id];B[ic];W[ls];B[ks];W[ms];B[sa];W[ra];B[od];W[pe];B[kh];W[lh];B[ji];W[ii];B[mh];W[ji];B[lg];W[mp];B[no];W[jn];B[km];W[as];B[fi];W[ej])";
   }
   else if(boardSize == 18) {
@@ -59,6 +61,31 @@ string TestCommon::getBenchmarkSGFData(int boardSize) {
   }
   else {
     throw StringError("getBenchmarkSGFData: unsupported board size: " + Global::intToString(boardSize));
+  }
+  }
+  else {
+    string szString = "SZ[" + Global::intToString(boardXSize) + ":" + Global::intToString(boardYSize) + "]";
+    auto searchIn = [&](const std::vector<string>& sgfs) -> string {
+       string combined;
+       for(const string& s : sgfs) {
+          if(s.find(szString) != string::npos) {
+             combined += s;
+          }
+       }
+       return combined;
+    };
+
+    if(boardXSize == 10 && boardYSize == 14) {
+      sgfData = searchIn(getMultiGameSize10x14Data());
+    }
+    else {
+      sgfData = searchIn(getMultiGameRectangleData());
+    }
+
+    if(sgfData.empty()) {
+       // Fallback for custom board sizes: return an empty board SGF with a pass to ensure valid history
+       sgfData = "(;FF[4]GM[1]SZ[" + Global::intToString(boardXSize) + ":" + Global::intToString(boardYSize) + "]KM[7.5]PB[Black]PW[White]RE[?];B[])";
+    }
   }
   return sgfData;
 }
