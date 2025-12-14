@@ -34,14 +34,14 @@ function exportStuff() {
     TODIR="$2"
 
     #Sort by timestamp so that we process in order of oldest to newest if there are multiple
-    for FILEPATH in $(find "$BASEDIR"/"$FROMDIR"/ -mindepth 1 -maxdepth 1 -printf "%T@ %p\n" | sort -n | cut -d ' ' -f 2)
+    find "$BASEDIR"/"$FROMDIR"/ -mindepth 1 -maxdepth 1 -printf "%T@ %p\n" | sort -n | cut -d ' ' -f 2- | while read -r FILEPATH
     do
         #Make sure to skip tmp directories that are transiently there by the training,
         #they are probably in the process of being written
-        if [ ${FILEPATH: -4} == ".tmp" ]
+        if [ "${FILEPATH: -4}" == ".tmp" ]
         then
             echo "Skipping tmp file:" "$FILEPATH"
-        elif [ ${FILEPATH: -9} == ".exported" ]
+        elif [ "${FILEPATH: -9}" == ".exported" ]
         then
             echo "Skipping self tmp file:" "$FILEPATH"
         else
