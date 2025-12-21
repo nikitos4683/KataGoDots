@@ -33,9 +33,9 @@ function uploadStuff() {
     TODIR="$2"
 
     #Sort by timestamp so that we process in order of oldest to newest if there are multiple
-    for FILEPATH in $(find "$BASEDIR"/"$FROMDIR"/ -mindepth 1 -maxdepth 1 -printf "%T@ %p\n" | sort -n | cut -d ' ' -f 2)
+    find "$BASEDIR"/"$FROMDIR"/ -mindepth 1 -maxdepth 1 -printf "%T@ %p\n" | sort -n | cut -d ' ' -f 2- | while read -r FILEPATH
     do
-        if [ ${FILEPATH: -10} == ".uploading" ]
+        if [ "${FILEPATH: -10}" == ".uploading" ]
         then
             echo "Skipping upload tmp file:" "$FILEPATH"
         else

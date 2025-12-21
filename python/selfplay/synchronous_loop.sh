@@ -77,7 +77,8 @@ DATED_ARCHIVE="$BASEDIR"/scripts/dated/"$DATE_FOR_FILENAME"
 mkdir -p "$DATED_ARCHIVE"/bin
 cp "$GITROOTDIR"/python/*.py "$GITROOTDIR"/python/selfplay/*.sh "$DATED_ARCHIVE"
 cp -r "$GITROOTDIR"/python/katago "$DATED_ARCHIVE"
-cp "$GITROOTDIR"/cpp/katago "$DATED_ARCHIVE"/bin
+cp "$GITROOTDIR"/cpp/katago "$DATED_ARCHIVE"/bin 2>/dev/null || cp "$GITROOTDIR"/cpp/katago.exe "$DATED_ARCHIVE"/bin
+cp "$GITROOTDIR"/cpp/*.dll "$DATED_ARCHIVE"/bin 2>/dev/null || true
 cp "$SELFPLAY_CONFIG" "$DATED_ARCHIVE"/selfplay.cfg
 cp "$GATING_CONFIG" "$DATED_ARCHIVE"/gatekeeper.cfg
 git show --no-patch --no-color > "$DATED_ARCHIVE"/version.txt
