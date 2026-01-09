@@ -59,7 +59,7 @@ NUM_THREADS_FOR_SHUFFLING=16
 NUM_TRAIN_SAMPLES_PER_EPOCH=50000  # Training will proceed in chunks of this many rows, subject to MAX_TRAIN_PER_DATA.
 MAX_TRAIN_PER_DATA=8 # On average, train only this many times on each data row. Larger numbers may cause overfitting.
 NUM_TRAIN_SAMPLES_PER_SWA=80000  # Stochastic weight averaging frequency.
-BATCHSIZE=128 # For lower-end GPUs 64 or smaller may be needed to avoid running out of GPU memory.
+BATCHSIZE=96 # For lower-end GPUs 64 or smaller may be needed to avoid running out of GPU memory.
 SHUFFLE_MINROWS=50000 # Require this many rows at the very start before beginning training.
 MAX_TRAIN_SAMPLES_PER_CYCLE=500000  # Each cycle will do at most this many training steps.
 TAPER_WINDOW_SCALE=25000 # Parameter setting the scale at which the shuffler will make the training window grow sublinearly.
@@ -127,7 +127,7 @@ do
     )
 
     echo "Train"
-    time ./train.sh "$BASEDIR" "$TRAININGNAME" "$MODELKIND" "$BATCHSIZE" main "$info_max_len_x" "$info_max_len_y" "$info_git_rev" "$info_backend" -samples-per-epoch "$NUM_TRAIN_SAMPLES_PER_EPOCH" -swa-period-samples "$NUM_TRAIN_SAMPLES_PER_SWA" -quit-if-no-data -stop-when-train-bucket-limited -no-repeat-files -max-train-bucket-per-new-data "$MAX_TRAIN_PER_DATA" -max-train-bucket-size "$MAX_TRAIN_SAMPLES_PER_CYCLE"
+    time ./train.sh "$BASEDIR" "$TRAININGNAME" "$MODELKIND" "$BATCHSIZE" main "$info_max_len_x" "$info_max_len_y" "$info_git_rev" "$info_backend" -samples-per-epoch "$NUM_TRAIN_SAMPLES_PER_EPOCH" -swa-period-samples "$NUM_TRAIN_SAMPLES_PER_SWA" -quit-if-no-data -stop-when-train-bucket-limited -no-repeat-files -max-train-bucket-per-new-data "$MAX_TRAIN_PER_DATA" -max-train-bucket-size "$MAX_TRAIN_SAMPLES_PER_CYCLE" -use-fp16
 
     echo "Export"
     (
