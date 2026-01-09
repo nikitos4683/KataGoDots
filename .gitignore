@@ -93,3 +93,7 @@ cpp/include/KataGoSwift/KataGoSwift-swift.h
 
 **/.junie/memory/
 GEMINI.md
+
+# Ignore DLLs in cpp folder and training directory
+cpp/*.dll
+training
