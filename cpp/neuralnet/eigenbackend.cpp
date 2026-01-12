@@ -28,7 +28,9 @@ using Eigen::TensorMap;
 
 //Eigen doesn't seem to have a way to make a const tensor map out of a const float* ??
 //So we have to cast away qualifiers to build it.
+#ifdef __GNUC__
 #pragma GCC diagnostic ignored "-Wcast-qual"
+#endif
 
 // Eigen tensors are stored in column-major order, so an NHWC memory layout is given by Tensor<4>(C,W,H,N).
 
@@ -1645,8 +1647,8 @@ struct InputBuffers {
     singleScoreValueResultElts = (size_t)m.numScoreValueChannels;
     singleOwnershipResultElts = (size_t)m.numOwnershipChannels * nnXLen * nnYLen;
 
-    assert(NNModelVersion::getNumSpatialFeatures(m.modelVersion) == m.numInputChannels);
-    assert(NNModelVersion::getNumGlobalFeatures(m.modelVersion) == m.numInputGlobalChannels);
+    assert(NNModelVersion::getNumSpatialFeatures(m.modelVersion, m.isDotsGame) == m.numInputChannels);
+    assert(NNModelVersion::getNumGlobalFeatures(m.modelVersion, m.isDotsGame) == m.numInputGlobalChannels);
     if(m.numInputMetaChannels > 0) {
       assert(SGFMetadata::METADATA_INPUT_NUM_CHANNELS == m.numInputMetaChannels);
     }
@@ -1805,8 +1807,10 @@ void NeuralNet::getOutput(
   InputBuffers* inputBuffers,
   int numBatchEltsFilled,
   NNResultBuf** inputBufs,
-  vector<NNOutput*>& outputs
+  const vector<NNOutput*>& outputs,
+  bool dotsGame
 ) {
+  (void)dotsGame;
   assert(numBatchEltsFilled <= inputBuffers->maxBatchSize);
   assert(numBatchEltsFilled > 0);
   const int batchSize = numBatchEltsFilled;
@@ -1814,8 +1818,8 @@ void NeuralNet::getOutput(
   const int nnYLen = computeHandle->context->nnYLen;
   const int modelVersion = computeHandle->model->modelVersion;
 
-  const int numSpatialFeatures = NNModelVersion::getNumSpatialFeatures(modelVersion);
-  const int numGlobalFeatures = NNModelVersion::getNumGlobalFeatures(modelVersion);
+  const int numSpatialFeatures = NNModelVersion::getNumSpatialFeatures(modelVersion, dotsGame);
+  const int numGlobalFeatures = NNModelVersion::getNumGlobalFeatures(modelVersion, dotsGame);
   const int numMetaFeatures = inputBuffers->singleInputMetaElts;
   assert(numSpatialFeatures == computeHandle->model->numInputChannels);
   assert(numSpatialFeatures * nnXLen * nnYLen == inputBuffers->singleInputElts);
