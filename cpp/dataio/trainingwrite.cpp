@@ -1157,7 +1157,7 @@ void TrainingDataWriter::writeGame(const FinishedGameData& data) {
       testAssert(data.finalSekiAreas != NULL);
       testAssert(data.finalFullArea != NULL);
     }
-    testAssert(data.finalWhiteScoring != NULL);
+    testAssert(data.endHist.rules.isDots || data.finalWhiteScoring != NULL);
     testAssert(!data.endHist.isResignation);
   }
 

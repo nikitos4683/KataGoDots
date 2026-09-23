@@ -138,9 +138,7 @@ class GameState:
                 td_value_logits,    # N, {long, mid, short} {win,loss,noresult}
                 pred_td_score,      # N, {long, mid, short}
                 ownership_pretanh,  # N, 1, y, x
-                pred_scoring,       # N, 1, y, x
                 futurepos_pretanh,  # N, 2, y, x
-                seki_logits,        # N, 4, y, x
                 pred_scoremean,     # N
                 pred_scorestdev,    # N
                 pred_lead,          # N
@@ -164,11 +162,7 @@ class GameState:
             estv = math.sqrt(pred_shortterm_value_error.cpu().item())
             ests = math.sqrt(pred_shortterm_score_error.cpu().item())
             ownership = torch.tanh(ownership_pretanh).cpu().numpy()
-            scoring = pred_scoring.cpu().numpy()
             futurepos = torch.tanh(futurepos_pretanh).cpu().numpy()
-            seki_probs = torch.nn.functional.softmax(seki_logits[0:3,:,:],dim=0).cpu().numpy()
-            seki = seki_probs[1] - seki_probs[2]
-            seki2 = torch.sigmoid(seki_logits[3,:,:]).cpu().numpy()
             scorebelief = torch.nn.functional.softmax(scorebelief_logits,dim=0).cpu().numpy()
             if model.config["version"] >= 16:
                 qwinloss = torch.tanh(policy_logits[6,:]).cpu().numpy()
@@ -208,18 +202,6 @@ class GameState:
                 else:
                     ownership_by_loc.append((loc,-ownership_flat[pos]))
 
-        scoring_flat = scoring.reshape([features.pos_len_x * features.pos_len_y])
-        scoring_by_loc = []
-        board = self.board
-        for y in range(board.y_size):
-            for x in range(board.x_size):
-                loc = board.loc(x,y)
-                pos = features.loc_to_tensor_pos(loc,board)
-                if board.pla == Board.WHITE:
-                    scoring_by_loc.append((loc,scoring_flat[pos]))
-                else:
-                    scoring_by_loc.append((loc,-scoring_flat[pos]))
-
         futurepos0_flat = futurepos[0,:,:].reshape([features.pos_len_x * features.pos_len_y])
         futurepos0_by_loc = []
         board = self.board
@@ -243,27 +225,6 @@ class GameState:
                     futurepos1_by_loc.append((loc,futurepos1_flat[pos]))
                 else:
                     futurepos1_by_loc.append((loc,-futurepos1_flat[pos]))
-
-        seki_flat = seki.reshape([features.pos_len_x * features.pos_len_y])
-        seki_by_loc = []
-        board = self.board
-        for y in range(board.y_size):
-            for x in range(board.x_size):
-                loc = board.loc(x,y)
-                pos = features.loc_to_tensor_pos(loc,board)
-                if board.pla == Board.WHITE:
-                    seki_by_loc.append((loc,seki_flat[pos]))
-                else:
-                    seki_by_loc.append((loc,-seki_flat[pos]))
-
-        seki_flat2 = seki2.reshape([features.pos_len_x * features.pos_len_y])
-        seki_by_loc2 = []
-        board = self.board
-        for y in range(board.y_size):
-            for x in range(board.x_size):
-                loc = board.loc(x,y)
-                pos = features.loc_to_tensor_pos(loc,board)
-                seki_by_loc2.append((loc,seki_flat2[pos]))
 
         moves_and_probs = sorted(moves_and_probs0, key=lambda moveandprob: moveandprob[1], reverse=True)
         # Generate a random number biased small and then find the appropriate move to make
@@ -305,15 +266,9 @@ class GameState:
             "ests": ests,
             "ownership": ownership,
             "ownership_by_loc": ownership_by_loc,
-            "scoring": scoring,
-            "scoring_by_loc": scoring_by_loc,
             "futurepos": futurepos,
             "futurepos0_by_loc": futurepos0_by_loc,
             "futurepos1_by_loc": futurepos1_by_loc,
-            "seki": seki,
-            "seki_by_loc": seki_by_loc,
-            "seki2": seki2,
-            "seki_by_loc2": seki_by_loc2,
             "scorebelief": scorebelief,
             "qwinloss": qwinloss,
             "qscore": qscore,

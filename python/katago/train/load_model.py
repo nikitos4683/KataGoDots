@@ -27,7 +27,7 @@ def load_model_state_dict(state_dict):
             elif key.startswith("_orig_mod."):
                 key = key[len("_orig_mod."):]
         # Filter out some extra keys that were present in older checkpoints
-        if "score_belief_offset_vector" in key or "score_belief_offset_bias_vector" in key or "score_belief_parity_vector" in key:
+        if "score_belief_offset_vector" in key or "score_belief_offset_bias_vector" in key or "score_belief_parity_vector" in key or ".conv_seki." in key or ".conv_scoring." in key:
             continue
         model_state_dict[key] = state_dict["model"][old_key]
     return model_state_dict
@@ -38,7 +38,7 @@ def load_swa_model_state_dict(state_dict):
     swa_model_state_dict = {}
     for key in state_dict["swa_model"]:
         # Filter out some extra keys that were present in older checkpoints
-        if "score_belief_offset_vector" in key or "score_belief_offset_bias_vector" in key or "score_belief_parity_vector" in key:
+        if "score_belief_offset_vector" in key or "score_belief_offset_bias_vector" in key or "score_belief_parity_vector" in key or ".conv_seki." in key or ".conv_scoring." in key:
             continue
         swa_model_state_dict[key] = state_dict["swa_model"][key]
     return swa_model_state_dict
