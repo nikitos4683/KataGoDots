@@ -266,7 +266,7 @@ for param_name in data["model"]:
     old_shape = tuple(data["model"][param_name].shape)
     new_shape = tuple(new_tensor.shape)
     print(f"Expanding {param_name} from {old_shape} to {new_shape}")
-    if re.search(r"\.conv\d+\.weight$", stripped_name) or stripped_name.endswith("conv_spatial.weight") or stripped_name.endswith(".conv.weight") or stripped_name.endswith(".conv1r.weight") or stripped_name.endswith(".conv1g.weight") or stripped_name.endswith(".conv1p.weight") or stripped_name.endswith(".conv2p.weight") or stripped_name.endswith(".conv_ownership.weight") or stripped_name.endswith(".conv_scoring.weight") or stripped_name.endswith(".conv_futurepos.weight") or stripped_name.endswith(".conv_seki.weight"):
+    if re.search(r"\.conv\d+\.weight$", stripped_name) or stripped_name.endswith("conv_spatial.weight") or stripped_name.endswith(".conv.weight") or stripped_name.endswith(".conv1r.weight") or stripped_name.endswith(".conv1g.weight") or stripped_name.endswith(".conv1p.weight") or stripped_name.endswith(".conv2p.weight") or stripped_name.endswith(".conv_ownership.weight") or stripped_name.endswith(".conv_futurepos.weight"):
         data["model"][param_name] = expand_conv_weights(param_name, data["model"][param_name],new_shape)
     elif stripped_name.endswith("linear_g.weight") or stripped_name.endswith("linear_pass.weight") or stripped_name.endswith("value_head.linear2.weight") or stripped_name.endswith("value_head.linear_s2.weight") or stripped_name.endswith("value_head.linear_smix.weight"):
         data["model"][param_name] = expand_mat_weights_after_gpool(param_name, data["model"][param_name],new_shape)

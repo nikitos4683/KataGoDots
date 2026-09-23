@@ -269,7 +269,6 @@ def main(args):
                 meta_kata_only_soft_policy=False,
                 value_loss_scale=value_loss_scale,
                 td_value_loss_scales=td_value_loss_scales,
-                seki_loss_scale=1.0,
                 variance_time_loss_scale=1.0,
                 main_loss_scale=1.0,
                 intermediate_loss_scale=None,

@@ -103,9 +103,7 @@ def main(args):
             td_value_logits,    # N, {long, mid, short} {win,loss,noresult}
             pred_td_score,      # N, {long, mid, short}
             ownership_pretanh,  # N, 1, y, x
-            pred_scoring,       # N, 1, y, x
             futurepos_pretanh,  # N, 2, y, x
-            seki_logits,        # N, 4, y, x
             pred_scoremean,     # N
             pred_scorestdev,    # N
             pred_lead,          # N

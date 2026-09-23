@@ -46,7 +46,6 @@ from katago.train.trainloop_helpers import detensorify_metrics
 SOFT_POLICY_WEIGHT_SCALE = 8.0
 VALUE_LOSS_SCALE = 0.6
 TD_VALUE_LOSS_SCALES = [0.6, 0.6, 0.6]
-SEKI_LOSS_SCALE = 1.0
 VARIANCE_TIME_LOSS_SCALE = 1.0
 
 SUMMARY_TABLE_KEYS = ["p0loss", "p0sopt", "vloss", "tdvloss1", "leadloss", "oloss"]
@@ -269,7 +268,6 @@ def main(args):
             meta_kata_only_soft_policy=False,
             value_loss_scale=VALUE_LOSS_SCALE,
             td_value_loss_scales=TD_VALUE_LOSS_SCALES,
-            seki_loss_scale=SEKI_LOSS_SCALE,
             variance_time_loss_scale=VARIANCE_TIME_LOSS_SCALE,
             main_loss_scale=1.0,
             intermediate_loss_scale=(1.0 if has_intermediate else None),
