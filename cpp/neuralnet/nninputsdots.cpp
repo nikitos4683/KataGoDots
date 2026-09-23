@@ -176,6 +176,9 @@ void NNInputs::fillRowV7Dots(
     currentPla = getOpp(currentPla);
   }
 
+  // Temporarily keep Dots ladder input planes 14-17 zero. The row buffer was cleared above.
+  // Restore this block when ladder features are ready for self-play training.
+#if 0
   std::optional<DotsLaddersSolver> dotsLaddersSolver = DotsLaddersSolver(board);
   dotsLaddersSolver->solve(capturesAndTerritoriesInfos);
 
@@ -204,6 +207,7 @@ void NNInputs::fillRowV7Dots(
       dotsLaddersSolver->solve(recentBoard.calculateCapturesAndTerritoriesColorsForDots());
     }
   }
+#endif
 
   //Komi and any score adjustments
   float selfKomi = hist.currentSelfKomi(nextPlayer,nnInputParams.drawEquivalentWinsForWhite);

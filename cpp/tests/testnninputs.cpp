@@ -125,6 +125,7 @@ void Tests::runDotsNNInputsTests() {
     params.maxHistory = maxHistory;
     std::vector<float> global(numGlobal);
     spatial.resize(numSpatial * area);
+    std::fill(spatial.begin(), spatial.end(), -1.0f);
     NNInputs::fillRowVN(7, board, hist, P_BLACK, params, board.x_size, board.y_size,
                         false, spatial.data(), global.data(), false, &reasonableMoves);
   };
@@ -139,13 +140,24 @@ void Tests::runDotsNNInputsTests() {
     for(int pos = 0; pos < area; pos++)
       testAssert(noHistory[channel * area + pos] == 0.0f);
   }
-  for(int channel = 15; channel <= 16; channel++) {
-    for(int pos = 0; pos < area; pos++)
-      testAssert(noHistory[channel * area + pos] == 0.0f);
-  }
-
   fill(1, oneMove, reasonableMoves);
   fill(5, fullHistory, reasonableMoves);
+  for(const auto* spatial : {&noHistory, &oneMove, &fullHistory}) {
+    for(int channel = 14; channel <= 17; channel++) {
+      for(int pos = 0; pos < area; pos++)
+        testAssert((*spatial)[channel * area + pos] == 0.0f);
+    }
+  }
+  std::vector<float> nhwcSpatial(numSpatial * area, -1.0f);
+  std::vector<float> nhwcGlobal(numGlobal);
+  MiscNNInputParams nhwcParams;
+  nhwcParams.maxHistory = 5;
+  NNInputs::fillRowVN(7, board, hist, P_BLACK, nhwcParams, board.x_size, board.y_size,
+                      true, nhwcSpatial.data(), nhwcGlobal.data(), false);
+  for(int pos = 0; pos < area; pos++) {
+    for(int channel = 14; channel <= 17; channel++)
+      testAssert(nhwcSpatial[pos * numSpatial + channel] == 0.0f);
+  }
   const int blackPos = NNPos::locToPos(blackMove, board.x_size, board.x_size, board.y_size);
   const int whitePos = NNPos::locToPos(whiteMove, board.x_size, board.x_size, board.y_size);
   testAssert(oneMove[9 * area + whitePos] == 1.0f);
