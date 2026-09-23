@@ -1493,6 +1493,8 @@ void NNEvaluator::evaluate(
         int x = pos % nnXLen;
         if(y >= board.y_size || x >= board.x_size)
           buf.result->whiteOwnerMap[pos] = 0.0f;
+        else if(board.isDots() && getPlacedDotColor(board.getState(Location::getLoc(x,y,board.x_size))) == C_EMPTY)
+          buf.result->whiteOwnerMap[pos] = 0.0f;
         else {
           // Similarly as mentioned above, the result we get back from the net is actually not from white's perspective,
           // but from the player to move, so we need to flip it to make it white at the same time as we tanh it.

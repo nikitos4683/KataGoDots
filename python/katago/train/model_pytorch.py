@@ -3857,6 +3857,11 @@ class Model(torch.nn.Module):
             return self._forward_per_block_units(input_spatial, input_global)
 
         mask = input_spatial[:, 0:1, :, :].contiguous()
+        # For Dots, ownership describes the fate of dots already placed on the board.
+        # Keep the full board as input to the trunk, but suppress output on empty points.
+        ownership_mask = None
+        if self.games == [Game.DOTS]:
+            ownership_mask = (input_spatial[:, 3:5, :, :].sum(dim=1, keepdim=True) > 0.5).to(mask.dtype)
         mask_sum_hw = torch.sum(mask,dim=(2,3),keepdim=True)
         mask_sum = torch.sum(mask)
         # Save original mask/dims for restoring NCHW after trunk when using inline registers.
@@ -4030,6 +4035,8 @@ class Model(torch.nn.Module):
                     input_global=input_global_fp32,
                     extra_outputs=extra_outputs
                 )
+                if ownership_mask is not None:
+                    iout_ownership = iout_ownership * ownership_mask
 
             for i, block in enumerate(self.blocks[self.intermediate_head_blocks:], start=self.intermediate_head_blocks):
                 if self.use_trunk_residual_backout:
@@ -4142,6 +4149,8 @@ class Model(torch.nn.Module):
                 input_global=input_global_fp32,
                 extra_outputs=extra_outputs
             )
+            if ownership_mask is not None:
+                out_ownership = out_ownership * ownership_mask
 
         if self.has_intermediate_head:
             return (

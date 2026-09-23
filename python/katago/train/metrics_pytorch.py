@@ -632,6 +632,11 @@ class Metrics:
         target_seki = target_value_nchw[:, 1, :, :]
         target_futurepos = target_value_nchw[:, 2:4, :, :]
         target_scoring = target_value_nchw[:, 4, :, :] / 120.0
+        # Dots ownership only trains on dots present in this position. Go keeps
+        # the full-board target. Normalize each row by the number of valid points.
+        dots_placed_mask = (input_binary_nchw[:, 3, :, :] + input_binary_nchw[:, 4, :, :]).clamp(max=1.0) * mask
+        ownership_mask = torch.where(target_global_nc[:, 23].view(-1, 1, 1) > 0.5, dots_placed_mask, mask)
+        ownership_mask_sum_hw = torch.sum(ownership_mask, dim=(1, 2)).clamp(min=1.0)
 
         predict_q_values = False
         if raw_model.config["version"] <= 11:
@@ -802,8 +807,8 @@ class Metrics:
             ownership_pretanh,
             target_ownership,
             target_weight_ownership,
-            mask,
-            mask_sum_hw,
+            ownership_mask,
+            ownership_mask_sum_hw,
             global_weight,
         ).sum()
         loss_scoring = self.loss_scoring_samplewise(
