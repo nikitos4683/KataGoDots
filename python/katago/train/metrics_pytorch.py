@@ -2,7 +2,6 @@ from typing import Any, Dict, List
 import math
 
 from ..train.model_pytorch import EXTRA_SCORE_DISTR_RADIUS, Model, compute_gain, ExtraOutputs, MetadataEncoder
-from ..train.trainloop_helpers import env_flag
 
 import torch
 import torch.nn
@@ -32,49 +31,18 @@ class Metrics:
         self.value_len = 3
         self.num_td_values = 3
         self.num_futurepos_values = 2
-        self.num_seki_logits = 4
         self.scorebelief_len = 2 * (self.pos_len_x * self.pos_len_y + EXTRA_SCORE_DISTR_RADIUS)
 
         self.scoremean_multiplier = raw_model.scoremean_multiplier
 
         self.score_belief_offset_vector = raw_model.value_head.score_belief_offset_vector
-        # Keeping the seki moving average on the model device avoids a per-batch
-        # GPU->CPU sync in the training loss and lets the loss be torch.compiled.
-        self.seki_ema_on_device = env_flag("KATAGO_SEKI_EMA_ON_DEVICE", default=True)
-        if self.seki_ema_on_device:
-            metric_device = self.score_belief_offset_vector.device
-            self.moving_unowned_proportion_sum = torch.zeros([], device=metric_device, dtype=torch.float32)
-            self.moving_unowned_proportion_weight = torch.zeros([], device=metric_device, dtype=torch.float32)
-        else:
-            self.moving_unowned_proportion_sum = 0.0
-            self.moving_unowned_proportion_weight = 0.0
 
     def state_dict(self):
-        # Checkpoints always store plain floats regardless of where the moving
-        # average lives at runtime.
-        moving_sum = self.moving_unowned_proportion_sum
-        moving_weight = self.moving_unowned_proportion_weight
-        if isinstance(moving_sum, torch.Tensor):
-            moving_sum = moving_sum.item()
-        if isinstance(moving_weight, torch.Tensor):
-            moving_weight = moving_weight.item()
-        return dict(
-            moving_unowned_proportion_sum = moving_sum,
-            moving_unowned_proportion_weight = moving_weight,
-        )
+        return {}
+
     def load_state_dict(self, state_dict: Dict[str,Any]):
-        moving_sum = state_dict["moving_unowned_proportion_sum"]
-        moving_weight = state_dict["moving_unowned_proportion_weight"]
-        if isinstance(moving_sum, torch.Tensor):
-            moving_sum = moving_sum.item()
-        if isinstance(moving_weight, torch.Tensor):
-            moving_weight = moving_weight.item()
-        if self.seki_ema_on_device:
-            self.moving_unowned_proportion_sum.fill_(moving_sum)
-            self.moving_unowned_proportion_weight.fill_(moving_weight)
-        else:
-            self.moving_unowned_proportion_sum = moving_sum
-            self.moving_unowned_proportion_weight = moving_weight
+        # Ignore obsolete seki statistics in older checkpoints.
+        pass
 
     def loss_policy_player_samplewise(self, pred_logits, target_probs, weight, global_weight):
         assert pred_logits.shape[1:] == (self.policy_len,)
@@ -162,19 +130,6 @@ class Metrics:
         return 1.5 * global_weight * weight * loss
 
 
-    def loss_scoring_samplewise(self, pred_scoring, target, weight, mask, mask_sum_hw, global_weight):
-        n = pred_scoring.shape[0]
-        assert pred_scoring.shape == (n, 1, self.pos_len_y, self.pos_len_x)
-        assert target.shape == (n, self.pos_len_y, self.pos_len_x)
-        assert mask.shape == (n, self.pos_len_y, self.pos_len_x)
-        assert mask_sum_hw.shape == (n,)
-
-        loss = torch.sum(torch.square(pred_scoring.squeeze(1) - target) * mask, dim=(1,2)) / mask_sum_hw
-        # Simple huberlike transform to reduce crazy values
-        loss = 4.0 * (torch.sqrt(loss * 0.5 + 1.0) - 1.0)
-        return global_weight * weight * loss
-
-
     def loss_futurepos_samplewise(self, pred_pretanh, target, weight, mask, mask_sum_hw, global_weight):
         # The futurepos targets extrapolate a fixed number of steps into the future independent
         # of board size. So unlike the ownership above, generally a fixed number of spots are going to be
@@ -193,59 +148,6 @@ class Metrics:
         loss = loss * constant_like([1.0,0.25], loss).view(1,2,1,1)
         loss = torch.sum(loss, dim=(1, 2, 3)) / torch.sqrt(mask_sum_hw)
         return 0.25 * global_weight * weight * loss
-
-
-    def loss_seki_samplewise(self, pred_logits, target, target_ownership, weight, mask, mask_sum_hw, global_weight, is_training, skip_moving_update):
-        assert self.num_seki_logits == 4
-        n = pred_logits.shape[0]
-        assert pred_logits.shape == (n, self.num_seki_logits, self.pos_len_y, self.pos_len_x)
-        assert target.shape == (n, self.pos_len_y, self.pos_len_x)
-        assert target_ownership.shape == (n, self.pos_len_y, self.pos_len_x)
-        assert mask.shape == (n, self.pos_len_y, self.pos_len_x)
-        assert mask_sum_hw.shape == (n,)
-
-        owned_target = torch.square(target_ownership)
-        unowned_target = 1.0 - owned_target
-        unowned_proportion = torch.sum(unowned_target * mask, dim=(1, 2)) / (1.0 + mask_sum_hw)
-        unowned_proportion = torch.mean(unowned_proportion * weight)
-        if is_training:
-            if not skip_moving_update:
-                if self.seki_ema_on_device:
-                    with torch.no_grad():
-                        self.moving_unowned_proportion_sum.mul_(0.998).add_(unowned_proportion.detach())
-                        self.moving_unowned_proportion_weight.mul_(0.998).add_(1.0)
-                else:
-                    self.moving_unowned_proportion_sum *= 0.998
-                    self.moving_unowned_proportion_weight *= 0.998
-                    self.moving_unowned_proportion_sum += unowned_proportion.item()
-                    self.moving_unowned_proportion_weight += 1.0
-            moving_unowned_proportion = self.moving_unowned_proportion_sum / self.moving_unowned_proportion_weight
-            seki_weight_scale = 8.0 * 0.005 / (0.005 + moving_unowned_proportion)
-        else:
-            seki_weight_scale = 7.0
-
-        # Loss for predicting the exact sign of seki points
-        sign_pred = pred_logits[:, 0:3, :, :]
-        sign_target = torch.stack(
-            (
-                1.0 - torch.square(target),
-                torch.nn.functional.relu(target),
-                torch.nn.functional.relu(-target),
-            ),
-            dim=1,
-        )
-        loss_sign = torch.sum(cross_entropy(sign_pred, sign_target, dim=1) * mask, dim=(1, 2))
-
-        # Loss for generally predicting points that nobody will own
-        neutral_pred = torch.stack(
-            (pred_logits[:, 3, :, :], torch.zeros_like(target_ownership)), dim=1
-        )
-        neutral_target = torch.stack((unowned_target, owned_target), dim=1)
-        loss_neutral = torch.sum(cross_entropy(neutral_pred, neutral_target, dim=1) * mask, dim=(1, 2))
-
-        loss = loss_sign + 0.5 * loss_neutral
-        loss = loss / mask_sum_hw
-        return (global_weight * seki_weight_scale * weight * loss, seki_weight_scale)
 
 
     def loss_scoremean_samplewise(self, pred, target, weight, global_weight):
@@ -484,7 +386,6 @@ class Metrics:
         meta_kata_only_soft_policy,
         value_loss_scale,
         td_value_loss_scales,
-        seki_loss_scale,
         variance_time_loss_scale,
         main_loss_scale,
         intermediate_loss_scale,
@@ -500,7 +401,6 @@ class Metrics:
             meta_kata_only_soft_policy=meta_kata_only_soft_policy,
             value_loss_scale=value_loss_scale,
             td_value_loss_scales=td_value_loss_scales,
-            seki_loss_scale=seki_loss_scale,
             variance_time_loss_scale=variance_time_loss_scale,
             is_intermediate=False,
             include_model_norms=include_model_norms,
@@ -527,7 +427,6 @@ class Metrics:
                     meta_kata_only_soft_policy=meta_kata_only_soft_policy,
                     value_loss_scale=value_loss_scale,
                     td_value_loss_scales=td_value_loss_scales,
-                    seki_loss_scale=seki_loss_scale,
                     variance_time_loss_scale=variance_time_loss_scale,
                     is_intermediate=True,
                 )
@@ -555,7 +454,6 @@ class Metrics:
         meta_kata_only_soft_policy,
         value_loss_scale,
         td_value_loss_scales,
-        seki_loss_scale,
         variance_time_loss_scale,
         is_intermediate,
         include_model_norms=True,
@@ -566,9 +464,7 @@ class Metrics:
             td_value_logits,
             pred_td_score,
             ownership_pretanh,
-            pred_scoring,
             futurepos_pretanh,
-            seki_logits,
             pred_scoremean,
             pred_scorestdev,
             pred_lead,
@@ -622,16 +518,13 @@ class Metrics:
         target_weight_ownership = target_global_nc[:, 27]
         target_weight_lead = target_global_nc[:, 29]
         target_weight_futurepos = target_global_nc[:, 33]
-        target_weight_scoring = target_global_nc[:, 34]
         target_weight_value = 1.0 - target_global_nc[:, 35]
         target_weight_td_value = 1.0 - target_global_nc[:, 24]
 
         target_score_distribution = score_distribution_ns / 100.0
 
         target_ownership = target_value_nchw[:, 0, :, :]
-        target_seki = target_value_nchw[:, 1, :, :]
         target_futurepos = target_value_nchw[:, 2:4, :, :]
-        target_scoring = target_value_nchw[:, 4, :, :] / 120.0
         # Dots ownership only trains on dots present in this position. Go keeps
         # the full-board target. Normalize each row by the number of valid points.
         dots_placed_mask = (input_binary_nchw[:, 3, :, :] + input_binary_nchw[:, 4, :, :]).clamp(max=1.0) * mask
@@ -811,14 +704,6 @@ class Metrics:
             ownership_mask_sum_hw,
             global_weight,
         ).sum()
-        loss_scoring = self.loss_scoring_samplewise(
-            pred_scoring,
-            target_scoring,
-            target_weight_scoring,
-            mask,
-            mask_sum_hw,
-            global_weight,
-        ).sum()
         loss_futurepos = self.loss_futurepos_samplewise(
             futurepos_pretanh,
             target_futurepos,
@@ -827,19 +712,6 @@ class Metrics:
             mask_sum_hw,
             global_weight,
         ).sum()
-        (loss_seki,seki_weight_scale) = self.loss_seki_samplewise(
-            seki_logits,
-            target_seki,
-            target_ownership,
-            target_weight_ownership,
-            mask,
-            mask_sum_hw,
-            global_weight,
-            is_training,
-            skip_moving_update=is_intermediate,
-        )
-        loss_seki = loss_seki.sum()
-        seki_weight_scale = seki_weight_scale.sum() if not isinstance(seki_weight_scale,float) else seki_weight_scale
         loss_scoremean = self.loss_scoremean_samplewise(
             pred_scoremean,
             target_scoremean,
@@ -921,9 +793,7 @@ class Metrics:
             + loss_td_value3 * td_value_loss_scales[2]
             + loss_td_score
             + loss_ownership
-            + loss_scoring * 0.25
             + loss_futurepos
-            + loss_seki * seki_loss_scale
             + loss_scoremean
             + loss_scorebelief_cdf
             + loss_scorebelief_pdf
@@ -959,9 +829,7 @@ class Metrics:
             "tdvloss3_sum": loss_td_value3,
             "tdsloss_sum": loss_td_score,
             "oloss_sum": loss_ownership,
-            "sloss_sum": loss_scoring,
             "fploss_sum": loss_futurepos,
-            "skloss_sum": loss_seki,
             "smloss_sum": loss_scoremean,
             "sbcdfloss_sum": loss_scorebelief_cdf,
             "sbpdfloss_sum": loss_scorebelief_pdf,
@@ -998,7 +866,6 @@ class Metrics:
                 "nsamp": nsamples * self.world_size,
                 "ptentr_sum": policy_target_entropy,
                 "ptsoftentr_sum": soft_policy_target_entropy,
-                "sekiweightscale_sum": seki_weight_scale * weight,
             }
 
             if include_model_norms:

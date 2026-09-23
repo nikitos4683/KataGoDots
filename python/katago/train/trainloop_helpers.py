@@ -299,11 +299,6 @@ def make_training_metrics_fn(metrics_obj, no_compile: bool, model_norms_only_at_
             "KATAGO_COMPILE_TRAINING_LOSS=1 requires KATAGO_MODEL_NORMS_ONLY_AT_PRINT=1 "
             "so the compiled result structure is fixed"
         )
-    if not metrics_obj.seki_ema_on_device:
-        raise ValueError(
-            "KATAGO_COMPILE_TRAINING_LOSS=1 requires KATAGO_SEKI_EMA_ON_DEVICE=1 "
-            "to avoid a per-step Python scalar guard"
-        )
     logging.info(f"Compiling training loss with mode={get_compile_mode()}")
     return torch.compile(metrics_obj.metrics_dict_batchwise, mode=get_compile_mode(), dynamic=False)
 
