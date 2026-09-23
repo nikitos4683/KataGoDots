@@ -938,7 +938,9 @@ void NNEvaluator::serve(
       for(int row = 0; row<numRows; row++) {
         if(resultBufs[row]->symmetry == NNInputs::SYMMETRY_NOTSPECIFIED) {
           if(doRandomize)
-            resultBufs[row]->symmetry = rand.nextUInt(SymmetryHelpers::NUM_SYMMETRIES);
+            resultBufs[row]->symmetry = rand.nextUInt(
+              nnXLen == nnYLen ? SymmetryHelpers::NUM_SYMMETRIES : SymmetryHelpers::NUM_SYMMETRIES_WITHOUT_TRANSPOSE
+            );
           else {
             testAssert(defaultSymmetry >= 0 && defaultSymmetry <= SymmetryHelpers::NUM_SYMMETRIES-1);
             resultBufs[row]->symmetry = defaultSymmetry;
@@ -1061,10 +1063,12 @@ std::shared_ptr<NNOutput>* NNEvaluator::averageMultipleSymmetries(
 ) {
   MiscNNInputParams nnInputParams = baseNNInputParams;
   vector<std::shared_ptr<NNOutput>> ptrs;
+  const int numValidSymmetries =
+    nnXLen == nnYLen ? SymmetryHelpers::NUM_SYMMETRIES : SymmetryHelpers::NUM_SYMMETRIES_WITHOUT_TRANSPOSE;
   std::array<int, SymmetryHelpers::NUM_SYMMETRIES> symmetryIndexes;
   std::iota(symmetryIndexes.begin(), symmetryIndexes.end(), 0);
-  for(int i = 0; i<numSymmetriesToSample; i++) {
-    std::swap(symmetryIndexes[i], symmetryIndexes[rand.nextInt(i,SymmetryHelpers::NUM_SYMMETRIES-1)]);
+  for(int i = 0; i<std::min(numSymmetriesToSample,numValidSymmetries); i++) {
+    std::swap(symmetryIndexes[i], symmetryIndexes[rand.nextInt(i,numValidSymmetries-1)]);
     nnInputParams.symmetry = symmetryIndexes[i];
     bool skipCacheThisIteration = true; // Skip cache since there's no guarantee which symmetry is in the cache
     evaluate(
