@@ -162,7 +162,6 @@ if __name__ == "__main__":
     optional_args.add_argument('-meta-kata-only-soft-policy', help='Mask soft policy on non-kata rows using sgfmeta', required=False, action='store_true')
     optional_args.add_argument('-value-loss-scale', type=float, default=0.6, help='Additional value loss coeff', required=False)
     optional_args.add_argument('-td-value-loss-scales', type=str, default="0.6,0.6,0.6", help='Additional td value loss coeffs, 3 comma separated values', required=False)
-    optional_args.add_argument('-seki-loss-scale', type=float, default=1.0, help='Additional seki loss coeff', required=False)
     optional_args.add_argument('-variance-time-loss-scale', type=float, default=1.0, help='Additional variance time loss coeff', required=False)
 
     optional_args.add_argument('-main-loss-scale', type=float, help='Loss factor scale for main head', required=False)
@@ -453,7 +452,6 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     meta_kata_only_soft_policy = args["meta_kata_only_soft_policy"]
     value_loss_scale = args["value_loss_scale"]
     td_value_loss_scales = [float(x) for x in args["td_value_loss_scales"].split(",")]
-    seki_loss_scale = args["seki_loss_scale"]
     variance_time_loss_scale = args["variance_time_loss_scale"]
 
     main_loss_scale = args["main_loss_scale"]
@@ -1179,7 +1177,6 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     logging.info(f"meta_kata_only_soft_policy {meta_kata_only_soft_policy}")
     logging.info(f"value_loss_scale {value_loss_scale}")
     logging.info(f"td_value_loss_scales {td_value_loss_scales}")
-    logging.info(f"seki_loss_scale {seki_loss_scale}")
     logging.info(f"variance_time_loss_scale {variance_time_loss_scale}")
     logging.info(f"main_loss_scale {main_loss_scale}")
     logging.info(f"intermediate_loss_scale {intermediate_loss_scale}")
@@ -1737,7 +1734,6 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                     meta_kata_only_soft_policy=meta_kata_only_soft_policy,
                     value_loss_scale=value_loss_scale,
                     td_value_loss_scales=td_value_loss_scales,
-                    seki_loss_scale=seki_loss_scale,
                     variance_time_loss_scale=variance_time_loss_scale,
                     main_loss_scale=main_loss_scale,
                     intermediate_loss_scale=intermediate_loss_scale,
@@ -2006,7 +2002,6 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                             meta_kata_only_soft_policy=meta_kata_only_soft_policy,
                             value_loss_scale=value_loss_scale,
                             td_value_loss_scales=td_value_loss_scales,
-                            seki_loss_scale=seki_loss_scale,
                             variance_time_loss_scale=variance_time_loss_scale,
                             main_loss_scale=main_loss_scale,
                             intermediate_loss_scale=intermediate_loss_scale,

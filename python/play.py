@@ -359,11 +359,8 @@ known_commands = [
     'policy1',
     'logpolicy',
     'ownership',
-    'scoring',
     'futurepos0',
     'futurepos1',
-    'seki',
-    'seki2',
     'scorebelief',
     'passalive',
 ]
@@ -372,11 +369,8 @@ known_analyze_commands = [
     'gfx/Policy1/policy1',
     'gfx/LogPolicy/logpolicy',
     'gfx/Ownership/ownership',
-    'gfx/Scoring/scoring',
     'gfx/FuturePos0/futurepos0',
     'gfx/FuturePos1/futurepos1',
-    'gfx/Seki/seki',
-    'gfx/Seki2/seki2',
     'gfx/ScoreBelief/scorebelief',
     'gfx/PassAlive/passalive',
 ]
@@ -543,10 +537,6 @@ while True:
         outputs = gs.get_model_outputs(model)
         gfx_commands = get_gfx_commands_for_heatmap(outputs["ownership_by_loc"], gs.board, normalization_div=None, is_percent=True, value_and_score_from=None, hotcold=True)
         ret = "\n".join(gfx_commands)
-    elif command[0] == "scoring":
-        outputs = gs.get_model_outputs(model)
-        gfx_commands = get_gfx_commands_for_heatmap(outputs["scoring_by_loc"], gs.board, normalization_div=None, is_percent=True, value_and_score_from=None, hotcold=True)
-        ret = "\n".join(gfx_commands)
     elif command[0] == "futurepos0":
         outputs = gs.get_model_outputs(model)
         gfx_commands = get_gfx_commands_for_heatmap(outputs["futurepos0_by_loc"], gs.board, normalization_div=None, is_percent=True, value_and_score_from=None, hotcold=True)
@@ -555,15 +545,6 @@ while True:
         outputs = gs.get_model_outputs(model)
         gfx_commands = get_gfx_commands_for_heatmap(outputs["futurepos1_by_loc"], gs.board, normalization_div=None, is_percent=True, value_and_score_from=None, hotcold=True)
         ret = "\n".join(gfx_commands)
-    elif command[0] == "seki":
-        outputs = gs.get_model_outputs(model)
-        gfx_commands = get_gfx_commands_for_heatmap(outputs["seki_by_loc"], gs.board, normalization_div=None, is_percent=True, value_and_score_from=None)
-        ret = "\n".join(gfx_commands)
-    elif command[0] == "seki2":
-        outputs = gs.get_model_outputs(model)
-        gfx_commands = get_gfx_commands_for_heatmap(outputs["seki_by_loc2"], gs.board, normalization_div=None, is_percent=True, value_and_score_from=None)
-        ret = "\n".join(gfx_commands)
-
     elif command[0] == "policy_raw":
         outputs = gs.get_model_outputs(model)
         ret = "\n"
@@ -589,21 +570,12 @@ while True:
     elif command[0] == "ownership_raw":
         outputs = gs.get_model_outputs(model)
         ret = get_board_matrix_str(outputs["ownership"], 100.0, "%+7.3f")
-    elif command[0] == "scoring_raw":
-        outputs = gs.get_model_outputs(model)
-        ret = get_board_matrix_str(outputs["scoring"], 100.0, "%+7.3f")
     elif command[0] == "futurepos0_raw":
         outputs = gs.get_model_outputs(model)
         ret = get_board_matrix_str(outputs["futurepos"][0], 100.0, "%+7.3f")
     elif command[0] == "futurepos1_raw":
         outputs = gs.get_model_outputs(model)
         ret = get_board_matrix_str(outputs["futurepos"][1], 100.0, "%+7.3f")
-    elif command[0] == "seki_raw":
-        outputs = gs.get_model_outputs(model)
-        ret = get_board_matrix_str(outputs["seki"], 100.0, "%+7.3f")
-    elif command[0] == "seki2_raw":
-        outputs = gs.get_model_outputs(model)
-        ret = get_board_matrix_str(outputs["seki2"], 100.0, "%+7.3f")
     elif command[0] == "qwinloss_raw":
         outputs = gs.get_model_outputs(model)
         ret = "\n"
