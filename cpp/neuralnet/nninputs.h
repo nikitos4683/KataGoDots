@@ -187,7 +187,8 @@ namespace NNInputs {
     bool useNHWC,
     float* rowBin,
     float* rowGlobal,
-    bool selfplay
+    bool selfplay,
+    std::vector<Loc>* dotsReasonableMoves = nullptr
   );
   void fillRowV3(
     const Board& board, const BoardHistory& boardHistory, Player nextPlayer,
@@ -219,7 +220,8 @@ namespace NNInputs {
     bool useNHWC,
     float* rowBin,
     float* rowGlobal,
-    bool selfplay
+    bool selfplay,
+    std::vector<Loc>* reasonableMoves = nullptr
   );
 
   //If groupTax is specified, for each color region of area, reduce weight on empty spaces equally to reduce the total sum by 2.

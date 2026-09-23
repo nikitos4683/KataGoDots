@@ -83,6 +83,7 @@ namespace Tests {
   //testnninputs.cpp
   void runNNInputsV3V4Tests();
   void runExcludeTerritoryAtariNNInputsTests();
+  void runDotsNNInputsTests();
 
   //testsymmetries.cpp
   void runBasicSymmetryTests();
