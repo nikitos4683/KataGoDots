@@ -226,7 +226,7 @@ static httplib::Result oneShotDownload(
       if(proxyUrl.username != "")
         httpClient->set_proxy_basic_auth(proxyUrl.username.c_str(), proxyUrl.password.c_str());
     }
-    //Avoid automatically decompressing .bin.gz files that get sent to us with "content-encoding: gzip"
+    //Keep compressed model files byte-for-byte intact when sent with "content-encoding: gzip".
     httpClient->set_decompress(false);
     return httpClient->Get(url.path.c_str(),headers,responseHandler,contentReceiver);
   }
@@ -240,7 +240,7 @@ static httplib::Result oneShotDownload(
     }
     httpsClient->set_ca_cert_path(caCertsFile.c_str());
     httpsClient->enable_server_certificate_verification(true);
-    //Avoid automatically decompressing .bin.gz files that get sent to us with "content-encoding: gzip"
+    //Keep compressed model files byte-for-byte intact when sent with "content-encoding: gzip".
     httpsClient->set_decompress(false);
     httplib::Result response = httpsClient->Get(url.path.c_str(),headers,responseHandler,contentReceiver);
     if(response == nullptr) {
@@ -857,13 +857,23 @@ bool Connection::getNextTask(
   return retryLoop("getNextTask",(retryOnFailure ? DEFAULT_MAX_TRIES : 1),shouldStop,f);
 }
 
+static string modelFileExtension(const Client::ModelInfo& modelInfo) {
+  string url = Global::toLower(modelInfo.downloadUrl);
+  url = url.substr(0, url.find_first_of("?#"));
+  if(Global::isSuffix(url,".onnx.gz"))
+    return ".onnx.gz";
+  if(Global::isSuffix(url,".onnx"))
+    return ".onnx";
+  if(Global::isSuffix(url,".txt.gz"))
+    return ".txt.gz";
+  return ".bin.gz";
+}
+
 //STATIC method
 string Connection::getModelPath(const Client::ModelInfo& modelInfo, const string& modelDir) {
   if(modelInfo.isRandom)
     return "/dev/null";
-  if(Global::isSuffix(modelInfo.downloadUrl,".txt.gz"))
-    return modelDir + "/" + modelInfo.name + ".txt.gz";
-  return modelDir + "/" + modelInfo.name + ".bin.gz";
+  return modelDir + "/" + modelInfo.name + modelFileExtension(modelInfo);
 }
 string Connection::getTmpModelPath(const Client::ModelInfo& modelInfo, const string& modelDir) {
   if(modelInfo.isRandom)
@@ -876,9 +886,7 @@ string Connection::getTmpModelPath(const Client::ModelInfo& modelInfo, const str
     for(int i = 0; i<10; i++)
       randStr += chars[rand.nextUInt(len)];
   }
-  if(Global::isSuffix(modelInfo.downloadUrl,".txt.gz"))
-    return modelDir + "/" + modelInfo.name + ".tmp." + randStr + ".txt.gz";
-  return modelDir + "/" + modelInfo.name + ".tmp." + randStr + ".bin.gz";
+  return modelDir + "/" + modelInfo.name + ".tmp." + randStr + modelFileExtension(modelInfo);
 }
 
 void Client::ModelInfo::failIfSha256Mismatch(const string& modelPath) const {

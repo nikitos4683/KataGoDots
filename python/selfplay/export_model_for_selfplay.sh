@@ -1,4 +1,5 @@
 #!/bin/bash -eu
+set -eu
 set -o pipefail
 {
 #Takes any models in torchmodels_toexport/ and outputs a cuda-runnable model file to modelstobetested/
@@ -74,20 +75,53 @@ function exportStuff() {
                 mkdir "$TMPDST"
 
                 set -x
-                $PYTHON ./export_model_pytorch.py \
-                        -checkpoint "$SRC/model.ckpt" \
-                        -export-dir "$TMPDST" \
-                        -model-name "$NAMEPREFIX-$NAME" \
-                        -filename-prefix model \
-                        -use-swa
+                if ! FORMAT="$($PYTHON ./model_export_format.py "$SRC/model.ckpt")"; then
+                    echo "Could not determine model format: $SRC" >&2
+                    exit 1
+                fi
+                if [ "$FORMAT" = "onnx" ]; then
+                    if ! $PYTHON ./export_model_onnx.py \
+                            -checkpoint "$SRC/model.ckpt" \
+                            -out "$TMPDST/model.onnx" \
+                            -model-name "$NAMEPREFIX-$NAME" \
+                            -selfplay-sidecars \
+                            -use-swa; then
+                        echo "ONNX export failed: $SRC" >&2
+                        exit 1
+                    fi
+                    MODEL_OUTPUT="$TMPDST/model.onnx"
+                elif [ "$FORMAT" = "bin" ]; then
+                    if ! $PYTHON ./export_model_pytorch.py \
+                            -checkpoint "$SRC/model.ckpt" \
+                            -export-dir "$TMPDST" \
+                            -model-name "$NAMEPREFIX-$NAME" \
+                            -filename-prefix model \
+                            -use-swa; then
+                        echo "Binary export failed: $SRC" >&2
+                        exit 1
+                    fi
+                    MODEL_OUTPUT="$TMPDST/model.bin"
+                else
+                    echo "Unknown model format: $FORMAT" >&2
+                    exit 1
+                fi
+                if [ ! -s "$MODEL_OUTPUT" ]; then
+                    echo "Exported model is missing or empty: $MODEL_OUTPUT" >&2
+                    exit 1
+                fi
 
-                $PYTHON ./clean_checkpoint.py \
+                if ! $PYTHON ./clean_checkpoint.py \
                         -checkpoint "$SRC/model.ckpt" \
-                        -output "$TMPDST/model.ckpt"
+                        -output "$TMPDST/model.ckpt"; then
+                    echo "Checkpoint cleaning failed: $SRC" >&2
+                    exit 1
+                fi
                 set +x
 
                 rm -r "$SRC"
-                gzip "$TMPDST"/model.bin
+                if [ "$FORMAT" = "bin" ]; then
+                    gzip "$TMPDST"/model.bin
+                fi
 
                 #Make a bunch of the directories that selfplay will need so that there isn't a race on the selfplay
                 #machines to concurrently make it, since sometimes concurrent making of the same directory can corrupt

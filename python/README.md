@@ -10,7 +10,9 @@ These are the most critical scripts needed for training neural nets.
 * `katago/train/metrics_pytorch.py` - Implementation of loss functions and other metrics for training.
 * `katago/train/modelconfigs.py` - Specific channel and block configurations for different-sized nets. These are codes that you can supply to `train.py` as an argument to pick the net size.
 * `train.py` - Trains the neural net using the shuffled data and saves it to a SavedModel periodically, used by `selfplay/train.sh`.
-* `export_model.py` - Exports the trained neural net pytorch checkpoints to KataGo's .bin.gz format. Used by `selfplay/export_model_for_selfplay.sh`.
+* `export_model_pytorch.py` - Exports trained PyTorch checkpoints to KataGo's `.bin.gz` format, including ordinary transformer models.
+* `export_model_onnx.py` - Exports checkpoints to self-contained ONNX files for TensorRT when an architecture uses operations the `.bin.gz` path cannot represent. See [ONNX model files](../docs/ONNX_Model_Files.md).
+* `selfplay/export_model_for_selfplay.sh` chooses `.bin.gz` or ONNX based on the blocks and options the model uses.
 
 And:
 

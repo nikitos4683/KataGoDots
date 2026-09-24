@@ -1,4 +1,5 @@
 #!/bin/bash -eu
+set -eu
 set -o pipefail
 {
 # Takes any models in modelstobetested/ and uploads them, then moves them to modelsuploaded/
@@ -73,7 +74,13 @@ function uploadStuff() {
                 rm "$TOBEZIPPED"/*
                 rmdir "$TOBEZIPPED"
 
-                cp "$SRC/model.bin.gz" "$TMPDST/$RUNNAME-$NAME.bin.gz"
+                if [ -f "$SRC/model.onnx" ]; then
+                    MODELFILE="$TMPDST/$RUNNAME-$NAME.onnx"
+                    cp "$SRC/model.onnx" "$MODELFILE"
+                else
+                    MODELFILE="$TMPDST/$RUNNAME-$NAME.bin.gz"
+                    cp "$SRC/model.bin.gz" "$MODELFILE"
+                fi
                 cp "$SRC/metadata.json" "$TMPDST/metadata.json"
                 cp "$SRC/log.txt" "$TMPDST/log.txt"
 
@@ -89,7 +96,7 @@ function uploadStuff() {
                     $PYTHON ./upload_model.py \
                             -run-name "$RUNNAME" \
                             -model-name "$RUNNAME-$NAME" \
-                            -model-file "$TMPDST/$RUNNAME-$NAME.bin.gz" \
+                            -model-file "$MODELFILE" \
                             -model-zip "$TMPDST/$RUNNAME-$NAME.zip" \
                             -upload-log-file "$TMPDST/upload_log.txt" \
                             -metadata-file "$TMPDST/metadata.json" \

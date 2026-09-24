@@ -3,6 +3,9 @@
 #include "../core/fileutils.h"
 #include "../dataio/files.h"
 #include "../dataio/loadmodel.h"
+#ifdef BUILD_DISTRIBUTED
+#include "../distributed/client.h"
+#endif
 #include "../neuralnet/desc.h"
 
 #include <chrono>
@@ -40,6 +43,17 @@ void Tests::runLoadModelTests() {
   bool logToStderrDefault = false;
   bool logTimeDefault = false;
   Logger logger(nullptr, logToStdoutDefault, logToStderrDefault, logTimeDefault);
+
+#ifdef BUILD_DISTRIBUTED
+  {
+    Client::ModelInfo modelInfo{};
+    modelInfo.name = "dots-transformer";
+    modelInfo.downloadUrl = "https://example.com/models/model.onnx?token=example";
+    testAssert(Client::Connection::getModelPath(modelInfo, "models") == "models/dots-transformer.onnx");
+    modelInfo.downloadUrl = "https://example.com/models/model.onnx.gz";
+    testAssert(Client::Connection::getModelPath(modelInfo, "models") == "models/dots-transformer.onnx.gz");
+  }
+#endif
 
   {
     string modelsDir = "tests/models/findLatestModelTest1";

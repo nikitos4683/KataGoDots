@@ -42,6 +42,34 @@ katago gtp -model model.onnx -config configs/gtp_example.cfg
 
 Four things are fixed when the graph is built and cannot be changed afterwards: the board buffer size, whether the graph does board masking, the transformer trunk layout, and the scale8 rescaling. The config options for them have no effect on an already-built graph, and KataGo logs a warning if you set one. Board size and masking mode are checked against what the run needs, and a mismatch is an error rather than a wrong evaluation. A masked graph is fine to use in a run where every position happens to fill the buffer, just slightly slower than a graph built for exactly that size.
 
+## Exporting a Dots training checkpoint
+
+For architectures that the `.bin.gz` exporter cannot represent, export a checkpoint from
+`python/` as a self-contained ONNX model:
+
+```bash
+python -m pip install onnx onnxscript
+python export_model_onnx.py -checkpoint /path/to/model.ckpt \
+  -use-swa -out /path/to/model.onnx -model-name dots-model
+```
+
+The checkpoint supplies the architecture, game, and board dimensions. For an older
+checkpoint without game or dimensions, pass `-game dots -pos-len-x 39 -pos-len-y 32`.
+To exercise a configuration without training it, use `-export-random-initialized-model NAME`
+in place of `-checkpoint` and omit `-use-swa`.
+
+The GTP and analysis engines accept `-model /path/to/model.onnx` on TensorRT or ONNX Runtime.
+The NN buffer must match the exported dimensions; set `maxBoardXSizeForNNBuffer` and
+`maxBoardYSizeForNNBuffer` in the engine config when they differ from its defaults.
+The selfplay export script uses `.bin.gz` for supported architectures and ONNX for
+configurations requiring the full PyTorch graph. Distributed upload/client scripts
+preserve `.onnx` filenames; a remote training server must also accept ONNX uploads.
+
+PyTorch FlexAttention is an execution path for eligible attention blocks. During ONNX
+export, the exporter temporarily selects equivalent matrix multiplication and softmax
+operations, then restores the model's FlexAttention setting. TensorRT chooses its own
+kernels for the graph, so runtime performance may differ from PyTorch.
+
 ## The model file format
 
 An ONNX graph says nothing about what KataGo's inputs and outputs mean, which model version's feature encoding to use, or how to turn the outputs into a winrate and a score. Those parameters travel in the ModelProto's `metadata_props` under `katago.` keys. A file without them is refused, since nothing else can supply them.

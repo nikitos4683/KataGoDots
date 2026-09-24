@@ -103,8 +103,12 @@ if model_file.endswith(".bin.gz"):
     model_file_extension = ".bin.gz"
 elif model_file.endswith(".txt.gz"):
     model_file_extension = ".txt.gz"
+elif model_file.endswith(".onnx.gz"):
+    model_file_extension = ".onnx.gz"
+elif model_file.endswith(".onnx"):
+    model_file_extension = ".onnx"
 else:
-    raise Exception("Model file must end in .bin.gz or .txt.gz")
+    raise Exception("Model file must end in .bin.gz, .txt.gz, .onnx, or .onnx.gz")
 
 possible_parents = []
 if parents_dir is not None:

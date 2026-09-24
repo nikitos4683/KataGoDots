@@ -20,12 +20,16 @@ std::time_t to_time_t(TP tp)
 static const vector<string> ACCEPTABLE_MODEL_SUFFIXES {
   ".bin.gz",
   ".bin",
+  ".onnx.gz",
+  ".onnx",
   "model.txt.gz",
   "model.txt"
 };
 static const vector<string> GENERIC_MODEL_NAMES {
   "model.bin.gz",
   "model.bin",
+  "model.onnx.gz",
+  "model.onnx",
   "model.txt.gz",
   "model.txt",
   "Model.bin.gz",
@@ -113,6 +117,8 @@ void LoadModel::deleteModelsOlderThan(const string& modelsDir, Logger& logger, c
       continue;
     string filePathStr = filePath.u8string();
     if(Global::isSuffix(filePathStr,".bin.gz") ||
+       Global::isSuffix(filePathStr,".onnx.gz") ||
+       Global::isSuffix(filePathStr,".onnx") ||
        Global::isSuffix(filePathStr,".txt.gz") ||
        Global::isSuffix(filePathStr,".bin") ||
        Global::isSuffix(filePathStr,".txt")) {
