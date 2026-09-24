@@ -20,7 +20,10 @@ from torch.optim.swa_utils import AveragedModel
 from katago.train.model_pytorch import RMSNormMask
 
 from katago.train import modelconfigs
-from katago.train.model_pytorch import Model, ResBlock, NestedBottleneckResBlock, TransformerAttentionBlock, TransformerFFNBlock, NestedBottleneckTransformerBlock
+from katago.train.model_pytorch import (
+    Game, Model, ResBlock, NestedBottleneckResBlock,
+    TransformerAttentionBlock, TransformerFFNBlock, NestedBottleneckTransformerBlock,
+)
 from katago.train.model_pytorch import compute_attn_logit_dataless_bounds
 from katago.train.load_model import load_model
 
@@ -183,6 +186,9 @@ Export neural net weights to file for KataGo engine.
 parser = argparse.ArgumentParser(description=description)
 parser.add_argument('-checkpoint', help='Checkpoint to test', required=False)
 parser.add_argument('-export-random-initialized-model', help='Instead of loading a checkpoint, export a freshly random-initialized model of the given model config name (e.g. b15c512h8nbttflrs-fson-silu-rsnh)', required=False)
+parser.add_argument('-pos-len-x', type=int, default=19, help='Board width for a randomly initialized model')
+parser.add_argument('-pos-len-y', type=int, default=19, help='Board height for a randomly initialized model')
+parser.add_argument('-game', choices=['go', 'dots'], default='go', help='Game for a randomly initialized model')
 parser.add_argument('-export-dir', help='model file dir to save to', required=True)
 parser.add_argument('-model-name', help='name to record in model file', required=True)
 parser.add_argument('-filename-prefix', help='filename prefix to save to within dir', required=True)
@@ -233,7 +239,7 @@ def main(args):
         model_config = modelconfigs.config_of_name[export_random_initialized_model]
         logging.info(f"Exporting freshly random-initialized model with config: {export_random_initialized_model}")
         logging.info(str(model_config))
-        model = Model(model_config, pos_len=19)
+        model = Model(model_config, args['pos_len_x'], args['pos_len_y'], games=[Game[args['game'].upper()]])
         model.initialize()
         model.to("cpu")
         swa_model = None

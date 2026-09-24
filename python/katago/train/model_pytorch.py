@@ -1182,7 +1182,7 @@ class DilationNestedBottleneckResBlock(torch.nn.Module):
 #
 # RoPE (Rotary Position Embeddings):
 # Static positional encoding. Precomputes sin/cos tables for the full
-# pos_len x pos_len grid and rotates Q/K vectors so that their dot product depends
+# board grid and rotates Q/K vectors so that their dot product depends
 # on relative position based on fixed frequencies regardless of board content.
 # Requires head_dim % 4 == 0 for 2D interleaved layout.
 # Only axis-aligned frequencies are included, cannot express diagonal attention
@@ -1268,17 +1268,19 @@ class DilationNestedBottleneckResBlock(torch.nn.Module):
 # mean pooling also masks off-board positions when summarizing the board state.
 # =============================================================================
 
-def precompute_freqs_cos_sin_2d(dim, pos_len, theta=100.0):
+def precompute_freqs_cos_sin_2d(dim, pos_len_x, pos_len_y, theta=100.0):
     """Precompute cos and sin tables of 2D frequencies for RoPE (real-valued, interleaved layout).
-    Returns shape: (pos_len * pos_len, dim)
+    Returns shape: (pos_len_x * pos_len_y, dim)
     """
     assert dim % 4 == 0
     dim_half = dim // 2
 
     freqs = 1.0 / (theta ** (torch.arange(0, dim_half, 2).float() / dim_half))
 
-    t = torch.arange(pos_len, dtype=torch.float32)
-    grid_h, grid_w = torch.meshgrid(t, t, indexing='ij')
+    grid_h, grid_w = torch.meshgrid(
+        torch.arange(pos_len_y, dtype=torch.float32),
+        torch.arange(pos_len_x, dtype=torch.float32), indexing='ij'
+    )
 
     emb_h = grid_h.unsqueeze(-1) * freqs
     emb_w = grid_w.unsqueeze(-1) * freqs
@@ -1447,9 +1449,9 @@ class GABTemplateMLP(torch.nn.Module):
     """Shared module that maps relative (dr, dc) offsets to T template values.
     Computed once and shared across all GAB-enabled transformer blocks.
     """
-    def __init__(self, gab_num_templates, gab_num_fourier_features, gab_mlp_hidden, pos_len, activation):
+    def __init__(self, gab_num_templates, gab_num_fourier_features, gab_mlp_hidden, pos_len_x, pos_len_y, activation):
         # Let F = gab_num_fourier_features, H = gab_mlp_hidden, T = gab_num_templates
-        # S = pos_len * pos_len (max spatial positions)
+        # S = pos_len_x * pos_len_y (max spatial positions)
         super().__init__()
         self.gab_num_templates = gab_num_templates
         self.activation = activation
@@ -1464,9 +1466,9 @@ class GABTemplateMLP(torch.nn.Module):
         self.linear1 = torch.nn.Linear(fourier_input_dim, gab_mlp_hidden)  # (8*F) -> (H)
         self.linear2 = torch.nn.Linear(gab_mlp_hidden, gab_num_templates)  # (H) -> (T)
 
-        S = pos_len * pos_len
+        S = pos_len_x * pos_len_y
         s_idx = torch.arange(S)
-        s_r, s_c = s_idx // pos_len, s_idx % pos_len
+        s_r, s_c = s_idx // pos_len_x, s_idx % pos_len_x
         offset_dr = (s_r.unsqueeze(1) - s_r.unsqueeze(0)).float()  # (S, S)
         offset_dc = (s_c.unsqueeze(1) - s_c.unsqueeze(0)).float()  # (S, S)
         self.register_buffer("offset_dr", offset_dr, persistent=False)
@@ -1603,7 +1605,7 @@ class TABModule(torch.nn.Module):
 
     Computed once and shared across all transformer blocks.
     """
-    def __init__(self, trunk_channels, tab_c_z, tab_num_templates, tab_num_freqs, tab_num_blocks, tab_dilation, activation, pos_len):
+    def __init__(self, trunk_channels, tab_c_z, tab_num_templates, tab_num_freqs, tab_num_blocks, tab_dilation, activation):
         super().__init__()
         self.tab_c_z = tab_c_z
         self.tab_num_freqs = tab_num_freqs
@@ -1839,7 +1841,7 @@ class FrequencyMixingTABModule(torch.nn.Module):
     convs in the unrotated frame, spatial mixing happens via depthwise convs in the
     rotated frame. This preserves translational equivariance.
     """
-    def __init__(self, trunk_channels, tab_c_z, tab_num_templates, tab_num_blocks, tab_dilation, activation, pos_len):
+    def __init__(self, trunk_channels, tab_c_z, tab_num_templates, tab_num_blocks, tab_dilation, activation):
         super().__init__()
         self.tab_c_z = tab_c_z  # = number of frequencies
         self.tab_num_templates = tab_num_templates
@@ -1955,7 +1957,8 @@ class NestedBottleneckTransformerBlock(torch.nn.Module):
         c_mid: int,
         config: modelconfigs.ModelConfig,
         activation: str,
-        pos_len: int,
+        pos_len_x: int,
+        pos_len_y: int,
         use_swiglu: bool,
         use_rope: bool = True,
         use_gab: bool = False,
@@ -1985,7 +1988,8 @@ class NestedBottleneckTransformerBlock(torch.nn.Module):
                 c_main=c_mid,
                 config=config,
                 activation=activation,
-                pos_len=pos_len,
+                pos_len_x=pos_len_x,
+                pos_len_y=pos_len_y,
                 use_rope=use_rope,
                 use_gab=use_gab,
                 use_tab=use_tab,
@@ -2111,7 +2115,8 @@ class TransformerAttentionBlock(torch.nn.Module):
         c_main,
         config,
         activation,
-        pos_len,
+        pos_len_x,
+        pos_len_y,
         use_rope=True,
         use_gab=False,
         use_tab=False,
@@ -2198,13 +2203,17 @@ class TransformerAttentionBlock(torch.nn.Module):
                     * (torch.randint(0, 2, (self.num_kv_heads, num_pairs, 2)) * 2 - 1).float()
                 )
                 self.rope_freqs = torch.nn.Parameter(init_freqs)  # (num_kv_heads, P, 2)
-                self.pos_len = pos_len
+                self.pos_len_x = pos_len_x
+                self.pos_len_y = pos_len_y
                 self.cos_cached = None
                 self.sin_cached = None
             else:
                 self.rope_theta = config.get("rope_theta", 100.0)
-                assert self.rope_theta > pos_len * 2.0, f"theta={self.rope_theta} of RoPE may be too small for pos_len={pos_len}"
-                cos_cached, sin_cached = precompute_freqs_cos_sin_2d(self.q_head_dim, pos_len, self.rope_theta)
+                assert self.rope_theta > max(pos_len_x, pos_len_y) * 2.0, \
+                    f"theta={self.rope_theta} of RoPE may be too small for board {pos_len_x}x{pos_len_y}"
+                cos_cached, sin_cached = precompute_freqs_cos_sin_2d(
+                    self.q_head_dim, pos_len_x, pos_len_y, self.rope_theta
+                )
                 self.register_buffer("cos_cached", cos_cached, persistent=False)
                 self.register_buffer("sin_cached", sin_cached, persistent=False)
         else:
@@ -2393,8 +2402,8 @@ class TransformerAttentionBlock(torch.nn.Module):
                     s_y = reg_state.all_pos_y  # (B, S)
                 else:
                     s_idx = torch.arange(seq_len, device=q.device)
-                    s_y = (s_idx // self.pos_len).float()  # row
-                    s_x = (s_idx % self.pos_len).float()   # col
+                    s_y = (s_idx // self.pos_len_x).float()  # row
+                    s_x = (s_idx % self.pos_len_x).float()   # col
                 cos_k, sin_k = compute_learnable_rope_cos_sin(s_x, s_y, self.rope_freqs)  # ([B,] S, H_kv, P)
                 # For Q: expand kv head freqs to match num_heads if using grouped-query attention.
                 # cos_k/sin_k are ([B,] S, H_kv, P); repeat each kv head n_rep times along a new axis
@@ -2529,7 +2538,7 @@ class TransformerAttentionBlock(torch.nn.Module):
                 block_mask=flex_block_mask,
                 scale=scale,
             )
-        elif not wants_attn_weights:
+        elif not wants_attn_weights and not getattr(self, "onnx_export", False):
             attn_output = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=attn_mask,
@@ -2550,8 +2559,12 @@ class TransformerAttentionBlock(torch.nn.Module):
 
             attn_output = torch.matmul(attn_weights, v)  # (B, H, S, Dv)
 
-        attn_output = attn_output.permute(0, 2, 1, 3).contiguous()
-        attn_output = attn_output.view(batch_size, seq_len, self.num_heads * self.v_head_dim)
+        if getattr(self, "onnx_export", False):
+            # Avoid a PyTorch ONNX decomposition error for the permute/flatten path.
+            attn_output = torch.cat([attn_output[:, head] for head in range(self.num_heads)], dim=-1)
+        else:
+            attn_output = attn_output.permute(0, 2, 1, 3).contiguous()
+            attn_output = attn_output.view(batch_size, seq_len, self.num_heads * self.v_head_dim)
         attn_output = self.out_proj(attn_output)
 
         if input_was_seq:
@@ -3220,7 +3233,8 @@ class Model(torch.nn.Module):
                 gab_num_templates=config["gab_num_templates"],
                 gab_num_fourier_features=config["gab_num_fourier_features"],
                 gab_mlp_hidden=config["gab_mlp_hidden"],
-                pos_len=pos_len,
+                pos_len_x=pos_len_x,
+                pos_len_y=pos_len_y,
                 activation=self.activation,
             )
         else:
@@ -3237,7 +3251,6 @@ class Model(torch.nn.Module):
                     tab_num_blocks=config["tab_num_blocks"],
                     tab_dilation=config["tab_dilation"],
                     activation=self.activation,
-                    pos_len=pos_len,
                 )
             else:
                 self.tab_module = TABModule(
@@ -3248,7 +3261,6 @@ class Model(torch.nn.Module):
                     tab_num_blocks=config["tab_num_blocks"],
                     tab_dilation=config["tab_dilation"],
                     activation=self.activation,
-                    pos_len=pos_len,
                 )
         else:
             self.tab_module = None
@@ -3337,7 +3349,8 @@ class Model(torch.nn.Module):
                     c_main=self.c_trunk,
                     config=self.config,
                     activation=self.activation,
-                    pos_len=pos_len,
+                    pos_len_x=pos_len_x,
+                    pos_len_y=pos_len_y,
                     use_rope=True,
                 ))
             elif block_kind == "attngab":
@@ -3346,7 +3359,8 @@ class Model(torch.nn.Module):
                     c_main=self.c_trunk,
                     config=self.config,
                     activation=self.activation,
-                    pos_len=pos_len,
+                    pos_len_x=pos_len_x,
+                    pos_len_y=pos_len_y,
                     use_rope=False,
                     use_gab=True,
                 ))
@@ -3356,7 +3370,8 @@ class Model(torch.nn.Module):
                     c_main=self.c_trunk,
                     config=self.config,
                     activation=self.activation,
-                    pos_len=pos_len,
+                    pos_len_x=pos_len_x,
+                    pos_len_y=pos_len_y,
                     use_rope=True,
                     use_gab=True,
                 ))
@@ -3366,7 +3381,8 @@ class Model(torch.nn.Module):
                     c_main=self.c_trunk,
                     config=self.config,
                     activation=self.activation,
-                    pos_len=pos_len,
+                    pos_len_x=pos_len_x,
+                    pos_len_y=pos_len_y,
                     use_rope=True,
                     use_tab=True,
                 ))
@@ -3394,7 +3410,8 @@ class Model(torch.nn.Module):
                     c_mid=self.c_mid,
                     config=self.config,
                     activation=self.activation,
-                    pos_len=pos_len,
+                    pos_len_x=pos_len_x,
+                    pos_len_y=pos_len_y,
                     use_swiglu=False,
                     use_rope=True,
                 ))
@@ -3406,7 +3423,8 @@ class Model(torch.nn.Module):
                     c_mid=self.c_mid,
                     config=self.config,
                     activation=self.activation,
-                    pos_len=pos_len,
+                    pos_len_x=pos_len_x,
+                    pos_len_y=pos_len_y,
                     use_swiglu=True,
                     use_rope=True,
                 ))
@@ -3418,7 +3436,8 @@ class Model(torch.nn.Module):
                     c_mid=self.c_mid,
                     config=self.config,
                     activation=self.activation,
-                    pos_len=pos_len,
+                    pos_len_x=pos_len_x,
+                    pos_len_y=pos_len_y,
                     use_swiglu=True,
                     use_rope=True,
                 ))
@@ -3430,7 +3449,8 @@ class Model(torch.nn.Module):
                     c_mid=self.c_mid,
                     config=self.config,
                     activation=self.activation,
-                    pos_len=pos_len,
+                    pos_len_x=pos_len_x,
+                    pos_len_y=pos_len_y,
                     use_swiglu=True,
                     use_rope=False,
                     use_gab=True,
@@ -3443,7 +3463,8 @@ class Model(torch.nn.Module):
                     c_mid=self.c_mid,
                     config=self.config,
                     activation=self.activation,
-                    pos_len=pos_len,
+                    pos_len_x=pos_len_x,
+                    pos_len_y=pos_len_y,
                     use_swiglu=True,
                     use_rope=True,
                     use_gab=True,
@@ -3456,7 +3477,8 @@ class Model(torch.nn.Module):
                     c_mid=self.c_mid,
                     config=self.config,
                     activation=self.activation,
-                    pos_len=pos_len,
+                    pos_len_x=pos_len_x,
+                    pos_len_y=pos_len_y,
                     use_swiglu=True,
                     use_rope=False,
                     use_tab=True,
@@ -3469,7 +3491,8 @@ class Model(torch.nn.Module):
                     c_mid=self.c_mid,
                     config=self.config,
                     activation=self.activation,
-                    pos_len=pos_len,
+                    pos_len_x=pos_len_x,
+                    pos_len_y=pos_len_y,
                     use_swiglu=True,
                     use_rope=True,
                     use_tab=True,
@@ -3567,7 +3590,9 @@ class Model(torch.nn.Module):
             and not self.use_rw_registers
         )
         self.transformer_seq_layout = (
-            env_flag("KATAGO_TRANSFORMER_NHWC", default=True) and trunk_is_plain_transformer
+            env_flag("KATAGO_TRANSFORMER_NHWC", default=True)
+            and trunk_is_plain_transformer
+            and not config.get("transformer_ffn_depthwise_conv", False)
         )
         self.transformer_skip_redundant_masks = (
             env_flag("KATAGO_TRANSFORMER_SKIP_REDUNDANT_MASKS", default=True)
@@ -3958,9 +3983,8 @@ class Model(torch.nn.Module):
         seq_layout = self.transformer_seq_layout
         if seq_layout:
             seq_B, seq_C, seq_H, seq_W = out.shape
-            # Learnable RoPE position arithmetic inside blocks assumes the full
-            # pos_len x pos_len grid.
-            assert seq_H == self.pos_len and seq_W == self.pos_len
+            # Learnable RoPE position arithmetic inside blocks assumes the full board grid.
+            assert seq_H == self.pos_len_y and seq_W == self.pos_len_x
             out = out.view(seq_B, seq_C, seq_H * seq_W).transpose(1, 2).contiguous()
             mask = mask.view(seq_B, seq_H * seq_W, 1)
 
@@ -4366,5 +4390,5 @@ class Model(torch.nn.Module):
             pred_variance_time, # N
             pred_shortterm_value_error, # N
             pred_shortterm_score_error, # N
-            scorebelief_logits, # N, 2 * (self.pos_len*self.pos_len + EXTRA_SCORE_DISTR_RADIUS)
+            scorebelief_logits, # N, 2 * (self.pos_len_x*self.pos_len_y + EXTRA_SCORE_DISTR_RADIUS)
         )
