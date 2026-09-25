@@ -76,7 +76,7 @@ def _make_blocks(dev):
     config = modelconfigs.config_of_name["b11c768h12nbt3tflrs-fson-silu"].copy()
     pos_len = 19
     torch.manual_seed(0)
-    attn = TransformerAttentionBlock("attn", 384, config, "silu", pos_len, use_rope=True).to(dev)
+    attn = TransformerAttentionBlock("attn", 384, config, "silu", pos_len, pos_len, use_rope=True).to(dev)
     ffn = TransformerFFNBlock("ffn", 384, config, "silu", use_swiglu=True).to(dev)
     # Give the (identity-initialized) norms and zero-initialized projections nontrivial values.
     with torch.no_grad():
@@ -223,7 +223,7 @@ def test_compiled_model_matches_eager(model_kind, batch, per_block, monkeypatch)
     dev = torch.device("cuda")
     torch.manual_seed(3)
     cfg = modelconfigs.config_of_name[model_kind].copy()
-    model = Model(cfg, 19)
+    model = Model(cfg, 19, 19)
     model.initialize()
     model.to(dev)
     model.train()

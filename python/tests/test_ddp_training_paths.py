@@ -40,7 +40,7 @@ def test_per_block_compiled_trunk_matches_whole_model():
     dev = torch.device("cuda")
     torch.manual_seed(3)
     cfg = modelconfigs.config_of_name[MODEL_KIND].copy()
-    base = Model(cfg, 19)
+    base = Model(cfg, 19, 19)
     base.initialize()
     base.to(dev)
     base.train()
@@ -84,7 +84,7 @@ def _muon_gather_worker(rank, world, port, result_queue):
     try:
         torch.manual_seed(7)
         cfg = modelconfigs.config_of_name[MODEL_KIND].copy()
-        base = Model(cfg, 19)
+        base = Model(cfg, 19, 19)
         base.initialize()
         base.cuda()
 

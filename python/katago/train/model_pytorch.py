@@ -2184,6 +2184,7 @@ class TransformerAttentionBlock(torch.nn.Module):
         # See FUSED_ROPE_BACKWARD. The remaining conditions are checked per forward.
         self.fused_rope_backward = (
             FUSED_ROPE_BACKWARD
+            and pos_len_x == pos_len_y  # The fused kernel indexes a square board.
             and self.fused_qkv_proj
             and self.learnable_rope
             and self.num_kv_heads == self.num_heads
@@ -2373,7 +2374,7 @@ class TransformerAttentionBlock(torch.nn.Module):
             if use_fused_rope:
                 from .fused_rope import learnable_rope_qkv
                 q, k, v = learnable_rope_qkv(
-                    qkv, self.rope_freqs, self.pos_len, self.num_heads, self.q_head_dim, self.v_head_dim,
+                    qkv, self.rope_freqs, self.pos_len_x, self.num_heads, self.q_head_dim, self.v_head_dim,
                 )  # q, k rotated and v, each (B, H, S, head dim)
                 qkv_is_bhsd = True
             else:
@@ -4263,7 +4264,7 @@ class Model(torch.nn.Module):
         out = x_spatial + x_global
         if self.transformer_seq_layout:
             seq_B, seq_C, seq_H, seq_W = out.shape
-            assert seq_H == self.pos_len and seq_W == self.pos_len
+            assert seq_H == self.pos_len_y and seq_W == self.pos_len_x
             out = out.view(seq_B, seq_C, seq_H * seq_W).transpose(1, 2).contiguous()
         return out, mask, mask_sum_hw, mask_sum
 
