@@ -21,7 +21,8 @@ def _small_model(num_blocks=2, ffn_channels=None):
     if ffn_channels is not None:
         config["transformer_ffn_channels"] = ffn_channels
     torch.manual_seed(0)
-    model = Model(config, pos_len=19)
+    model = Model(config, pos_len_x=19, pos_len_y=19)
+    model.use_flex_attention = False  # CPU comparison should not invoke the compiled CUDA path.
     model.initialize()
     model.eval()
     return model
