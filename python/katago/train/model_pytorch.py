@@ -4239,6 +4239,10 @@ class Model(torch.nn.Module):
         out, mask, mask_sum_hw, mask_sum = self._per_block_embed(input_spatial, input_global)
         batch_size, _, orig_H, orig_W = mask.shape
 
+        ownership_mask = None
+        if self.games == [Game.DOTS]:
+            ownership_mask = (input_spatial[:, 3:5, :, :].sum(dim=1, keepdim=True) > 0.5).to(mask.dtype)
+
         block_shared_data = {}
         if self.use_flex_attention:
             block_shared_data[FLEX_BLOCK_MASK] = build_flex_attention_block_mask(mask, compile_inner=True)
@@ -4253,7 +4257,7 @@ class Model(torch.nn.Module):
                 block, out, residual, block_mask, mask_sum_hw, mask_sum, block_shared_data,
             )
         ub_list = block_shared_data[ATTN_LOGIT_UB]["ubs"] if self.attn_logit_penalty_cap is not None else None
-        return self._per_block_finish(out, residual, input_global, mask, mask_sum_hw, mask_sum, orig_H, orig_W, ub_list)
+        return self._per_block_finish(out, residual, input_global, mask, mask_sum_hw, mask_sum, orig_H, orig_W, ub_list, ownership_mask)
 
     def _per_block_embed(self, input_spatial, input_global):
         mask = input_spatial[:, 0:1, :, :].contiguous()
@@ -4274,7 +4278,7 @@ class Model(torch.nn.Module):
         residual = block(out, mask=mask, mask_sum_hw=mask_sum_hw, mask_sum=mask_sum, extra_outputs=None, block_shared_data=block_shared_data)
         return out, residual
 
-    def _per_block_finish(self, out, residual, input_global, mask, mask_sum_hw, mask_sum, orig_H, orig_W, ub_list):
+    def _per_block_finish(self, out, residual, input_global, mask, mask_sum_hw, mask_sum, orig_H, orig_W, ub_list, ownership_mask=None):
         out = out + residual
         if self.transformer_seq_layout:
             out = out.transpose(1, 2).reshape(out.shape[0], self.c_trunk, orig_H, orig_W)
@@ -4303,23 +4307,21 @@ class Model(torch.nn.Module):
                 out_miscvalue,
                 out_moremiscvalue,
                 out_ownership,
-                out_scoring,
                 out_futurepos,
-                out_seki,
                 out_scorebelief_logprobs,
             ) = self.value_head(
                 out, mask=mask_fp32, mask_sum_hw=mask_sum_hw_fp32, mask_sum=mask_sum_fp32,
                 input_global=input_global_fp32, extra_outputs=None,
             )
+            if ownership_mask is not None:
+                out_ownership = out_ownership * ownership_mask
         return ((
             out_policy,
             out_value,
             out_miscvalue,
             out_moremiscvalue,
             out_ownership,
-            out_scoring,
             out_futurepos,
-            out_seki,
             out_scorebelief_logprobs,
         ),)
 
