@@ -62,12 +62,16 @@ KataGoDots/
 │   │   ├── desc.{h,cpp}           # Model descriptor & weight parsing
 │   │   ├── modelversion.{h,cpp}   # Model version enumerations
 │   │   ├── nneval.{h,cpp}         # Multi-threaded batched evaluation server
-│   │   ├── nninputs.{h,cpp}       # Feature extraction interfaces
-│   │   ├── nninputsdots.cpp       # Dots spatial (22) and global (19) input features
+│   │   ├── nninputs.{h,cpp}       # Feature interfaces and Dots feature enums (22 spatial, 19 global)
+│   │   ├── nninputsdots.cpp       # Dots feature extraction
 │   │   ├── cudabackend.cpp        # CUDA + cuDNN backend
-│   │   ├── trtbackend.cpp         # TensorRT 10 & 11 backend (with onnxmodelbuilder)
+│   │   ├── trtbackend.cpp         # TensorRT backend
 │   │   ├── openclbackend.cpp      # OpenCL backend
-│   │   └── eigenbackend.cpp       # CPU backend with AVX2/FMA
+│   │   ├── eigenbackend.cpp       # CPU backend with AVX2/FMA
+│   │   ├── rocmbackend.cpp        # AMD ROCm backend
+│   │   ├── onnxbackend.cpp        # ONNX Runtime backend
+│   │   ├── onnxmodelbuilder.{h,cpp} # ONNX graph generation
+│   │   └── metalbackend.{h,cpp}  # Apple Metal backend (also metalbackend.swift)
 │   ├── program/                   # Top-level gameplay, setup, GTP config parsing
 │   ├── search/                    # MCTS/MCGS search engine
 │   │   ├── search.{h,cpp}         # Multithreaded MCTS search implementation
@@ -89,12 +93,13 @@ KataGoDots/
 │   │   ├── train.sh               # Python training script wrapper
 │   │   ├── shuffle.sh             # Data shuffler script wrapper
 │   │   └── export_model_for_selfplay.sh
-│   ├── tests/                     # Python unit tests
-│   │   └── test_training_data_generator.py
+│   ├── muon/                      # Muon-family training optimizers
+│   ├── tests/                     # Data, model, export, transformer, and optimizer tests
 │   ├── train.py                   # Main PyTorch training entry point
 │   ├── shuffle.py                 # Multi-threaded selfplay data shuffling script
 │   └── export_model_pytorch.py    # Checkpoint exporter to KataGo .bin.gz format
 ├── docs/                          # Documentation (Analysis Engine, GTP extensions, GraphSearch, etc.)
+├── .github/workflows/             # Build and ONNX backend CI checks
 ├── .clang-format                  # C++ code formatting rules (Chromium base, column limit 120, 2-space indent)
 └── pytest.ini                     # Pytest configuration rooted at python/tests
 ```
@@ -111,25 +116,20 @@ The primary CMake file is `cpp/CMakeLists.txt`. Key build options:
   - `CUDA`: Alternative NVIDIA GPU backend with cuDNN.
   - `OPENCL`: General GPU backend (NVIDIA, AMD, Intel).
   - `EIGEN`: CPU-only backend. Add `-DUSE_AVX2=1` on modern x86_64 processors for significant speedup.
+  - `ROCM`: AMD GPU backend (requires a ROCm/HIP installation; see `Compiling.md`).
+  - `ONNX`: ONNX Runtime backend with selectable execution providers (see `Compiling.md`).
   - `METAL`: Apple Silicon MPSGraph + CoreML backend.
-- `-DCMAKE_BUILD_TYPE=Release`: Use `Release` for optimal performance.
+- `-DCMAKE_BUILD_TYPE=Release`: Use `Release` with single-configuration generators. With Visual Studio, use `--config Release` when building.
 
 ### Windows (MSVC) Build
 Prerequisites: Visual Studio 2019/2022 (Desktop development with C++), CMake >= 3.18.2, vcpkg or prebuilt dependencies (`zlib`, `libzip`, `protobuf`, `TensorRT` if using TensorRT).
 
 ```powershell
-# Example: Building TensorRT backend with existing build tree in cpp/builds/trt-release
-cd cpp/builds/trt-release
-cmake --build . --config Release -j 4
-
-# Or configuring a fresh build with vcpkg:
-cd cpp
-mkdir build; cd build
-cmake .. -A x64 `
+# From the repository root, configure a fresh Visual Studio 2022 build with vcpkg:
+cmake -S cpp -B cpp/builds/msvc-opencl -G "Visual Studio 17 2022" -A x64 `
   -DUSE_BACKEND=OPENCL `
-  -DCMAKE_BUILD_TYPE=Release `
-  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
-cmake --build . --config Release -j 4
+  -DCMAKE_TOOLCHAIN_FILE="${env:VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+cmake --build cpp/builds/msvc-opencl --config Release -j 4
 ```
 
 > **Important (Windows DLLs)**: When running `katago.exe`, ensure the required runtime DLLs (`z.dll`, `zip.dll`, `libprotobuf.dll`, `abseil_dll.dll`, `bz2.dll`, `nvinfer.dll` etc.) are placed in the same directory as the executable.
@@ -148,8 +148,10 @@ make -j$(nproc)
 ### 1. C++ Built-in Test Suite
 Run the built-in unit tests and stress tests directly via `katago runtests`:
 ```powershell
-# From cpp/ directory (or pointing to compiled binary):
+# Run from cpp/ so the file-based config tests find tests/data/:
+Push-Location cpp
 .\katago.exe runtests
+Pop-Location
 ```
 This comprehensive suite runs:
 - Inline and file config parsing tests
@@ -168,8 +170,10 @@ Additional C++ test commands:
 ### 2. C++ Google Test Suite
 When compiled with `katago_tests`:
 ```powershell
-Release/katago_tests.exe
+# From the repository root; adjust the build directory for your build:
+.\cpp\builds\msvc-opencl\Release\katago_tests.exe
 ```
+For a single-configuration build (for example Ninja), the executable is directly in the build directory.
 Discovers and tests `tests/testdotsladders.cpp`, `tests/testdotsutils.cpp`, and `tests/testdotsstress.cpp`.
 
 ### 3. Python Unit Tests
@@ -178,7 +182,7 @@ The repository uses `pytest` configured in `pytest.ini`:
 # From repo root:
 pytest
 ```
-Runs unit tests for the data generator and shuffler in `python/tests/test_training_data_generator.py`.
+Collects tests in `python/tests/`, including data generation and rectangular training data, model export and ONNX architectures, transformer models, distributed training paths, and optimizer behavior. The root `pytest.ini` restricts collection to that directory.
 
 ---
 
@@ -187,7 +191,8 @@ Runs unit tests for the data generator and shuffler in `python/tests/test_traini
 ### GTP Engine (for GUIs & Controllers)
 Dots games can be played over GTP using `cpp/configs/gtp_dots.cfg`:
 ```powershell
-.\katago.exe gtp -config cpp/configs/gtp_dots.cfg -model <MODEL_PATH>.bin.gz
+# From the repository root:
+.\cpp\katago.exe gtp -config .\cpp\configs\gtp_dots.cfg -model <MODEL_PATH>.bin.gz
 ```
 - Supports Bronstein delay (`time_settings <main> <per_move>`, `time_left <color> <main_left> <delay_left>`).
 - Supports `kata-time_settings bronstein <main> <delay>`.
@@ -196,20 +201,21 @@ Dots games can be played over GTP using `cpp/configs/gtp_dots.cfg`:
 ### JSON Analysis Engine (for Backends & Tools)
 High-throughput parallel board analysis using `cpp/configs/analysis_dots.cfg`:
 ```powershell
-.\katago.exe analysis -config cpp/configs/analysis_dots.cfg -model <MODEL_PATH>.bin.gz
+.\cpp\katago.exe analysis -config .\cpp\configs\analysis_dots.cfg -model <MODEL_PATH>.bin.gz
 ```
-- Query fields:
-  - `"dots": true` — Declares the query as a Dots game.
+- Required query fields: string `"id"`, integer `"boardXSize"` and `"boardYSize"`, `"moves"` (an array, which may be empty), and `"rules"` (for example `"bbs"` or `"notago"`).
+- Optional Dots fields:
+  - `"dots": true` — Overrides the game selection; `analysis_dots.cfg` already defaults to Dots.
   - `"playerToMove": "b"` or `"w"` — Specifies whose turn to evaluate.
-  - `"rules": "bbs"` or `"notago"`.
   - `"initialStones"`: Placed dots for the initial position.
+- Minimal query with this config: `{"id":"position-1","boardXSize":39,"boardYSize":32,"moves":[],"rules":"bbs"}`.
 - Response fields:
   - `"chosenMove"`: The move chosen by the engine according to chosenMoveTemperature.
   - `"resignReasonable"`: Boolean indicating whether resigning is objectively justified based on grounding/captures.
 
 ### Performance Benchmark & Thread Tuning
 ```powershell
-.\katago.exe benchmark -config cpp/configs/gtp_dots.cfg -model <MODEL_PATH>.bin.gz
+.\cpp\katago.exe benchmark -config .\cpp\configs\gtp_dots.cfg -model <MODEL_PATH>.bin.gz
 ```
 Recommends optimal `numSearchThreads` for your hardware.
 
@@ -249,12 +255,12 @@ The loop carries out five stages sequentially:
    - Never replace `Board` parameters by mutable reference if `hist.initialBoard` could be inadvertently mutated.
 
 3. **Neural Net Features and Heads**:
-   - Spatial input features (`cpp/neuralnet/nninputsdots.cpp`): 22 channels defined by `DotsSpatialFeature`. Note: Ladder features (`LadderCaptured_14` through `LadderWorkingMoves_17`) are currently temporarily disabled in feature filling.
-   - Global input features: 19 channels defined by `DotsGlobalFeature`.
+   - Spatial input features (`cpp/neuralnet/nninputsdots.cpp`): 22 channels defined by `DotsSpatialFeature` in `cpp/neuralnet/nninputs.h`. Ladder features (`LadderCaptured_14` through `LadderWorkingMoves_17`) are currently disabled in feature filling by `#if 0`.
+   - Global input features: 19 channels defined by `DotsGlobalFeature` in `cpp/neuralnet/nninputs.h`.
    - Value / auxiliary heads: KataGo's original Go-specific seki and score distribution heads were removed in commit `885e426f`. Do not reintroduce them without updating model definitions in both C++ and Python (`model_pytorch.py`, `load_model.py`, `train.py`).
    - Ownership prediction: Masked in `nneval.cpp` and `model_pytorch.py` to only placed dots.
 
 4. **Code Formatting & Cleanliness**:
    - **C++**: Follow the rules defined in `.clang-format` (Chromium base, 2-space indentation, 120 characters column limit). Keep headers alphabetically sorted.
    - **Python**: Follow PEP 8 (4 spaces indentation). Keep tests under `python/tests/` and verify with `pytest`.
-   - **Git Branching**: The default working branch in this repository is `master-mine`. Ensure changes do not break CI checks defined in `.github/workflows/build.yml`.
+   - **Git Branching**: The default working branch in this repository is `master-mine`. Use concise, descriptive branch names without a `codex/` prefix unless the user requests it. Ensure changes do not break applicable CI checks in `.github/workflows/build.yml` and `.github/workflows/onnx-backend.yml`.
