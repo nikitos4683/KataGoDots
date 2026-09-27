@@ -5,6 +5,8 @@ In addition to a basic set of [GTP commands](https://www.lysator.liu.se/~gunnar/
    * `rectangular_boardsize X Y`
       * Sets the board size to a potentially non-square size, width `X` and height `Y`. Some of KataGo's older nets were not trained with non-square sizes, but often seem to generalize to them pretty well. More recent nets are trained on a very low frequency of non-square sizes.
       * KataGo will *also* accept the same two arguments X Y for the standard GTP `boardsize` command to set a rectangular size, in addition to the normal single-argument usage of `boardsize` to set a square size.
+   * `get_boardsize`
+      * Returns the current board dimensions. Returns `X` if the board is square (`X == Y`), or `X:Y` if rectangular.
    * `set_position COLOR VERTEX COLOR VERTEX COLOR VERTEX ...`
       * Directly specify an initial board position as a sequence of color-vertex pairs, replacing the current board.
       * The newly-set position is assumed to have no move history. Therefore:
@@ -14,6 +16,18 @@ In addition to a basic set of [GTP commands](https://www.lysator.liu.se/~gunnar/
       * It is NOT recommended to use this command to place the starting stones for handicap games. Use the standard GTP commands `fixed_handicap`, `place_free_handicap`, and/or `set_free_handicap` instead.
       * Calling `set_position` with zero arguments is equivalent to calling `clear_board`.
       * Fails, reports a normal GTP error message, and leaves the board state unchanged if any vertex is specified more than once or if the final configuration would contain stones with zero liberties.
+   * `get_position`
+      * Returns the moves that formed the initial starting position (for example, the dots of a preset start position like `bbs` or `notago`).
+   * `play COLOR VERTEX [COLOR VERTEX ...]`
+      * KataGoDots supports playing multiple moves in sequence within a single command. If any move in the sequence is illegal, the engine reports an error and rolls back all moves played during that command.
+   * `get_moves`
+      * Returns the sequence of moves played in the game so far, formatted as `COLOR VERTEX COLOR VERTEX ...`.
+   * `undo [COUNT]`
+      * Accepts an optional integer `COUNT` specifying how many moves to undo at once (defaults to 1 if omitted).
+   * `genmove [COLOR] [MOVES_COUNT]`
+      * Generates one or more moves in sequence. If `MOVES_COUNT` is specified (> 1), the engine searches and plays that many moves sequentially, stopping early if the game concludes.
+   * `info`
+      * Returns engine and build metadata in CSV format: `app_name,app_version,git_rev,compile_datetime,backend,max_len_x,max_len_y,build_type`.
    * `clear_cache`
       * Clears the search tree and the NN cache. Can be used to force KataGo to re-search a position freshly, re-randomizing the search on that position, or to free up memory.
    * `stop`
@@ -47,6 +61,8 @@ In addition to a basic set of [GTP commands](https://www.lysator.liu.se/~gunnar/
          * `bga           : Equivalent to {"hasButton":false,"ko":"SITUATIONAL","scoring":"AREA",     "suicide":false,"tax":"NONE","whiteHandicapBonus":"N-1","friendlyPassOk":true}`
          * `new-zealand   : Equivalent to {"hasButton":false,"ko":"SITUATIONAL","scoring":"AREA",     "suicide":true, "tax":"NONE","whiteHandicapBonus":"0","friendlyPassOk":true}`
          * `aga-button    : Equivalent to {"hasButton":true, "ko":"SITUATIONAL","scoring":"AREA",     "suicide":false,"tax":"NONE","whiteHandicapBonus":"N-1","friendlyPassOk":true}`
+         * `bbs           : Dots rules with standard single cross start position (alias: russian)`
+         * `notago        : Dots rules with 4 random crosses start position`
       * KataGo does NOT claim that the above rules are _exactly_ a match. These are merely the _closest_ settings that KataGo has to those countries' rulesets.
       * A small number of combinations are currently not supported by even the latest neural nets, for example `scoring TERRITORY` and `hasButton true`.
       * Older neural nets for KataGo (nets released before v1.3) will also not support many of the options, and setting these rules will fail if these neural nets are being used.

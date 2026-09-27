@@ -434,3 +434,24 @@ Additional notes per size:
 * **b28c512nbt.** The main network size from May 2024 to June 2026, which learned and improved well for a long time.
 * **b40c768nbt.** The largest network on the site, initially trained externally by ZhiziGo on KataGo data prior to being accepted for the main run. Much slower than b28c512nbt, but much stronger, enough to at the time become generally the strongest at equal compute.
 * **tf2-b10c384, tf3-b10c512, tf3-b11c768.** New transformers as of August 2026. All three are the new clear top models for their rough inference cost, except on backends without efficient self-attention implementations.
+
+---
+
+## Dots Neural Network Inputs and Outputs
+
+In KataGoDots, the neural network featurization is adapted for the game of Dots:
+
+* **Spatial Inputs (22 channels)**:
+  - `0`: On-board mask
+  - `1–2`: Active (un-enclosed) dots for current player and opponent
+  - `3–4`: Placed dots for current player and opponent
+  - `5`: Dead dots
+  - `6–8`: Reserved and grounded dots
+  - `9–13`: Move history locations for the previous 1 to 5 turns
+  - `14–17`: Tactical ladder solver planes (`LadderCaptured_14`, `LadderCapturedPrevious_15`, `LadderCapturedPrevious2_16`, `LadderWorkingMoves_17`)
+  - `18–21`: Territory/capture points and surrounding enclosure stones for current player and opponent
+* **Global Inputs (19 channels)**:
+  - Pass/grounding history, komi, suicide legality, tax rule indicators, grounding game-end indicator, playout doubling advantage, capture empty bases, and board size parity.
+* **Outputs**:
+  - Policy: Per-point logits `[N, numPolicyChannels, Y, X]` plus pass logit `OutputPolicyPass` `[N, numPolicyChannels, 1, 1]` for grounding.
+  - Value: Win/loss/no-result logits `OutputValue`, score belief distribution `OutputScoreValue`, and ownership prediction.

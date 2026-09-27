@@ -1,5 +1,7 @@
 # KataGo Older Training History and Research
 
+> *Note: This document chronicles the historical training runs of upstream KataGo for Go. For information on training models specifically for the game of Dots using KataGoDots, see [SelfplayTraining.md](SelfplayTraining.md).*
+
 * [Current Status](#current-status)
 * [History](#history)
   * [Third Major Run](#third-major-run)

@@ -1,17 +1,23 @@
-## Self-play training configs
+# Self-play Training Configs
 
-**See `selfplay1.cfg` for inline comments describing some of the game initialization parameters which to avoid duplication are not replicated in many of the other configs.** Feel free to also diff these various configs with each other to see what the important differences are, which could be the parameters that you want to adjust or consider yourself.
+This directory contains configuration files for self-play data generation and model gating.
 
-#### Brief notes about what these configs are:
+See `selfplay1.cfg` for inline comments describing search and game initialization parameters.
 
-These configs are roughly in order from configs used *early* in KataGo's runs with small nets that aren't trained as much to configs used *late* in KataGo's runs with large/strong/extensively trained nets.
+---
 
-* `selfplay1.cfg`, `selfplay2.cfg`, `selfplay8a.cfg` - Example configs with reasonable parameters for very early training, for machines with 1, 2, 8 GPUs. Uses lower visits (600 full / 100 cheap), and trains more frequently on smaller boards than 19x19 to generate more data quickly. Historically was used for 6-block and early 10-block training in KataGo, except this config also has improved search parameters that didn't exist back then.
-* `selfplay1_maxsize9.cfg` - The same as `selfplay1.cfg`, but different board size distribution including only boards of size 9 and smaller.
-* `selfplay8b.cfg` - 8 GPU early training config for early training, but later than selfplay8a.cfg. More visits (1000 full / 200 cheap), more 19x19 boards, and minor other parameter adjustments. Historically was used for 10-block and 15-block training in KataGo, except this config also has improved search parameters that didn't exist back then.
-* `selfplay8b20.cfg` - Same as `selfplay8b.cfg` but fewer threads and smaller batch size. Historically was used a bit later in runs, after KataGo had switched from 10-block and 15-blocker to 20-block nets that require less batching to be GPU-efficient, except this config also has improved search parameters that didn't exist back then.
-* `selfplay8midrun.cfg` - 8 GPU training config that resembles a config historically used for a large portion of the *middle* of KataGo's main public distributed training run after switching away from 20-block nets up to 40-block nets and 60-block nets. More visits (1500 full / 250 cheap), more 19x19 boards, higher early game root policy temperature, different CPUCT to adjust policy convergence, and a variety of changes to game and komi initialization.
-* `selfplay8mainb18.cfg` - 8 GPU training config that resembles a config used for later parts of KataGo's public distributed training run, after switching from 60-block nets to new b18c384nbt architecture. More visits to compensate the lighter architecture (2000 full / 350 cheap), more heavy-tailed komi randomization, adjusted cpuct parameters to compenste for visits change.
+## Dots Game Configurations
 
-* `gatekeeper*.cfg` - These configs are loosely analogous to some of the above except used for the gatekeeper. Unlike selfplay configs, these aren't very important, since pretty much any reasonable config will distinguish between significantly better and worse nets in a training run. Also, runs work fine and often are more efficient without a gatekeeper at all, although a gatekeeper can be nice when starting out a run to help debugging and make sure that nets are actually improving.
+* `selfplay1_dots.cfg`: Default selfplay data generation configuration for the game of Dots. Configured for a standard 39x32 rectangular board, `bbs` or `notago` rulesets, and appropriate visit counts and batching for Dots.
+* `gatekeeper1_dots.cfg`: Default gatekeeper configuration for evaluating candidate Dots neural nets against the current accepted best model.
+* `match_dots.cfg` (in `cpp/configs/`): Configuration for running automated matches between different Dots models or search parameters.
 
+---
+
+## Go Configurations (Reference)
+
+* `selfplay1.cfg`, `selfplay2.cfg`, `selfplay8a.cfg`: Go selfplay configs for early training on 1, 2, or 8 GPUs.
+* `selfplay1_maxsize9.cfg`: Config restricted to boards of size 9x9 and smaller.
+* `selfplay8b.cfg`, `selfplay8b20.cfg`: Go configs for mid-stage training with larger visit counts.
+* `selfplay8midrun.cfg`, `selfplay8mainb18.cfg`: Advanced Go training configs used in later stages of public distributed training.
+* `gatekeeper*.cfg`: Go gatekeeper configurations.

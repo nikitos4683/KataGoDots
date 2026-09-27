@@ -1,50 +1,85 @@
-## C++ Source Code Overview
+# C++ Source Code Overview
 
-Summary of source folders, in approximate dependency order, from lowest level to highest, along with a partial list of the most notable files in each directory.
+This document summarizes the C++ source architecture of **KataGoDots**, in approximate dependency order from lowest level to highest.
 
-* `external` - External open-source libraries that KataGo depends on that are small or self-contained enough to just include inline with this repo.
-* `core` - Low-level utilities, sort of a layer on top of the standard library. Hashing, portable rand, string formatting and parsing, filesystem helpers, etc.
-* `game` - Board representation and rules.
-  * `rules.{cpp,h}` - Lightweight struct representing all the combinations of rules KataGo supports.
-  * `board.{cpp,h}` - Raw board implementation, without move history. Helper functions for Benson's algorithm and ladder search.
-  * `boardhistory.{cpp,h}` - Datastructure that does include move history - handles superko, passing, game end, final scoring, komi, handicap detection, etc.
-  * `graphhash.{cpp,h}` - History-sensitive hash used for [monte-carlo graph search](https://github.com/lightvector/KataGo/blob/master/docs/GraphSearch.md).
-* `neuralnet` - Neural net GPU implementation and interface. Contains OpenCL, CUDA, Eigen, TensorRT, ROCm, ONNX, Metal backends along with common interfaces and model data structures.
-  * `desc.{cpp,h}` - Data structure holding neural net structure and weights.
-  * `modelversion.{cpp,h}` - Enumerates the various versions of neural net features and models.
-  * `nninputs.{cpp,h}` - Implements the input features for the neural net.
-  * `sgfmetadata.{cpp,h}` - Implements the input features for the [HumanSL neural net](https://github.com/lightvector/KataGo/blob/master/docs/Analysis_Engine.md#human-sl-analysis-guide), for conditioning on various SGF metadata about human players from training data.
-  * `nninterface.h` - Common interface that is implemented by every low-level neural net backend.
-  * `{cuda,opencl,eigen,trt,rocm,onnx,metal,dummy}backend.cpp` - Various backends.
-  * `nneval.{cpp,h}` - Top-level handle to the neural net used by the rest of the engine, implements thread-safe batching of queries.
-* `search` - The main search engine.
-  * `timecontrols.cpp` - Basic handling of a few possible time controls.
-  * `searchparams.{cpp,h}` - Configurable coefficients and parameters for the search.
-  * `search.{cpp,h}` - Multithreaded MCTS implementation.
-  * `searchresults.cpp` - Functions to inspect the results of finished searches, select moves, etc.
-  * `asyncbot.{cpp,h}` - Simple thread-safe layer on top of main engine to implement pondering.
-* `dataio` - SGF reading and writing, writing of self-play training data.
-  * `sgf.{cpp,h}` - SGF reading and writing.
-  * `loadmodel.{cpp,h}` - Loading the neural net.
-  * `trainingwrite.{cpp,h}` - Writing of self-play training data.
-* `book` - Utilities for generating opening books (such as the ones hosted at [https://katagobooks.org/](https://katagobooks.org/))
-* `program` - Top-level helper functions.  neural net, running matches and selfplay games, handicap placement, computing stats to report, etc.
-  * `setup.{cpp,h}` - Functions for parsing configs for search parameters, parsing parameters for initializing the neural net.
-  * `playutils.{cpp,h}` - Miscellaneous: handicap placement, ownership and final stone status, computing high-level stats to report, benchmarking.
-  * `play.{cpp,h}` - Running matches and self-play games.
-* `distributed` - Code for talking to https webserver for volunteers to contribute distributed self-play games for training.
-* `tests` - A variety of tests.
-  * `models` - A directory with a small number of small-sized (and not very strong) models for running tests.
-* `command` - Top-level subcommands callable by users. GTP, analysis commands, benchmarking, selfplay data generation, etc.
-  * `commandline.{cpp,h}` - Common command line logic shared by all subcommands.
-  * `gtp.cpp` - Main GTP engine.
-  * `analysis.cpp` - JSON-based analysis engine that can use large batch sizes to analyze positions in parallel.
-  * `benchmark.cpp` - Performance benchmarking.
-  * `contribute.cpp` - Command for volunteers to contribute distributed self-play games for training.
-  * `selfplay.cpp` - Selfplay data generation engine.
-  * `gatekeeper.cpp` - Gating engine to filter neural nets for selfplay data generation.
-  * `match.cpp` - Match engine for testing different parameters that can use huge batch sizes to efficiently play games in parallel.
+---
 
-Other folders:
+## 1. Source Directories
 
-* `configs` - Default or example configs for many of the different subcommands.
+### `core/`
+Low-level utilities layered over the C++ standard library:
+* High-performance hashing (MurmurHash, Zobrist hashing).
+* Portable random number generation (`rand.{cpp,h}`).
+* String formatting, command-line parsing, config file reading (`config_parser.{cpp,h}`).
+* Multithreading and queue utilities (`threadsafequeue.h`).
+
+### `game/`
+Board representations, Dots mechanics, and rulesets:
+* `board.{cpp,h}`: Core `Board` representation supporting both Go and Dots. Implements rectangular coordinate systems (`x_size`, `y_size`) with stride indexing `(x + 1) + (y + 1) * (x_size + 1)`.
+* `dotsfield.cpp`: Core Dots algorithms for tracing cycles, detecting enclosed bases, and setting territory flags.
+* `dotsfieldCapturesAndTerritories.cpp`: Capture and base evaluations, computing captured dot locations and empty base areas.
+* `dotsfieldLadders.{cpp,h}`: Tactical ladder detection and `DotsLaddersSolver`, solving attacking/defending ladder paths and identifying working moves.
+* `dotsboardhistory.cpp`: Move history, grounding alive checks (`winOrEffectiveDrawByGrounding`), resign reasonableness (`isResignReasonableForDots`), and Dots scoring.
+* `rules.{cpp,h}`: Rules struct, start position generators (`START_POS_EMPTY`, `START_POS_SINGLE`, `START_POS_CROSS`, `START_POS_CROSS_2`, `START_POS_CROSS_4`), and preset definitions (`bbs`, `notago`, `russian`).
+* `boardhistory.{cpp,h}`: Move history tracking, superko detection, and pass/grounding coordination.
+
+### `neuralnet/`
+Inference server and backend implementations:
+* `nninputs.{cpp,h}`: Definitions of spatial and global neural net input features.
+* `nninputsdots.cpp`: Dots feature extraction producing 22 spatial planes (including tactical ladder planes 14–17) and 19 global planes.
+* `nneval.{cpp,h}`: Thread-safe multi-threaded batched neural net evaluation server.
+* `desc.{cpp,h}`: Model architecture descriptors and `.bin.gz` weight loading.
+* `modelversion.{cpp,h}`: Model version enumerations.
+* `onnxmodelbuilder.{cpp,h}`: In-memory ONNX graph construction for TensorRT and ONNX backends.
+* **Backends**:
+  * `openclbackend.cpp`: General OpenCL GPU backend.
+  * `cudabackend.cpp`: NVIDIA CUDA + cuDNN backend.
+  * `trtbackend.cpp`: NVIDIA TensorRT backend (via ONNX parser).
+  * `rocmbackend.cpp`: AMD ROCm / MIOpen backend.
+  * `eigenbackend.cpp`: CPU backend with optional AVX2/FMA vectorization.
+  * `onnxbackend.cpp`: Cross-platform ONNX Runtime backend.
+  * `metalbackend.{cpp,h}` / `metalbackend.swift`: Apple Silicon Metal / CoreML backend.
+
+### `search/`
+Monte-Carlo Tree Search (MCTS) engine:
+* `search.{cpp,h}`: Multithreaded MCTS implementation with support for Monte-Carlo Graph Search (MCGS), terminal grounded state detection, and Dots-normalized move temperature decay.
+* `searchparams.{cpp,h}`: Configurable search hyperparameters.
+* `timecontrols.{cpp,h}`: Time control management, including Bronstein delay for Dots (`time_settings <main> <per_move>`).
+* `searchresults.cpp`: Move selection and statistics reporting.
+
+### `dataio/`
+File serialization and dataset generation:
+* `sgf.{cpp,h}`: SGF parser and writer supporting Dots board sizes, moves, and start position presets.
+* `trainingwrite.{cpp,h}`: Selfplay training data writer for `.npz` records.
+* `loadmodel.{cpp,h}`: Model weight loader from disk.
+
+### `command/`
+CLI subcommands:
+* `gtp.cpp`: GTP engine with custom extensions (`get_boardsize`, `get_moves`, `get_position`, multi-move `play`, `undo [count]`, multi-move `genmove [color] [moves_count]`, `info`, `time_settings`, `time_left`).
+* `analysis.cpp`: JSON parallel analysis engine with Dots query/response support (`dots`, `playerToMove`, `initialStones`, `timeControl`, `resignReasonable`, `chosenMove`).
+* `selfplay.cpp`: High-throughput selfplay data generator.
+* `gatekeeper.cpp`: Candidate network evaluation against current best model.
+* `match.cpp`: Multi-model tournament and benchmark matches.
+* `benchmark.cpp`: Hardware speed benchmark and search thread recommendations.
+* `dumponnx.cpp`: ONNX graph exporter from `.bin.gz` models.
+* `runtests.cpp`: Comprehensive unit, stress, and regression test runner.
+
+### `tests/`
+Test suites covering engine logic and game rules:
+* `testdotsbasic.cpp`: Dots territory, capture, and base boundary tests.
+* `testdotsextra.cpp`: Edge-case capture scenarios and cycle detections.
+* `testdotsladders.cpp`: Tactical ladder detection and solver tests.
+* `testdotsstartposes.cpp`: Start position generator and recognizer tests.
+* `testdotsstress.cpp`: High-volume random Dots simulation stress tests (100k+ games).
+* `testdotsutils.{cpp,h}`: Helper assertions for Dots test positions.
+* `testboardbasic.cpp`, `testboardarea.cpp`, `testrules.cpp`, `testtime.cpp`: General board, rules, and Bronstein time control tests.
+
+---
+
+## 2. Configuration Files (`cpp/configs/`)
+
+* `gtp_dots.cfg`: GTP engine configuration for Dots games.
+* `analysis_dots.cfg`: Parallel JSON analysis engine configuration for Dots.
+* `match_dots.cfg`: Match configuration for comparing Dots models.
+* `training/selfplay1_dots.cfg`: Selfplay data generation configuration for Dots (39x32 board).
+* `training/gatekeeper1_dots.cfg`: Gatekeeper testing configuration for Dots.
