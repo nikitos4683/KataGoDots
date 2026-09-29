@@ -150,19 +150,24 @@ def test_fused_swiglu_kernel_in_ffn_block_under_autocast():
     assert _rel(out_k, out_amp) < 1e-2
 
 
-@pytest.mark.parametrize("dtype,batch,pos_len,heads,head_dim,v_head_dim", [
-    (torch.float32, 6, 19, 12, 32, 32),
-    (torch.float16, 6, 19, 12, 32, 32),
-    (torch.float16, 5, 19, 6, 32, 32),   # odd batch exercises the batch-chunk tail of the backward
-    (torch.bfloat16, 3, 9, 6, 32, 16),   # value head dim != query head dim, small board
+@pytest.mark.parametrize("dtype,batch,pos_len_x,pos_len_y,heads,head_dim,v_head_dim", [
+    (torch.float32, 6, 19, 19, 12, 32, 32),
+    (torch.float16, 6, 19, 19, 12, 32, 32),
+    (torch.float16, 5, 19, 19, 6, 32, 32),   # odd batch exercises the batch-chunk tail of the backward
+    (torch.bfloat16, 3, 9, 9, 6, 32, 16),   # value head dim != query head dim, small board
+    (torch.float32, 3, 39, 32, 4, 32, 32),
+    (torch.float16, 3, 39, 32, 4, 32, 32),
+    (torch.bfloat16, 3, 39, 32, 4, 32, 32),
+    (torch.bfloat16, 3, 32, 39, 4, 32, 32),
+    (torch.bfloat16, 3, 20, 13, 4, 32, 16),  # partial sequence tile and unequal head dimensions
 ])
-def test_fused_rope_backward_matches_autograd(dtype, batch, pos_len, heads, head_dim, v_head_dim):
+def test_fused_rope_backward_matches_autograd(dtype, batch, pos_len_x, pos_len_y, heads, head_dim, v_head_dim):
     from katago.train.fused_rope import learnable_rope_qkv
     from katago.train.model_pytorch import compute_learnable_rope_cos_sin, apply_learnable_rotary_emb
 
     torch.manual_seed(0)
     dev = torch.device("cuda")
-    seq = pos_len * pos_len
+    seq = pos_len_x * pos_len_y
 
     def reference(qkv, freqs):
         hd = heads * head_dim
@@ -170,7 +175,7 @@ def test_fused_rope_backward_matches_autograd(dtype, batch, pos_len, heads, head
         k = qkv[..., hd:2 * hd].view(batch, seq, heads, head_dim)
         v = qkv[..., 2 * hd:].view(batch, seq, heads, v_head_dim)
         s_idx = torch.arange(seq, device=dev)
-        cos, sin = compute_learnable_rope_cos_sin((s_idx % pos_len).float(), (s_idx // pos_len).float(), freqs)
+        cos, sin = compute_learnable_rope_cos_sin((s_idx % pos_len_x).float(), (s_idx // pos_len_x).float(), freqs)
         q, k = apply_learnable_rotary_emb(q, k, cos, sin, cos, sin)
         return q, k, v.permute(0, 2, 1, 3)
 
@@ -192,7 +197,7 @@ def test_fused_rope_backward_matches_autograd(dtype, batch, pos_len, heads, head
     outs_r, gqkv_r, gf_r = run(reference)
 
     def fused(a, b):
-        q, k, v = learnable_rope_qkv(a, b, pos_len, heads, head_dim, v_head_dim)  # (B, H, S, D) each
+        q, k, v = learnable_rope_qkv(a, b, pos_len_x, heads, head_dim, v_head_dim)  # (B, H, S, D) each
         return q.permute(0, 2, 1, 3), k.permute(0, 2, 1, 3), v
 
     outs_f, gqkv_f, gf_f = run(fused)

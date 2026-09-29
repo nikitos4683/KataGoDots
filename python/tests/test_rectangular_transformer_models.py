@@ -3,7 +3,7 @@ import copy
 import pytest
 import torch
 
-from katago.train.model_pytorch import Game, Model, TransformerAttentionBlock
+from katago.train.model_pytorch import Game, Model
 from katago.train.modelconfigs import base_config_of_name
 
 
@@ -73,7 +73,7 @@ def test_dots_transformer_backward_on_rectangular_board(monkeypatch, name):
     "b6c384h6nbttflrs-qkn",
 ])
 @pytest.mark.parametrize("smaller_board", [False, True])
-def test_flex_attention_matches_export_path(monkeypatch, name, smaller_board):
+def test_flex_attention_matches_sdpa(monkeypatch, name, smaller_board):
     monkeypatch.setenv("KATAGO_FLEX_ATTENTION", "1")
     config = copy.deepcopy(base_config_of_name[name])
     config["block_kind"] = config["block_kind"][:1]
@@ -91,10 +91,7 @@ def test_flex_attention_matches_export_path(monkeypatch, name, smaller_board):
     with torch.no_grad():
         flex_outputs = model(spatial, global_input)[0]
         model.use_flex_attention = False
-        for module in model.modules():
-            if isinstance(module, TransformerAttentionBlock):
-                module.onnx_export = True
-        export_outputs = model(spatial, global_input)[0]
+        sdpa_outputs = model(spatial, global_input)[0]
 
-    for flex, exported in zip(flex_outputs[:5], export_outputs[:5]):
-        torch.testing.assert_close(flex, exported, rtol=1e-5, atol=2e-5)
+    for flex, sdpa in zip(flex_outputs, sdpa_outputs):
+        torch.testing.assert_close(flex, sdpa, rtol=1e-5, atol=2e-5)

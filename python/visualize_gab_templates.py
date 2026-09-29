@@ -43,7 +43,8 @@ def load_gab_template_mlp(checkpoint_path):
         gab_num_templates=config["gab_num_templates"],
         gab_num_fourier_features=config["gab_num_fourier_features"],
         gab_mlp_hidden=config["gab_mlp_hidden"],
-        pos_len=pos_len,
+        pos_len_x=pos_len,
+        pos_len_y=pos_len,
         activation=config["activation"],
     )
 

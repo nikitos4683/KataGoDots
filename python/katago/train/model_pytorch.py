@@ -2184,7 +2184,6 @@ class TransformerAttentionBlock(torch.nn.Module):
         # See FUSED_ROPE_BACKWARD. The remaining conditions are checked per forward.
         self.fused_rope_backward = (
             FUSED_ROPE_BACKWARD
-            and pos_len_x == pos_len_y  # The fused kernel indexes a square board.
             and self.fused_qkv_proj
             and self.learnable_rope
             and self.num_kv_heads == self.num_heads
@@ -2539,7 +2538,7 @@ class TransformerAttentionBlock(torch.nn.Module):
                 block_mask=flex_block_mask,
                 scale=scale,
             )
-        elif not wants_attn_weights and not getattr(self, "onnx_export", False):
+        elif not wants_attn_weights:
             attn_output = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=attn_mask,
@@ -2560,12 +2559,8 @@ class TransformerAttentionBlock(torch.nn.Module):
 
             attn_output = torch.matmul(attn_weights, v)  # (B, H, S, Dv)
 
-        if getattr(self, "onnx_export", False):
-            # Avoid a PyTorch ONNX decomposition error for the permute/flatten path.
-            attn_output = torch.cat([attn_output[:, head] for head in range(self.num_heads)], dim=-1)
-        else:
-            attn_output = attn_output.permute(0, 2, 1, 3).contiguous()
-            attn_output = attn_output.view(batch_size, seq_len, self.num_heads * self.v_head_dim)
+        attn_output = attn_output.permute(0, 2, 1, 3).contiguous()
+        attn_output = attn_output.view(batch_size, seq_len, self.num_heads * self.v_head_dim)
         attn_output = self.out_proj(attn_output)
 
         if input_was_seq:
