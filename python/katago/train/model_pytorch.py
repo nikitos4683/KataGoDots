@@ -2836,7 +2836,8 @@ class PolicyHead(torch.nn.Module):
 
 
 class ValueHead(torch.nn.Module):
-    def __init__(self, c_in, c_v1, c_v2, c_sv2, num_scorebeliefs, config, activation, pos_len_x, pos_len_y):
+    def __init__(self, c_in, c_v1, c_v2, c_sv2, num_scorebeliefs, config, activation, pos_len_x, pos_len_y,
+                 scorebelief_offset=0.5):
         super(ValueHead, self).__init__()
         self.activation = activation
         self.conv1 = torch.nn.Conv2d(c_in, c_v1, kernel_size=1, padding="same", bias=False)
@@ -2870,13 +2871,16 @@ class ValueHead(torch.nn.Module):
         self.linear_s3 = torch.nn.Linear(c_sv2, num_scorebeliefs, bias=True)
         self.linear_smix = torch.nn.Linear(3 * c_v1, num_scorebeliefs, bias=True)
 
+        # Match TrainingWriteBuffers::addRow: Dots buckets have integer centers,
+        # while Go buckets have half-integer centers. Keep these derived buffers
+        # out of checkpoints so they are rebuilt for the model's game on load.
         self.register_buffer("score_belief_offset_vector", torch.tensor(
-            data=[(float(i-self.scorebelief_mid)+0.5) for i in range(self.scorebelief_len)],
+            data=[float(i-self.scorebelief_mid)+scorebelief_offset for i in range(self.scorebelief_len)],
             dtype=torch.float32,
             requires_grad=False,
         ), persistent=False)
         self.register_buffer("score_belief_offset_bias_vector", torch.tensor(
-            data=[0.05 * (float(i-self.scorebelief_mid)+0.5) for i in range(self.scorebelief_len)],
+            data=[0.05 * (float(i-self.scorebelief_mid)+scorebelief_offset) for i in range(self.scorebelief_len)],
             dtype=torch.float32,
             requires_grad=False,
         ), persistent=False)
@@ -3648,8 +3652,10 @@ class Model(torch.nn.Module):
             self.config,
             self.activation,
         )
+        scorebelief_offset = 0.0 if self.games == [Game.DOTS] else 0.5
         self.value_head = ValueHead(self.c_trunk, self.c_v1, self.c_v2, self.c_sv2, self.num_scorebeliefs, self.config,
-                                    self.activation, self.pos_len_x, self.pos_len_y)
+                                    self.activation, self.pos_len_x, self.pos_len_y,
+                                    scorebelief_offset=scorebelief_offset)
         if self.has_intermediate_head:
             self.norm_intermediate_trunkfinal = NormMask(self.c_trunk, self.config, fixup_use_gamma=False, is_last_batchnorm=True)
             self.act_intermediate_trunkfinal = act(self.activation)
@@ -3662,7 +3668,8 @@ class Model(torch.nn.Module):
             )
             self.intermediate_value_head = ValueHead(self.c_trunk, self.c_v1, self.c_v2, self.c_sv2,
                                                      self.num_scorebeliefs, self.config, self.activation,
-                                                     self.pos_len_x, self.pos_len_y)
+                                                     self.pos_len_x, self.pos_len_y,
+                                                     scorebelief_offset=scorebelief_offset)
 
     @property
     def device(self):
