@@ -183,6 +183,89 @@ namespace NNInputs {
     COUNT, // = 8
   };
   constexpr int NUM_FEATURES_GLOBAL_DOTS_SPARSE = static_cast<int>(DotsSparseGlobalFeature::COUNT);
+  // Maximum number of moves of history marked on points and areas
+  constexpr int DOTS_SPARSE_MAX_MOVES_AGO = 5;
+}
+
+// A Dots position in the sparse token format (model version 18), see docs/DotsSparseNN.md.
+// Holds only integer coordinates and game facts relative to the player to move.
+// Everything geometric (scaled coordinates, distances to the edges, Fourier features, RoPE)
+// is computed by the model itself from the coordinates and the board size.
+struct DotsSparseInput {
+  // A placed dot outside the interiors of the areas
+  struct Point {
+    int8_t x;
+    int8_t y;
+    int8_t owner; // 0 - the player to move, 1 - the opponent
+    int8_t grounded;
+    int8_t movesAgo; // 0 - not in the history, 1..5 - placed that many moves ago
+  };
+  // A completed enclosure, the outer contour only
+  struct Area {
+    int16_t owner; // 0 - the player to move, 1 - the opponent
+    int16_t grounded; // at least one boundary dot is grounded
+    int16_t movesAgo; // 0 - not in the history, 1..5 - appeared that many moves ago
+    int16_t insideMy; // dots of the player to move inside, by the color they were placed with
+    int16_t insideOpp; // opponent dots inside
+    int16_t boundaryLen; // number of boundary dots, also the number of vertices of the area
+    int32_t vertexStart; // index of the first vertex of the area in `vertices`
+  };
+  struct Vertex {
+    int8_t x;
+    int8_t y;
+  };
+  // An action candidate on a point of the board (grounding is described separately)
+  struct Candidate {
+    int8_t x;
+    int8_t y;
+    int16_t gainMy; // change of (own - opponent score) if the player to move plays here
+    int16_t gainOpp; // change of (opponent - own score) if the opponent plays here
+    int16_t inMyHouse;
+    int16_t inOppHouse;
+  };
+
+  int xSize = 0;
+  int ySize = 0;
+  float global[NNInputs::NUM_FEATURES_GLOBAL_DOTS_SPARSE] = {};
+  std::vector<Point> points;
+  std::vector<Area> areas;
+  std::vector<Vertex> vertices; // grouped by area in the order of `areas`
+  std::vector<Candidate> candidates;
+  bool groundAllowed = false;
+  // Own minus opponent score plus komi if the player to move grounds now (the game ends)
+  float groundResult = 0.0f;
+
+  // Not NN inputs: board locations of the tokens to map the outputs back to the board
+  std::vector<Loc> pointLocs;
+  std::vector<Loc> candidateLocs;
+
+  void clear();
+  // Max number of entries of each kind, used to size buffers
+  static constexpr int MAX_POINTS = Board::MAX_PLAY_SIZE;
+  static constexpr int MAX_AREAS = Board::MAX_PLAY_SIZE / 2;
+  static constexpr int MAX_VERTICES = Board::MAX_PLAY_SIZE * 2;
+  static constexpr int MAX_CANDIDATES = Board::MAX_PLAY_SIZE;
+
+  // Coordinates of the point (x, y) after applying the symmetry (same convention as SymmetryHelpers::getSymLoc).
+  // The board sizes are swapped by the transposing symmetries.
+  static void applySymmetry(int x, int y, int xSize, int ySize, int symmetry, int& outX, int& outY);
+  // Returns a copy with all the coordinates, the board size and the size global features transformed by the symmetry
+  DotsSparseInput withSymmetry(int symmetry) const;
+
+  nlohmann::json toJson() const;
+};
+
+namespace NNInputs {
+  // Fills the sparse Dots position. Also outputs the reasonable moves (the candidates and maybe PASS_LOC) if requested.
+  void fillDotsSparseInput(
+    const Board& board,
+    const BoardHistory& hist,
+    Player nextPlayer,
+    const MiscNNInputParams& nnInputParams,
+    DotsSparseInput& result,
+    bool selfplay,
+    std::vector<Loc>* reasonableMoves = nullptr
+  );
 
   Hash128 getHash(
     const Board& board, const BoardHistory& boardHistory, Player nextPlayer,

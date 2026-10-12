@@ -1039,6 +1039,7 @@ add_executable(katago
   dataio/files.cpp
   neuralnet/nninputs.cpp
   neuralnet/nninputsdots.cpp
+  neuralnet/nninputsdotssparse.cpp
   neuralnet/sgfmetadata.cpp
   neuralnet/modelversion.cpp
   neuralnet/nneval.cpp
@@ -1098,6 +1099,7 @@ add_executable(katago
   tests/testsgf.cpp
   tests/testsymmetries.cpp
   tests/testnninputs.cpp
+  tests/testdotssparse.cpp
   tests/testownership.cpp
   tests/testsearchcommon.cpp
   tests/testsearchnonn.cpp

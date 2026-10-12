@@ -649,3 +649,68 @@ int MainCmds::selfplaysurprisedump(const vector<string>& args) {
   ScoreValue::freeTables();
   return 0;
 }
+
+int MainCmds::dumpsparse(const vector<string>& args) {
+  Board::initHash();
+  ScoreValue::initTables();
+
+  string sgfFile;
+  int moveNum;
+  int symmetry;
+  bool printBoard;
+  int maxHistory;
+  try {
+    KataGoCommandLine cmd("Print the sparse Dots NN input (model version 18) of a position from an sgf file as JSON.");
+    TCLAP::UnlabeledValueArg<string> sgfFileArg("","Sgf file",true,string(),"FILE");
+    TCLAP::ValueArg<int> moveNumArg("m","move-num","Sgf move num, the end of the game by default",false,-1,"MOVENUM");
+    TCLAP::ValueArg<int> symmetryArg("","symmetry","Symmetry (0-7) applied to the coordinates",false,0,"SYMMETRY");
+    TCLAP::ValueArg<int> maxHistoryArg("","max-history","Max number of moves of history",false,1000,"N");
+    TCLAP::SwitchArg printBoardArg("","print-board","Also print the board before the JSON");
+    cmd.add(sgfFileArg);
+    cmd.add(moveNumArg);
+    cmd.add(symmetryArg);
+    cmd.add(maxHistoryArg);
+    cmd.add(printBoardArg);
+    cmd.parseArgs(args);
+    sgfFile = sgfFileArg.getValue();
+    moveNum = moveNumArg.getValue();
+    symmetry = symmetryArg.getValue();
+    maxHistory = maxHistoryArg.getValue();
+    printBoard = printBoardArg.getValue();
+  }
+  catch (TCLAP::ArgException &e) {
+    cerr << "Error: " << e.error() << " for argument " << e.argId() << endl;
+    return 1;
+  }
+
+  const std::unique_ptr<CompactSgf> sgf = CompactSgf::loadFile(sgfFile);
+  if(!sgf->isDots)
+    throw StringError("dumpsparse: the sgf is not a Dots game");
+  Rules rules = sgf->getRulesOrWarn(Rules::DEFAULT_DOTS, [](const string& msg) { cerr << msg << endl; });
+  // Tolerate moves into the opponent's houses that real games may contain (5.14)
+  rules.multiStoneSuicideLegal = true;
+  if(moveNum < 0)
+    moveNum = static_cast<int>(sgf->moves.size());
+  if(moveNum > sgf->moves.size())
+    throw StringError("Move num " + Global::intToString(moveNum) + " requested but sgf has only " + Global::int64ToString(sgf->moves.size()));
+  if(symmetry < 0 || symmetry >= SymmetryHelpers::NUM_SYMMETRIES)
+    throw StringError("Invalid symmetry " + Global::intToString(symmetry));
+
+  Player nextPla;
+  BoardHistory hist = sgf->setupInitialBoardAndHist(rules, nextPla, BoardHistoryModes());
+  Board board = hist.initialBoard;
+  sgf->playMovesTolerant(board, nextPla, hist, moveNum, false);
+  if(SymmetryHelpers::isTranspose(symmetry) && board.x_size != board.y_size)
+    throw StringError("Transposing symmetries are allowed only for square boards");
+
+  MiscNNInputParams params;
+  params.maxHistory = maxHistory;
+  DotsSparseInput input;
+  NNInputs::fillDotsSparseInput(board, hist, nextPla, params, input, false);
+  if(printBoard) {
+    Board::printBoard(cout, board, Board::NULL_LOC, &hist.moveHistory);
+    cout << "Next player: " << PlayerIO::playerToString(nextPla, true) << endl;
+  }
+  cout << input.withSymmetry(symmetry).toJson().dump(1) << endl;
+  return 0;
+}

@@ -84,6 +84,7 @@ namespace Tests {
   void runNNInputsV3V4Tests();
   void runExcludeTerritoryAtariNNInputsTests();
   void runDotsNNInputsTests();
+  void runDotsSparseInputTests();
 
   //testsymmetries.cpp
   void runBasicSymmetryTests();
