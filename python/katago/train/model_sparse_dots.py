@@ -570,6 +570,8 @@ class SparseDotsModel(torch.nn.Module):
         self.katago_backend = katago_backend
         self.pos_len_x = pos_len_x
         self.pos_len_y = pos_len_y
+        # Read by train.py around validation, flex attention is never used here
+        self.use_flex_attention = False
         self.norm_kind = config["norm_kind"]
         self.block_kind = config["block_kind"]
         self.c_trunk = config["trunk_num_channels"]

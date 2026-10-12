@@ -41,9 +41,12 @@ from muon.muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
 from katago.train import modelconfigs
 from katago.train.model_pytorch import Model, ExtraOutputs, MetadataEncoder, parse_game, Game
 from katago.train.metrics_pytorch import Metrics
+from katago.train.metrics_sparse_dots import SparseDotsMetrics
+from katago.train.model_sparse_dots import SparseDotsModel, create_model, is_sparse_dots_config
 from katago.utils.training_data_generator import TrainingDataGenerator
 from katago.train import load_model
 from katago.train import data_processing_pytorch
+from katago.train import data_processing_sparse_dots
 from katago.train import trainloop_helpers
 from katago.train.metrics_logging import accumulate_metrics, log_metrics, clear_metric_nonfinite
 
@@ -416,7 +419,52 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     use_amp = use_fp16 or use_bf16
     amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
     no_compile = args["no_compile"]
+    if Game.DOTS in games and not no_compile:
+        # Sparse Dots batches have a different number of tokens every time
+        logging.info("Sparse Dots models are trained without torch.compile")
+        no_compile = True
     use_tf32_matmul = args["use_tf32_matmul"]
+
+    def make_metrics(raw_model):
+        if isinstance(raw_model, SparseDotsModel):
+            return SparseDotsMetrics(world_size, raw_model)
+        return Metrics(world_size, raw_model)
+
+    def read_training_data(files, world_size_for_data, rank_for_data, model_config, prefetch_depth=1):
+        if is_sparse_dots_config(model_config):
+            return data_processing_sparse_dots.read_npz_training_data_sparse(
+                files,
+                batch_size,
+                world_size_for_data,
+                rank_for_data,
+                device=device,
+                randomize_symmetries=True,
+                prefetch_depth=prefetch_depth,
+            )
+        return data_processing_pytorch.read_npz_training_data(
+            files,
+            batch_size,
+            world_size_for_data,
+            rank_for_data,
+            pos_len_x,
+            pos_len_y,
+            device=device,
+            randomize_symmetries=True,
+            include_meta=raw_model.get_has_metadata_encoder(),
+            model_config=model_config,
+            prefetch_depth=prefetch_depth,
+        )
+
+    def run_model(model, raw_model, batch, extra_outputs=None):
+        # Sparse Dots models take the whole batch
+        if isinstance(raw_model, SparseDotsModel):
+            return model(batch, extra_outputs=extra_outputs)
+        return model(
+            batch["binaryInputNCHW"],
+            batch["globalInputNC"],
+            input_meta=(batch["metadataInputNC"] if raw_model.get_has_metadata_encoder() else None),
+            extra_outputs=extra_outputs,
+        )
 
     epochs_per_export = args["epochs_per_export"]
     export_prob = args["export_prob"]
@@ -921,9 +969,9 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
         if path_to_load_from is None:
             logging.info("Initializing new model!")
             assert model_kind is not None, "Model kind is none or unspecified but the model is being created fresh"
-            model_config = modelconfigs.config_of_name[model_kind]
+            model_config = modelconfigs.get_config(model_kind, Game.DOTS in games)
             logging.info(str(model_config))
-            raw_model = Model(model_config,pos_len_x,pos_len_y,games,katago_git_rev,katago_backend)
+            raw_model = create_model(model_config,pos_len_x,pos_len_y,games,katago_git_rev,katago_backend)
             raw_model.initialize()
 
             raw_model.to(device)
@@ -940,7 +988,7 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                 ema_avg = lambda avg_param, cur_param, num_averaged: avg_param + new_factor * (cur_param - avg_param)
                 swa_model = AveragedModel(raw_model, avg_fn=ema_avg)
 
-            metrics_obj = Metrics(world_size,raw_model)
+            metrics_obj = make_metrics(raw_model)
             running_metrics = {}
             train_state = {}
             last_val_metrics = {}
@@ -972,9 +1020,9 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
         else:
             state_dict = load_model.load_checkpoint(path_to_load_from, map_location=device)
 
-            model_config = state_dict["config"] if "config" in state_dict else modelconfigs.config_of_name[model_kind]
+            model_config = state_dict["config"] if "config" in state_dict else modelconfigs.get_config(model_kind, Game.DOTS in games)
             logging.info(str(model_config))
-            raw_model = Model(model_config,pos_len_x,pos_len_y,games,katago_git_rev,katago_backend)
+            raw_model = create_model(model_config,pos_len_x,pos_len_y,games,katago_git_rev,katago_backend)
             raw_model.initialize()
 
             train_state = {}
@@ -1055,7 +1103,7 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                 if swa_model_state_dict is not None:
                     swa_model.load_state_dict(swa_model_state_dict)
 
-            metrics_obj = Metrics(world_size,raw_model)
+            metrics_obj = make_metrics(raw_model)
             if "metrics" in state_dict:
                 metrics_obj.load_state_dict(state_dict["metrics"])
             else:
@@ -1684,19 +1732,7 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
             logging.info("This subepoch, using files: " + str(train_files_to_use))
             logging.info("Currently up to data row " + str(train_state["total_num_data_rows"]))
             lookahead_counter = 0
-            for batch in data_processing_pytorch.read_npz_training_data(
-                train_files_to_use,
-                batch_size,
-                world_size,
-                rank,
-                pos_len_x,
-                pos_len_y,
-                device=device,
-                randomize_symmetries=True,
-                include_meta=raw_model.get_has_metadata_encoder(),
-                model_config=model_config,
-                prefetch_depth=data_prefetch_depth,
-            ):
+            for batch in read_training_data(train_files_to_use, world_size, rank, model_config, prefetch_depth=data_prefetch_depth):
                 optimizer.zero_grad(set_to_none=True)
                 extra_outputs = None
                 # if raw_model.get_has_metadata_encoder():
@@ -1705,19 +1741,9 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                 if use_amp:
                     with autocast("cuda", dtype=amp_dtype):
                         # Note: output heads are already in fp32 despite autocast
-                        model_outputs = ddp_model(
-                            batch["binaryInputNCHW"],
-                            batch["globalInputNC"],
-                            input_meta=(batch["metadataInputNC"] if raw_model.get_has_metadata_encoder() else None),
-                            extra_outputs=extra_outputs,
-                        )
+                        model_outputs = run_model(ddp_model, raw_model, batch, extra_outputs)
                 else:
-                    model_outputs = ddp_model(
-                        batch["binaryInputNCHW"],
-                        batch["globalInputNC"],
-                        input_meta=(batch["metadataInputNC"] if raw_model.get_has_metadata_encoder() else None),
-                        extra_outputs=extra_outputs,
-                    )
+                    model_outputs = run_model(ddp_model, raw_model, batch, extra_outputs)
 
                 # The print-batch extras below run when the post-increment batch count hits the print interval.
                 is_print_batch = (batch_count_this_epoch + 1) % print_train_loss_every_batches == 0
@@ -1963,32 +1989,14 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
                     val_metric_weights = defaultdict(float)
                     val_samples = 0
                     t0 = time.perf_counter()
-                    for batch in data_processing_pytorch.read_npz_training_data(
-                            val_files,
-                            batch_size,
-                            world_size=1,  # Only the main process validates
-                            rank=0,        # Only the main process validates
-                            pos_len_x=pos_len_x,
-                            pos_len_y=pos_len_y,
-                            device=device,
-                            randomize_symmetries=True,
-                            include_meta=raw_model.get_has_metadata_encoder(),
-                            model_config=model_config
-                    ):
+                    # Only the main process validates
+                    for batch in read_training_data(val_files, 1, 0, model_config):
                         if use_amp:
                             with autocast("cuda", dtype=amp_dtype):
                                 # Note: output heads are already in fp32 despite autocast
-                                model_outputs = validation_model(
-                                    batch["binaryInputNCHW"],
-                                    batch["globalInputNC"],
-                                    input_meta=(batch["metadataInputNC"] if raw_model.get_has_metadata_encoder() else None),
-                                )
+                                model_outputs = run_model(validation_model, raw_model, batch)
                         else:
-                            model_outputs = validation_model(
-                                batch["binaryInputNCHW"],
-                                batch["globalInputNC"],
-                                input_meta=(batch["metadataInputNC"] if raw_model.get_has_metadata_encoder() else None),
-                            )
+                            model_outputs = run_model(validation_model, raw_model, batch)
                         postprocessed = raw_model.postprocess_output(model_outputs)
                         extra_outputs = None
                         metrics = metrics_obj.metrics_dict_batchwise(
