@@ -1,4 +1,3 @@
-#include "../game/dotsfieldLadders.h"
 #include "../neuralnet/nninputs.h"
 
 #include <optional>
@@ -176,38 +175,7 @@ void NNInputs::fillRowV7Dots(
     currentPla = getOpp(currentPla);
   }
 
-  // Temporarily keep Dots ladder input planes 14-17 zero. The row buffer was cleared above.
-  // Restore this block when ladder features are ready for self-play training.
-#if 0
-  std::optional<DotsLaddersSolver> dotsLaddersSolver = DotsLaddersSolver(board);
-  dotsLaddersSolver->solve(capturesAndTerritoriesInfos);
-
-  int currentCapturedLayer = 0;
-
-  for (auto i = static_cast<uint8_t>(DotsSpatialFeature::LadderCaptured_14); i <= static_cast<uint8_t>(DotsSpatialFeature::LadderCapturedPrevious2_16); i++) {
-    for(int y = 0; y<ySize; y++) {
-      for(int x = 0; x<xSize; x++) {
-        const Loc loc = Location::getLoc(x, y, xSize);
-
-        if (const Color capturedColor = dotsLaddersSolver->getCapturedColor(loc); capturedColor != C_EMPTY) {
-          setSpatial(NNPos::xyToPos(x,y,nnXLen), static_cast<DotsSpatialFeature>(i));
-        }
-
-        if (i == static_cast<uint8_t>(DotsSpatialFeature::LadderCaptured_14) && dotsLaddersSolver->getWorkingColor(loc) == pla) {
-          setSpatial(NNPos::xyToPos(x,y,nnXLen), DotsSpatialFeature::LadderWorkingMoves_17);
-        }
-      }
-    }
-
-    currentCapturedLayer++;
-
-    if (i < static_cast<uint8_t>(DotsSpatialFeature::LadderCapturedPrevious2_16) && numTurnsOfHistoryIncluded >= currentCapturedLayer) {
-      const auto& recentBoard = hist.getRecentBoard(currentCapturedLayer);
-      dotsLaddersSolver.emplace(recentBoard);
-      dotsLaddersSolver->solve(recentBoard.calculateCapturesAndTerritoriesColorsForDots());
-    }
-  }
-#endif
+  // Ladder input planes 14-17 stay zero (the row buffer was cleared above): the ladder solver was removed.
 
   //Komi and any score adjustments
   float selfKomi = hist.currentSelfKomi(nextPlayer,nnInputParams.drawEquivalentWinsForWhite);

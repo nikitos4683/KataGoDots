@@ -28,9 +28,8 @@ namespace Tests {
     REGULAR,
     UNDO_AND_STATES,
 
-    // The following modes are expensive, especially ladders
+    // The following mode is expensive
     CAPTURE_TERRITORY_ON_EACH_MOVE,
-    LADDERS_ON_EACH_MOVE,
   };
 
   void runDotsStressTestsInternal(

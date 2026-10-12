@@ -1,7 +1,6 @@
 #include <chrono>
 
 #include "../version.h"
-#include "../game/dotsfieldLadders.h"
 #include "../tests/testdotsutils.h"
 #include "../tests/tests.h"
 
@@ -176,7 +175,6 @@ void Tests::runDotsStressTestsInternal(
     case REGULAR: cout << "Regular"; break;
     case UNDO_AND_STATES: cout << "Undo and States"; break;
     case CAPTURE_TERRITORY_ON_EACH_MOVE: cout << "Capture territory on each move"; break;
-    case LADDERS_ON_EACH_MOVE: cout << "Ladders on each move"; break;
     default: ASSERT_UNREACHABLE;
   }
   cout << endl;
@@ -249,11 +247,6 @@ void Tests::runDotsStressTestsInternal(
               (void)boardHistory->getReasonableMoves(board, P_WHITE, Board::NULL_LOC, false, &capturesAndTerritoriesInfos);
 
               (void)boardHistory->whiteScoreIfGroundingAlive(board, C_EMPTY, &capturesAndTerritoriesInfos);
-            } else if (checkingMode == LADDERS_ON_EACH_MOVE) {
-              Board boardCopy = board;
-              DotsLaddersSolver laddersSolver(board);
-              laddersSolver.solve(capturesAndTerritoriesInfos);
-              testAssert(boardCopy.isEqualForTesting(board));
             }
           }
         }

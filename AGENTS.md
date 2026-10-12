@@ -57,7 +57,6 @@ KataGoDots/
 │   │   ├── common.h               # Core types (Loc, Color, Player, Move, string keys)
 │   │   ├── dotsfield.cpp          # Dots cycle tracing, base boundaries, territory flags
 │   │   ├── dotsfieldCapturesAndTerritories.cpp # Capture/territory calculation
-│   │   ├── dotsfieldLadders.{h,cpp} # Dots tactical ladder solver
 │   │   ├── dotsboardhistory.cpp   # Dots scoring, grounding alive checks, resign reasonableness
 │   │   └── rules.{h,cpp}          # Rules struct, start position generators/recognizers
 │   ├── neuralnet/                 # Neural net backends & feature extractors
@@ -186,7 +185,7 @@ When compiled with `katago_tests`:
 .\cpp\builds\msvc-opencl\Release\katago_tests.exe
 ```
 For a single-configuration build (for example Ninja), the executable is directly in the build directory.
-Discovers and tests `tests/testdotsladders.cpp`, `tests/testdotsutils.cpp`, and `tests/testdotsstress.cpp`.
+Builds `tests/testdotsutils.cpp` and `tests/testdotsstress.cpp`; it has no test cases at the moment (the only ones were the Dots ladder solver tests, removed with the solver).
 
 ### 3. Python Unit Tests
 The repository uses `pytest` configured in `pytest.ini`:
