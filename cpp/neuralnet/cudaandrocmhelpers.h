@@ -141,6 +141,13 @@ bool customCudaFlashAttentionMma(
   int batchSize, int seqLen, int numHeads, int numKVHeads, int qHeadDim, int vHeadDim,
   int qStride, int kvStride, cudaStream_t stream
 );
+//Cross attention variant of customCudaFlashAttentionMma: qLen queries attend to kvLen keys per
+//batch element, kvMask [batchSize, kvLen] (can be null) masks the keys, no query mask.
+bool customCudaFlashAttentionMmaCross(
+  const half* Q, const half* K, const half* V, const half* kvMask, half* output,
+  int batchSize, int qLen, int kvLen, int numHeads, int numKVHeads, int qHeadDim, int vHeadDim,
+  int qStride, int kvStride, cudaStream_t stream
+);
 //Whether the mma kernels support this attention shape at all (head dims, GQA divisibility).
 //Static shape check only - the device probe below is a separate condition.
 bool customCudaFlashAttentionMmaSupportsShape(int numHeads, int numKVHeads, int qHeadDim, int vHeadDim);

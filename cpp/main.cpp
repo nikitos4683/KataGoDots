@@ -191,6 +191,8 @@ static int handleSubcommand(const string& subcommand, const vector<string>& args
     return MainCmds::dumpsparse(subArgs);
   else if(subcommand == "dumpsparsenn")
     return MainCmds::dumpsparsenn(subArgs);
+  else if(subcommand == "testsparsenn")
+    return MainCmds::testsparsenn(subArgs);
   else if(subcommand == "sandbox")
     return MainCmds::sandbox();
   else if(subcommand == "version") {

@@ -716,6 +716,51 @@ int MainCmds::dumpsparse(const vector<string>& args) {
   return 0;
 }
 
+// Positions of random Dots games (random moves preferring captures), sampled over the whole games
+static vector<DotsSparseInput> randomSparseDotsPositions(Rand& rand, int xSize, int ySize, int numPositions, int& numGames) {
+  vector<DotsSparseInput> result;
+  numGames = 0;
+  while((int)result.size() < numPositions) {
+    Rules rules = Rules::DEFAULT_DOTS;
+    rules.startPos = rand.nextBool(0.5) ? Rules::START_POS_CROSS : Rules::START_POS_CROSS_4;
+    rules.startPosIsRandom = rules.startPos == Rules::START_POS_CROSS_4;
+    Board board(xSize, ySize, rules);
+    BoardHistory hist(board, P_BLACK, rules, 0, BoardHistoryModes());
+    Player pla = P_BLACK;
+    numGames++;
+    // Sample positions from the whole game, more of them later when there are more areas
+    const double recordProb = 4.0 / (xSize * ySize * 0.3);
+    for(int moveIdx = 0; moveIdx < xSize * ySize && !hist.isGameFinished && (int)result.size() < numPositions; moveIdx++) {
+      MiscNNInputParams params;
+      DotsSparseInput input;
+      NNInputs::fillDotsSparseInput(board, hist, pla, params, input, false);
+      if(input.candidates.empty() && !input.groundAllowed)
+        break;
+      if(rand.nextBool(recordProb))
+        result.push_back(input);
+      Loc loc;
+      if(input.candidates.empty() || (input.groundAllowed && rand.nextBool(0.02))) {
+        loc = Board::PASS_LOC;
+      }
+      else {
+        vector<int> captures;
+        for(int i = 0; i < (int)input.candidates.size(); i++)
+          if(input.candidates[i].gainMy != 0)
+            captures.push_back(i);
+        int idx;
+        if(!captures.empty() && rand.nextBool(0.5))
+          idx = captures[rand.nextUInt((uint32_t)captures.size())];
+        else
+          idx = (int)rand.nextUInt((uint32_t)input.candidates.size());
+        loc = input.candidateLocs[idx];
+      }
+      hist.makeBoardMoveAssumeLegal(board, loc, pla, nullptr);
+      pla = getOpp(pla);
+    }
+  }
+  return result;
+}
+
 int MainCmds::dumpsparsenn(const vector<string>& args) {
   Board::initHash();
   ScoreValue::initTables();
@@ -762,58 +807,23 @@ int MainCmds::dumpsparsenn(const vector<string>& args) {
   const SparseDotsNN::Model model(*desc.sparseDots);
 
   Rand rand(seed);
-  nlohmann::json result = nlohmann::json::array();
   int numGames = 0;
-  while((int)result.size() < numPositions) {
-    Rules rules = Rules::DEFAULT_DOTS;
-    rules.startPos = rand.nextBool(0.5) ? Rules::START_POS_CROSS : Rules::START_POS_CROSS_4;
-    rules.startPosIsRandom = rules.startPos == Rules::START_POS_CROSS_4;
-    Board board(xSize, ySize, rules);
-    BoardHistory hist(board, P_BLACK, rules, 0, BoardHistoryModes());
-    Player pla = P_BLACK;
-    numGames++;
-    // Sample positions from the whole game, more of them later when there are more areas
-    const double recordProb = 4.0 / (xSize * ySize * 0.3);
-    for(int moveIdx = 0; moveIdx < xSize * ySize && !hist.isGameFinished && (int)result.size() < numPositions; moveIdx++) {
-      MiscNNInputParams params;
-      DotsSparseInput input;
-      NNInputs::fillDotsSparseInput(board, hist, pla, params, input, false);
-      if(input.candidates.empty() && !input.groundAllowed)
-        break;
-      if(rand.nextBool(recordProb)) {
-        const int symmetry = SparseDotsNN::effectiveSymmetry(
-          (int)rand.nextUInt(SymmetryHelpers::NUM_SYMMETRIES), input.xSize, input.ySize);
-        const DotsSparseInput transformed = input.withSymmetry(symmetry);
-        SparseDotsNN::RawOutput raw;
-        model.evaluate(transformed, raw);
-        nlohmann::json entry;
-        entry["symmetry"] = symmetry;
-        entry["input"] = transformed.toJson();
-        entry["policy"] = raw.policy;
-        entry["value"] = std::vector<float>(raw.value, raw.value + 3);
-        entry["scoreValue"] = std::vector<float>(raw.scoreValue, raw.scoreValue + 6);
-        entry["ownership"] = raw.ownership;
-        result.push_back(entry);
-      }
-      Loc loc;
-      if(input.candidates.empty() || (input.groundAllowed && rand.nextBool(0.02))) {
-        loc = Board::PASS_LOC;
-      }
-      else {
-        vector<int> captures;
-        for(int i = 0; i < (int)input.candidates.size(); i++)
-          if(input.candidates[i].gainMy != 0)
-            captures.push_back(i);
-        int idx;
-        if(!captures.empty() && rand.nextBool(0.5))
-          idx = captures[rand.nextUInt((uint32_t)captures.size())];
-        else
-          idx = (int)rand.nextUInt((uint32_t)input.candidates.size());
-        loc = input.candidateLocs[idx];
-      }
-      hist.makeBoardMoveAssumeLegal(board, loc, pla, nullptr);
-      pla = getOpp(pla);
-    }
+  const vector<DotsSparseInput> positions = randomSparseDotsPositions(rand, xSize, ySize, numPositions, numGames);
+  nlohmann::json result = nlohmann::json::array();
+  for(const DotsSparseInput& input : positions) {
+    const int symmetry = SparseDotsNN::effectiveSymmetry(
+      (int)rand.nextUInt(SymmetryHelpers::NUM_SYMMETRIES), input.xSize, input.ySize);
+    const DotsSparseInput transformed = input.withSymmetry(symmetry);
+    SparseDotsNN::RawOutput raw;
+    model.evaluate(transformed, raw);
+    nlohmann::json entry;
+    entry["symmetry"] = symmetry;
+    entry["input"] = transformed.toJson();
+    entry["policy"] = raw.policy;
+    entry["value"] = std::vector<float>(raw.value, raw.value + 3);
+    entry["scoreValue"] = std::vector<float>(raw.scoreValue, raw.scoreValue + 6);
+    entry["ownership"] = raw.ownership;
+    result.push_back(entry);
   }
   ofstream out;
   FileUtils::open(out, outputFile);
@@ -821,4 +831,166 @@ int MainCmds::dumpsparsenn(const vector<string>& args) {
   out.close();
   cout << "Wrote " << result.size() << " positions from " << numGames << " games to " << outputFile << endl;
   return 0;
+}
+
+int MainCmds::testsparsenn(const vector<string>& args) {
+  Board::initHash();
+  ScoreValue::initTables();
+
+  string modelFile;
+  int numPositions;
+  int batchSize;
+  int xSize;
+  int ySize;
+  string seed;
+  string useFP16Str;
+  double tolerance;
+  try {
+    KataGoCommandLine cmd(
+      "Evaluate positions of random Dots games with the neural net backend of this build and with the CPU reference "
+      "of a sparse model (version 18), and compare the raw outputs.");
+    TCLAP::ValueArg<string> modelArg("","model","Sparse Dots model file",true,string(),"FILE");
+    TCLAP::ValueArg<int> numPositionsArg("","num-positions","Number of positions",false,64,"N");
+    TCLAP::ValueArg<int> batchSizeArg("","batch-size","Max batch size, the batches have random sizes up to it",false,8,"N");
+    TCLAP::ValueArg<int> xSizeArg("","x-size","Board x size",false,Board::DEFAULT_LEN_X_DOTS,"X");
+    TCLAP::ValueArg<int> ySizeArg("","y-size","Board y size",false,Board::DEFAULT_LEN_Y_DOTS,"Y");
+    TCLAP::ValueArg<string> seedArg("","seed","Random seed",false,"testsparsenn","SEED");
+    TCLAP::ValueArg<string> useFP16Arg("","use-fp16","true, false or auto",false,"false","BOOL");
+    TCLAP::ValueArg<double> toleranceArg("","tolerance","Max allowed absolute difference of any output, 0 = default "
+                                         "(0.002 in FP32, 0.05 in FP16)",false,0.0,"X");
+    cmd.add(modelArg);
+    cmd.add(numPositionsArg);
+    cmd.add(batchSizeArg);
+    cmd.add(xSizeArg);
+    cmd.add(ySizeArg);
+    cmd.add(seedArg);
+    cmd.add(useFP16Arg);
+    cmd.add(toleranceArg);
+    cmd.parseArgs(args);
+    modelFile = modelArg.getValue();
+    numPositions = numPositionsArg.getValue();
+    batchSize = batchSizeArg.getValue();
+    xSize = xSizeArg.getValue();
+    ySize = ySizeArg.getValue();
+    seed = seedArg.getValue();
+    useFP16Str = useFP16Arg.getValue();
+    tolerance = toleranceArg.getValue();
+  }
+  catch (TCLAP::ArgException &e) {
+    cerr << "Error: " << e.error() << " for argument " << e.argId() << endl;
+    return 1;
+  }
+  enabled_t useFP16;
+  if(!enabled_t::tryParse(useFP16Str, useFP16))
+    throw StringError("testsparsenn: bad use-fp16 value " + useFP16Str);
+  if(batchSize < 1)
+    throw StringError("testsparsenn: batch-size must be positive");
+
+  Logger logger(nullptr, true);
+  NeuralNet::globalInitialize();
+  LoadedModel* loadedModel = NeuralNet::loadModelFile(modelFile, "");
+  const ModelDesc& desc = NeuralNet::getModelDesc(loadedModel);
+  if(!desc.isSparseDots())
+    throw StringError("testsparsenn: not a sparse Dots model");
+  const SparseDotsNN::Model reference(*desc.sparseDots);
+
+  const int nnXLen = std::max(xSize, ySize);
+  const int nnYLen = std::max(xSize, ySize);
+  ConfigParser cfg(std::map<string, string>{});
+  ComputeContext* context = NeuralNet::createComputeContext({0}, &logger, nnXLen, nnYLen, "", useFP16, loadedModel, cfg);
+  ComputeHandle* handle = NeuralNet::createComputeHandle(context, loadedModel, &logger, batchSize, false, true, 0, 0);
+  InputBuffers* inputBuffers = NeuralNet::createInputBuffers(loadedModel, batchSize, nnXLen, nnYLen);
+  const bool usingFP16 = NeuralNet::isUsingFP16(handle);
+  if(tolerance <= 0.0)
+    tolerance = usingFP16 ? 0.05 : 0.002;
+
+  Rand rand(seed);
+  int numGames = 0;
+  const vector<DotsSparseInput> positions = randomSparseDotsPositions(rand, xSize, ySize, numPositions, numGames);
+  cout << "Positions: " << positions.size() << " from " << numGames << " games, FP16 " << Global::boolToString(usingFP16)
+       << ", tolerance " << tolerance << endl;
+
+  auto newOutput = [&]() {
+    auto output = std::make_unique<NNOutput>();
+    output->nnXLen = nnXLen;
+    output->nnYLen = nnYLen;
+    output->whiteOwnerMap = new float[nnXLen * nnYLen];
+    output->noisedPolicyProbs = nullptr;
+    return output;
+  };
+  double maxPolicyDiff = 0.0, maxValueDiff = 0.0, maxScoreDiff = 0.0, maxOwnershipDiff = 0.0;
+  double sumPolicyDiff = 0.0;
+  int64_t numPolicyValues = 0;
+  int numBatches = 0;
+  size_t start = 0;
+  while(start < positions.size()) {
+    const int n = std::min<int>((int)(positions.size() - start), 1 + (int)rand.nextUInt((uint32_t)batchSize));
+    vector<std::unique_ptr<NNResultBuf>> bufs;
+    vector<NNResultBuf*> bufPtrs;
+    vector<std::unique_ptr<NNOutput>> outputs;
+    vector<NNOutput*> outputPtrs;
+    for(int i = 0; i < n; i++) {
+      bufs.push_back(std::make_unique<NNResultBuf>());
+      NNResultBuf& buf = *bufs.back();
+      buf.dotsSparseInput = positions[start + i];
+      buf.symmetry = (int)rand.nextUInt(SymmetryHelpers::NUM_SYMMETRIES);
+      buf.policyOptimism = rand.nextBool(0.5) ? 0.0 : 1.0;
+      bufPtrs.push_back(&buf);
+      outputs.push_back(newOutput());
+      outputPtrs.push_back(outputs.back().get());
+    }
+    NeuralNet::getOutput(handle, inputBuffers, n, bufPtrs.data(), outputPtrs, true);
+
+    for(int i = 0; i < n; i++) {
+      const DotsSparseInput& input = positions[start + i];
+      const int symmetry = SparseDotsNN::effectiveSymmetry(bufs[i]->symmetry, input.xSize, input.ySize);
+      SparseDotsNN::RawOutput raw;
+      reference.evaluate(input.withSymmetry(symmetry), raw);
+      auto expected = newOutput();
+      SparseDotsNN::writeOutput(input, raw, (float)bufs[i]->policyOptimism, *expected);
+      const NNOutput& actual = *outputs[i];
+
+      vector<int> policyPositions;
+      for(Loc loc : input.candidateLocs)
+        policyPositions.push_back(NNPos::locToPos(loc, input.xSize, nnXLen, nnYLen));
+      if(input.groundAllowed)
+        policyPositions.push_back(NNPos::getPassPos(nnXLen, nnYLen));
+      for(int pos : policyPositions) {
+        const double diff = std::fabs((double)actual.policyProbs[pos] - expected->policyProbs[pos]);
+        maxPolicyDiff = std::max(maxPolicyDiff, diff);
+        sumPolicyDiff += diff;
+        numPolicyValues++;
+      }
+      const float actualValues[3] = {actual.whiteWinProb, actual.whiteLossProb, actual.whiteNoResultProb};
+      const float expectedValues[3] = {expected->whiteWinProb, expected->whiteLossProb, expected->whiteNoResultProb};
+      for(int j = 0; j < 3; j++)
+        maxValueDiff = std::max(maxValueDiff, std::fabs((double)actualValues[j] - expectedValues[j]));
+      const float actualScores[6] = {actual.whiteScoreMean, actual.whiteScoreMeanSq, actual.whiteLead, actual.varTimeLeft,
+                                     actual.shorttermWinlossError, actual.shorttermScoreError};
+      const float expectedScores[6] = {expected->whiteScoreMean, expected->whiteScoreMeanSq, expected->whiteLead,
+                                       expected->varTimeLeft, expected->shorttermWinlossError, expected->shorttermScoreError};
+      for(int j = 0; j < 6; j++)
+        maxScoreDiff = std::max(maxScoreDiff, std::fabs((double)actualScores[j] - expectedScores[j]));
+      for(Loc loc : input.pointLocs) {
+        const int pos = NNPos::locToPos(loc, input.xSize, nnXLen, nnYLen);
+        maxOwnershipDiff = std::max(maxOwnershipDiff, std::fabs((double)actual.whiteOwnerMap[pos] - expected->whiteOwnerMap[pos]));
+      }
+    }
+    start += n;
+    numBatches++;
+  }
+
+  cout << "Batches: " << numBatches << endl;
+  cout << "Max abs diff: policy " << maxPolicyDiff << " (mean " << (sumPolicyDiff / std::max<int64_t>(1, numPolicyValues))
+       << "), value " << maxValueDiff << ", score value " << maxScoreDiff << ", ownership " << maxOwnershipDiff << endl;
+  const bool ok = maxPolicyDiff <= tolerance && maxValueDiff <= tolerance && maxScoreDiff <= tolerance &&
+                  maxOwnershipDiff <= tolerance;
+  cout << (ok ? "OK" : "FAILED") << endl;
+
+  NeuralNet::freeInputBuffers(inputBuffers);
+  NeuralNet::freeComputeHandle(handle);
+  NeuralNet::freeComputeContext(context);
+  NeuralNet::freeLoadedModel(loadedModel);
+  NeuralNet::globalCleanup();
+  return ok ? 0 : 1;
 }

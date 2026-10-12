@@ -212,6 +212,64 @@ struct RopeTables {
 
 }  // namespace
 
+static void edgeFeatures(const DotsSparseInput& input, float x, float y, float* out) {
+  out[0] = x * COORD_SCALE;
+  out[1] = y * COORD_SCALE;
+  out[2] = ((float)input.xSize - 1.0f - x) * COORD_SCALE;
+  out[3] = ((float)input.ySize - 1.0f - y) * COORD_SCALE;
+}
+
+static void movesAgoOneHot(int movesAgo, float* out) {
+  for(int i = 0; i < NUM_MOVES_AGO; i++)
+    out[i] = movesAgo == i + 1 ? 1.0f : 0.0f;
+}
+
+void SparseDotsNN::pointFeatures(const DotsSparseInput& input, int i, float* out) {
+  const auto& p = input.points[i];
+  out[0] = p.owner;
+  edgeFeatures(input, p.x, p.y, out + 1);
+  out[5] = p.grounded;
+  movesAgoOneHot(p.movesAgo, out + 6);
+}
+
+void SparseDotsNN::vertexFeatures(const DotsSparseInput& input, int i, float* out) {
+  const float x = input.vertices[i].x;
+  const float y = input.vertices[i].y;
+  edgeFeatures(input, x, y, out);
+  for(int p = 0; p < 5; p++) {
+    const float k = (float)(2.0 * 3.14159265358979323846 / FOURIER_PERIODS[p]);
+    out[4 + 4 * p + 0] = sinf(k * x);
+    out[4 + 4 * p + 1] = cosf(k * x);
+    out[4 + 4 * p + 2] = sinf(k * y);
+    out[4 + 4 * p + 3] = cosf(k * y);
+  }
+}
+
+void SparseDotsNN::areaScalarFeatures(const DotsSparseInput& input, int a, float* out) {
+  const auto& area = input.areas[a];
+  out[0] = log1pf((float)std::max<int>(1, area.boundaryLen));
+  float* s = out + 1;
+  s[0] = area.owner;
+  s[1] = area.insideMy * COUNT_SCALE;
+  s[2] = area.insideOpp * COUNT_SCALE;
+  s[3] = area.boundaryLen * COUNT_SCALE;
+  s[4] = area.grounded;
+  movesAgoOneHot(area.movesAgo, s + 5);
+}
+
+void SparseDotsNN::candidateFeatures(const DotsSparseInput& input, int i, float* out) {
+  const auto& cnd = input.candidates[i];
+  edgeFeatures(input, cnd.x, cnd.y, out);
+  out[4] = cnd.gainMy * COUNT_SCALE;
+  out[5] = cnd.gainOpp * COUNT_SCALE;
+  out[6] = cnd.inMyHouse;
+  out[7] = cnd.inOppHouse;
+}
+
+float SparseDotsNN::groundFeature(const DotsSparseInput& input) {
+  return input.groundResult * COUNT_SCALE;
+}
+
 struct SparseDotsNN::Model::Impl {
   bool areaRopeMean;
   int trunkChannels;
@@ -458,48 +516,20 @@ struct SparseDotsNN::Model::Impl {
     const float xSize = (float)input.xSize;
     const float ySize = (float)input.ySize;
 
-    auto edge = [&](float x, float y, float* out) {
-      out[0] = x * COORD_SCALE;
-      out[1] = y * COORD_SCALE;
-      out[2] = (xSize - 1.0f - x) * COORD_SCALE;
-      out[3] = (ySize - 1.0f - y) * COORD_SCALE;
-    };
-    auto movesAgoOneHot = [](int movesAgo, float* out) {
-      for(int i = 0; i < NUM_MOVES_AGO; i++)
-        out[i] = movesAgo == i + 1 ? 1.0f : 0.0f;
-    };
-
     // Embeddings ------------------------------------------------------------------------------------------------
     vector<float> trunk((size_t)seqLen * c);
     std::copy(globalToken.begin(), globalToken.end(), trunk.begin());
     if(numPoints > 0) {
-      vector<float> features((size_t)numPoints * 11);
-      for(int i = 0; i < numPoints; i++) {
-        const auto& p = input.points[i];
-        float* f = features.data() + (size_t)i * 11;
-        f[0] = p.owner;
-        edge(p.x, p.y, f + 1);
-        f[5] = p.grounded;
-        movesAgoOneHot(p.movesAgo, f + 6);
-      }
+      vector<float> features((size_t)numPoints * NUM_POINT_FEATURES);
+      for(int i = 0; i < numPoints; i++)
+        pointFeatures(input, i, features.data() + (size_t)i * NUM_POINT_FEATURES);
       point.apply(features.data(), numPoints, trunk.data() + c);
     }
     if(numAreas > 0) {
       const int numVertices = (int)input.vertices.size();
-      vector<float> vf((size_t)numVertices * 24);
-      for(int i = 0; i < numVertices; i++) {
-        const float x = input.vertices[i].x;
-        const float y = input.vertices[i].y;
-        float* f = vf.data() + (size_t)i * 24;
-        edge(x, y, f);
-        for(int p = 0; p < 5; p++) {
-          const float k = (float)(2.0 * 3.14159265358979323846 / FOURIER_PERIODS[p]);
-          f[4 + 4 * p + 0] = sinf(k * x);
-          f[4 + 4 * p + 1] = cosf(k * x);
-          f[4 + 4 * p + 2] = sinf(k * y);
-          f[4 + 4 * p + 3] = cosf(k * y);
-        }
-      }
+      vector<float> vf((size_t)numVertices * NUM_VERTEX_FEATURES);
+      for(int i = 0; i < numVertices; i++)
+        vertexFeatures(input, i, vf.data() + (size_t)i * NUM_VERTEX_FEATURES);
       const int cv = vertexChannels;
       vector<float> h1((size_t)numVertices * cv);
       vector<float> h((size_t)numVertices * cv);
@@ -507,7 +537,7 @@ struct SparseDotsNN::Model::Impl {
       activateAll(vertexActivation, h1.data(), h1.size());
       vertex2.apply(h1.data(), numVertices, h.data());
 
-      const int aggC = 2 * cv + 1 + 10;
+      const int aggC = 2 * cv + NUM_AREA_SCALAR_FEATURES;
       vector<float> agg((size_t)numAreas * aggC, 0.0f);
       for(int a = 0; a < numAreas; a++) {
         const auto& area = input.areas[a];
@@ -527,14 +557,7 @@ struct SparseDotsNN::Model::Impl {
         if(area.boundaryLen == 0)
           for(int i = 0; i < cv; i++)
             g[cv + i] = 0.0f;
-        g[2 * cv] = log1pf((float)len);
-        float* s = g + 2 * cv + 1;
-        s[0] = area.owner;
-        s[1] = area.insideMy * COUNT_SCALE;
-        s[2] = area.insideOpp * COUNT_SCALE;
-        s[3] = area.boundaryLen * COUNT_SCALE;
-        s[4] = area.grounded;
-        movesAgoOneHot(area.movesAgo, s + 5);
+        areaScalarFeatures(input, a, g + 2 * cv);
       }
       vector<float> a1((size_t)numAreas * c);
       area1.apply(agg.data(), numAreas, a1.data());
@@ -620,21 +643,14 @@ struct SparseDotsNN::Model::Impl {
 
       vector<float> queries((size_t)numQueries * cd);
       if(numCands > 0) {
-        vector<float> features((size_t)numCands * 8);
-        for(int i = 0; i < numCands; i++) {
-          const auto& cnd = input.candidates[i];
-          float* f = features.data() + (size_t)i * 8;
-          edge(cnd.x, cnd.y, f);
-          f[4] = cnd.gainMy * COUNT_SCALE;
-          f[5] = cnd.gainOpp * COUNT_SCALE;
-          f[6] = cnd.inMyHouse;
-          f[7] = cnd.inOppHouse;
-        }
+        vector<float> features((size_t)numCands * NUM_CAND_FEATURES);
+        for(int i = 0; i < numCands; i++)
+          candidateFeatures(input, i, features.data() + (size_t)i * NUM_CAND_FEATURES);
         cand.apply(features.data(), numCands, queries.data());
       }
       if(hasGround) {
-        const float groundFeature = input.groundResult * COUNT_SCALE;
-        ground.apply(&groundFeature, 1, queries.data() + (size_t)numCands * cd);
+        const float groundValue = groundFeature(input);
+        ground.apply(&groundValue, 1, queries.data() + (size_t)numCands * cd);
       }
       for(int qi = 0; qi < numQueries; qi++)
         for(int i = 0; i < cd; i++)

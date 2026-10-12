@@ -732,6 +732,8 @@ if(USE_BACKEND STREQUAL "CUDA")
     neuralnet/cudabackend.cpp
     neuralnet/cudautils.cpp
     neuralnet/cudahelpers.cu
+    neuralnet/cudasparsedots.cu
+    neuralnet/cudasparsedotsmodel.cpp
   )
   # Optional vendored CUTLASS enables the fused transformer FFN kernel. The fused kernel is
   # built on the DualGemm extension shipped in CUTLASS's example 45, so both the include tree

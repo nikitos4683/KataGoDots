@@ -433,3 +433,12 @@ model.value_head 0 0 0
   matmul linear1; matbias bias1; act; matmul linear2; matbias; act; matmul+matbias valuehead (3);
   matmul+matbias miscvaluehead (6: score mean, stdev, lead, vtime, 2 short-term errors); matmul linear_ownership (v1→1)
 ```
+
+### 9.4. Вычисление в C++
+
+- **CPU-эталон** — `cpp/neuralnet/sparsedotsnn.cpp`: одна позиция без паддинга, FP32, те же формулы, что в PyTorch. Им считает бэкенд Eigen, с ним сверяются GPU-бэкенды. Признаки токенов (`SparseDotsNN::pointFeatures` и т. д.) общие для эталона и CUDA.
+- **CUDA** — `cpp/neuralnet/cudasparsedotsmodel.cpp` (модель) и `cudasparsedots.cu` (ядра). Позиции батча дополняются до общего числа токенов `S` (кратно 8) и кандидатов; маска `[N,S]`. Признаки собираются на хосте и копируются одним блоком. Эмбеддинги, пулинги и value-голова — в FP32; ствол и декодер — в FP16 при `useFP16`, иначе в FP32. GEMM — cuBLAS с накоплением в FP32. Внимание: tensor-core ядро `cudaflashmma.cuh` (self-attention ствола и cross-attention декодера, для этого ядро обобщено на разные длины Q и KV), иначе скалярное ядро `sparseDotsAttention`. cuDNN SDPA не используется: его графы строятся под длину последовательности, а она меняется от батча к батчу.
+- **ROCm, OpenCL, TensorRT, ONNX, Metal** модели версии 18 не принимают.
+- **`katago dumpsparsenn -model M -output F`** пишет входы и сырые выходы эталона в JSON (сверка с PyTorch: `python/tests/test_sparse_dots_cpp_parity.py`).
+- **`katago testsparsenn -model M [-use-fp16 true] [-batch-size B] [-x-size X -y-size Y]`** сравнивает выходы бэкенда сборки с эталоном на позициях случайных партий; допуск по умолчанию 0.002 в FP32 и 0.05 в FP16.
+- **`KATAGO_SPARSE_DOTS_PROFILE=1`** — CUDA печатает время стадий (эмбеддинги, ствол, декодер, value-голова, упаковка на хосте) каждые 50 вызовов.
