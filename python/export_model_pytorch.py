@@ -25,6 +25,8 @@ from katago.train.model_pytorch import (
     TransformerAttentionBlock, TransformerFFNBlock, NestedBottleneckTransformerBlock,
 )
 from katago.train.model_pytorch import compute_attn_logit_dataless_bounds
+from katago.train import model_sparse_dots
+from katago.train.model_sparse_dots import SparseDotsModel, create_model, is_sparse_dots_config
 from katago.train.load_model import load_model
 
 # A transformer FFN hidden channel is pruned when no weight touching it exceeds this in
@@ -234,12 +236,14 @@ def main(args):
 
     # LOAD MODEL ---------------------------------------------------------------------
     if export_random_initialized_model is not None:
-        if export_random_initialized_model not in modelconfigs.config_of_name:
+        try:
+            # Dots models are always sparse (docs/DotsSparseNN.md)
+            model_config = modelconfigs.get_config(export_random_initialized_model, dots=(args['game'] == 'dots'))
+        except KeyError:
             raise Exception(f"Unknown model config name: {export_random_initialized_model}")
-        model_config = modelconfigs.config_of_name[export_random_initialized_model]
         logging.info(f"Exporting freshly random-initialized model with config: {export_random_initialized_model}")
         logging.info(str(model_config))
-        model = Model(model_config, args['pos_len_x'], args['pos_len_y'], games=[Game[args['game'].upper()]])
+        model = create_model(model_config, args['pos_len_x'], args['pos_len_y'], games=[Game[args['game'].upper()]])
         model.initialize()
         model.to("cpu")
         swa_model = None
@@ -337,8 +341,14 @@ def main(args):
     writestr("," + (model.katago_git_rev or ""))
     writestr("," + (model.katago_backend or ""))
     writeln("")
-    writeln(modelconfigs.get_num_bin_input_features(model_config))
-    writeln(modelconfigs.get_num_global_input_features(model_config))
+    sparse_dots = is_sparse_dots_config(model_config)
+    if sparse_dots:
+        # The sparse model reads point features instead of spatial planes
+        writeln(model_sparse_dots.NUM_POINT_FEATURES)
+        writeln(model_sparse_dots.NUM_GLOBAL_FEATURES)
+    else:
+        writeln(modelconfigs.get_num_bin_input_features(model_config))
+        writeln(modelconfigs.get_num_global_input_features(model_config))
 
     if version <= 12:
         assert model.td_score_multiplier == 20.0
@@ -839,12 +849,122 @@ def main(args):
         write_policy_head("model.policy_head",model.policy_head)
         write_value_head("model.value_head",model.value_head)
 
+    # Sparse Dots model (version 18) ------------------------------------------------------------------
+    # Layout: embeddings, trunk blocks, trunk tip, candidate decoder, value head. See SparseDotsDesc in desc.cpp.
+
+    def write_linear(name, linear):
+        write_matmul(name, linear.weight)
+        if linear.bias is not None:
+            write_matbias(name+".bias", linear.bias)
+
+    def write_cross_attention_block(name, block):
+        writeln("transformer_cross_attention_block")
+        writeln(name)
+        writeln(block.num_heads)
+        writeln(block.num_kv_heads)
+        writeln(block.q_head_dim)
+        writeln(block.v_head_dim)
+        writeln(1)  # use rope
+        writeln(1)  # learnable rope
+        write_transformer_norm(name+".norm1", block.norm1)
+        write_matmul(name+".q_proj", block.q_proj.weight)
+        write_matmul(name+".k_proj", block.k_proj.weight)
+        write_matmul(name+".v_proj", block.v_proj.weight)
+        write_matmul(name+".out_proj", block.out_proj.weight)
+        writeln(name+".rope_freqs")
+        freqs = block.rope_freqs.detach()
+        writeln(freqs.shape[0])
+        writeln(freqs.shape[1])
+        writeln(freqs.shape[2])
+        write_weights(freqs)
+
+    def write_sparse_model(model):
+        assert isinstance(model, SparseDotsModel)
+        writeln("sparse_dots_model")
+        writeln(1 if model.area_rope == "mean" else 0)
+        writeln(model_sparse_dots.NUM_VERTEX_FEATURES)
+        writeln(model_sparse_dots.NUM_AREA_SCALAR_FEATURES)
+        writeln(model_sparse_dots.NUM_CAND_FEATURES)
+        writeln(model_sparse_dots.NUM_GROUND_FEATURES)
+        # Spare slots for future options
+        writeln(0)
+        writeln(0)
+        writeln(0)
+        writeln(0)
+
+        write_linear("model.linear_point", model.linear_point)
+        write_linear("model.linear_vertex1", model.linear_vertex1)
+        write_activation("model.act_vertex", model.act_vertex)
+        write_linear("model.linear_vertex2", model.linear_vertex2)
+        write_linear("model.linear_area1", model.linear_area1)
+        write_activation("model.act_area", model.act_area)
+        write_linear("model.linear_area2", model.linear_area2)
+        write_matbias("model.global_token", model.global_token)
+        write_matmul("model.linear_global", model.linear_global.weight)
+
+        writeln("trunk")
+        writeln(len(model.blocks))
+        writeln(model.c_trunk)
+        writeln(model.c_mid)
+        writeln(model.c_mid-model.c_gpool)
+        writeln(model.c_gpool)
+        writeln(model.c_gpool)
+        writeln(1)  # TRUNK_NORM_KIND_RMSNORM, the spatial flag is in the norm itself
+        writeln(0)
+        writeln(0)
+        writeln(0)
+        writeln(0)
+        writeln(0)
+        for i,block in enumerate(model.blocks):
+            write_block("model.blocks."+str(i), block)
+        write_rmsnorm("model.norm_trunkfinal", model.norm_trunkfinal)
+        write_activation("model.act_trunkfinal", model.act_trunkfinal)
+
+        decoder = model.decoder
+        writeln("model.decoder")
+        writeln(decoder.c_dec)
+        writeln(decoder.num_layers)
+        writeln(0)
+        writeln(0)
+        write_linear("model.decoder.linear_cand", decoder.linear_cand)
+        write_linear("model.decoder.linear_ground", decoder.linear_ground)
+        write_matmul("model.decoder.linear_pool", decoder.linear_pool.weight)
+        for i in range(decoder.num_layers):
+            write_cross_attention_block(f"model.decoder.layers.{2*i}", decoder.layers[2*i])
+            write_transformer_ffn_block(f"model.decoder.layers.{2*i+1}", decoder.layers[2*i+1])
+        write_transformer_norm("model.decoder.norm_final", decoder.norm_final)
+        # Only the policy and the short-term-optimistic policy are used by the engine (like version 17)
+        out_weight = decoder.linear_out.weight
+        assert decoder.linear_out.bias is None
+        write_matmul("model.decoder.linear_out", torch.stack((out_weight[0], out_weight[5]), dim=0))
+
+        valuehead = model.value_head
+        writeln("model.value_head")
+        writeln(0)
+        writeln(0)
+        writeln(0)
+        write_matmul("model.value_head.linear1", valuehead.linear1.weight)
+        write_matbias("model.value_head.bias1", valuehead.bias1)
+        write_activation("model.value_head.act1", valuehead.act1)
+        write_matmul("model.value_head.linear2", valuehead.linear2.weight)
+        write_matbias("model.value_head.bias2", valuehead.linear2.bias)
+        write_activation("model.value_head.act2", valuehead.act2)
+        write_matmul("model.value_head.linear_valuehead", valuehead.linear_valuehead.weight)
+        write_matbias("model.value_head.bias_valuehead", valuehead.linear_valuehead.bias)
+        # Score mean, stdev, lead, variance time and the short-term errors, as for version 17
+        w = torch.cat((valuehead.linear_miscvaluehead.weight[0:4], valuehead.linear_moremiscvaluehead.weight[0:2]), dim=0)
+        b = torch.cat((valuehead.linear_miscvaluehead.bias[0:4], valuehead.linear_moremiscvaluehead.bias[0:2]), dim=0)
+        write_matmul("model.value_head.linear_miscvaluehead", w)
+        write_matbias("model.value_head.bias_miscvaluehead", b)
+        write_matmul("model.value_head.linear_ownership", valuehead.linear_ownership.weight)
+
+    writer = write_sparse_model if sparse_dots else write_model
     if swa_model is not None:
         logging.info("Writing SWA model")
-        write_model(swa_model)
+        writer(swa_model)
     else:
         logging.info("Writing model")
-        write_model(model)
+        writer(model)
     f.close()
 
     with open(os.path.join(export_dir,"metadata.json"),"w") as f:

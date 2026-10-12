@@ -379,3 +379,57 @@ C++ записывает **целочисленные координаты и и
 ## 8. Открытые вопросы
 
 1. (Позже) Токен `HOUSE` (домик) третьего типа: тот же кодировщик границы, плюс число пустых пунктов и своих точек внутри. Домики — надёжная территория (5.12–5.16), а пустые пункты токенами не являются, так что сейчас сеть видит домик только по форме точек. Нужно проверить, умеет ли движок перечислять контуры домиков.
+
+---
+
+## 9. Решения реализации
+
+Приняты при реализации, не меняют смысла разделов 1–7. Код: `cpp/neuralnet/nninputsdotssparse.cpp` (извлечение), `python/katago/train/model_sparse_dots.py` (модель), `metrics_sparse_dots.py` (потери), `export_model_pytorch.py` (экспорт), `sparse_dots_bin.py` (Python-ридер файла модели).
+
+### 9.1. Извлечение позиции (C++)
+
+- **Области**: 4-связные компоненты пунктов с `isTerritory` и одинаковым активным цветом. Граница — активные невыключенные точки владельца, 4-смежные с компонентой. Стресс-тест сверяет её с `Base::surrounding_locs` для только что созданных баз.
+- **`gain_my` / `gain_opp`** считаются ходом с откатом там, где движок вообще пытается окружить (`getColorsOfPotentialCapturing`, не меньше двух несвязанных соседей). `CapturesAndTerritoriesInfos` для этого не подходит: она пропускает окружения ходом внутри собственной потенциальной территории игрока. Ход-самоубийство даёт 0.
+- **`ground_result`** = `whiteScoreIfBlackGrounds` (или `blackScoreIfWhiteGrounds`) с учётом стороны + коми игрока на ходе (тот же коми, что в глобальном признаке 1).
+- **Кэш**: хеш NN-входа для Точек включает последние 5 ходов.
+- **`katago dumpsparse <sgf> [-m N] [-symmetry S] [-print-board]`** печатает вход позиции в JSON.
+
+### 9.2. Модель (PyTorch)
+
+- **Конфиг**: при `-game dots` любое имя трансформерной модели даёт разреженную модель (`modelconfigs.get_config(name, dots=True)`, версия 18). Суффиксы для сравнений: `-arnone` (`area_rope = "none"`), `-dec1` (один слой декодера).
+- **Последовательность**: `[GLOBAL][POINT×P][AREA×A]`, маска `[N,S,1]`. Токен `GLOBAL` — обучаемый вектор; ко всем токенам прибавляется `linear_global(globals)`.
+- **Эмбеддинги** (с bias): `POINT` — `Linear(11→C)`; вершина — `Linear(24→192) → SiLU → Linear(192→192)`; область — `[mean ‖ max ‖ log(1+|B|) ‖ 10 скаляров] → Linear(395→C) → SiLU → Linear(C→C)`.
+- **Признаки** (одинаково в PyTorch и C++):
+  - точка: `owner, x/40, y/40, (W−1−x)/40, (H−1−y)/40, grounded, one-hot(movesAgo)`;
+  - вершина: 4 расстояния до краёв, затем для `P = 4, 8, 16, 32, 64`: `sin(2πx/P), cos(2πx/P), sin(2πy/P), cos(2πy/P)`;
+  - область: `owner, insideMy/20, insideOpp/20, boundaryLen/20, grounded, one-hot(movesAgo)`;
+  - кандидат: 4 расстояния до краёв, `gainMy/20, gainOpp/20, inMyHouse, inOppHouse`; заземление: `ground_result/20`.
+- **RoPE**: координаты целые, без масштаба. Таблицы cos/sin строятся в каждом слое по его частотам. У `GLOBAL`, у кандидата-заземления и у областей при `"none"` таблицы нулевые, их q/k после поворота нулевые (NoPE).
+- **Ствол**: штатные `NestedBottleneckTransformerBlock` в раскладке NSC; внимание заменено подклассом `SparseRoPEAttentionBlock` (параметры те же). Финальная норма — spatial RMSNorm по действительным токенам, затем SiLU.
+- **Пулинг для голов**: среднее по всем действительным токенам, включая `GLOBAL` (знаменатель всегда ≥ 1); смещение `sqrt(x_size·y_size) − 14`. Для декодера `[mean, mean·off/10, max]`, для value-головы `[mean, mean·off/10, mean·(off²/100 − 0.1)]`.
+- **Декодер**: `Linear(8→Cd)` для пунктов, `Linear(1→Cd)` для заземления, плюс `Linear(3C→Cd)` от пулинга; `Cd` = `mid_num_channels` (192). Слой: `RMSNorm → cross-attention (q из кандидата, k/v из выхода ствола без доп. нормы) → SwiGLU FFN`. Затем `RMSNorm → Linear(Cd→8)` без bias. Заземление — последний кандидат (индекс M), маскированные кандидаты получают −5000.
+- **Value-голова**: как у KataGo, но `conv1` → `Linear(C→v1)` + bias; член чётности в scorebelief удалён (у Точек он всегда 0). Ownership — `Linear(v1→1)` от выхода `act1` на токенах `POINT`, логит сигмоиды.
+- **Потери**: как у KataGo с такими же весами; policy — общий softmax по M+1; цель соперника нормируется после проекции, при нулевой сумме вес выходов 1 и 3 равен 0; ownership — BCE, среднее по точкам строки; futurepos — по кандидатам-пунктам, `/ sqrt(x_size·y_size)`.
+- **Симметрии** при обучении — только преобразование координат батча (`apply_symmetry_to_batch`). Модель не зависит от порядка токенов; геометрически симметричной её делает обучение, как и свёрточную сеть KataGo.
+
+### 9.3. Файл модели версии 18
+
+Заголовок как у версии 17: имя, `18,maxX,maxY,DOTS,gitRev,backend`, затем `11` (признаки точки), `8` (глобальные), 7 множителей, 8 нулей. Далее:
+
+```
+sparse_dots_model
+<area_rope: 1 mean / 0 none> 24 10 8 1 0 0 0 0
+matmul+matbias linear_point; matmul+matbias linear_vertex1; act; matmul+matbias linear_vertex2
+matmul+matbias linear_area1; act; matmul+matbias linear_area2
+matbias global_token; matmul linear_global
+trunk <num_blocks> <C> <Cmid> <Cmid-Cgpool> <Cgpool> <Cgpool> 1 0 0 0 0 0
+  nested_bottleneck_block × num_blocks (как у версии 17)
+  rmsnorm norm_trunkfinal; act
+model.decoder <Cd> <layers> 0 0
+  matmul+matbias linear_cand; matmul+matbias linear_ground; matmul linear_pool
+  × layers: transformer_cross_attention_block (формат transformer_attention_block, k/v из C) ; transformer_ffn_block
+  transformer rmsnorm norm_final; matmul linear_out (Cd→2: выходы policy 0 и 5)
+model.value_head 0 0 0
+  matmul linear1; matbias bias1; act; matmul linear2; matbias; act; matmul+matbias valuehead (3);
+  matmul+matbias miscvaluehead (6: score mean, stdev, lead, vtime, 2 short-term errors); matmul linear_ownership (v1→1)
+```
