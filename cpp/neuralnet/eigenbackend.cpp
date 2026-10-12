@@ -18,6 +18,7 @@
 #include "../neuralnet/nninputs.h"
 #include "../neuralnet/nneval.h"
 #include "../neuralnet/activations.h"
+#include "../neuralnet/sparsedotsnn.h"
 
 #include "../core/simpleallocator.h"
 #include "../core/test.h"
@@ -2279,6 +2280,18 @@ struct InputBuffers {
     const ModelDesc& m = loadedModel->modelDesc;
 
     maxBatchSize = maxBatchSz;
+    if(m.isSparseDots()) {
+      // Sparse Dots models read DotsSparseInput directly from the result buffers
+      singleInputElts = 0;
+      singleInputGlobalElts = 0;
+      singleInputMetaElts = 0;
+      singlePolicyPassResultElts = 0;
+      singlePolicyResultElts = 0;
+      singleValueResultElts = 0;
+      singleScoreValueResultElts = 0;
+      singleOwnershipResultElts = 0;
+      return;
+    }
     singleInputElts = m.numInputChannels * nnXLen * nnYLen;
     singleInputGlobalElts = m.numInputGlobalChannels;
     singleInputMetaElts = m.numInputMetaChannels;
@@ -2370,6 +2383,8 @@ struct ComputeHandle {
   std::shared_ptr<const Model> model;
   std::unique_ptr<ScratchBuffers> scratch;
   std::unique_ptr<Buffers> buffers;
+  // Set instead of the above for sparse Dots models
+  std::unique_ptr<SparseDotsNN::Model> sparseModel;
 
   ComputeHandle() = delete;
   ComputeHandle(const ComputeHandle&) = delete;
@@ -2382,6 +2397,10 @@ struct ComputeHandle {
       modelCacheKey(loadedModel.modelDesc.name + "-" + loadedModel.modelDesc.sha256),
       model(nullptr)
   {
+    if(loadedModel.modelDesc.isSparseDots()) {
+      sparseModel = std::make_unique<SparseDotsNN::Model>(*loadedModel.modelDesc.sparseDots);
+      return;
+    }
     {
       std::lock_guard<std::mutex> lock(context->cachedModelsMutex);
       if(context->cachedModels.find(modelCacheKey) == context->cachedModels.end()) {
@@ -2396,6 +2415,8 @@ struct ComputeHandle {
   }
 
   ~ComputeHandle() {
+    if(sparseModel != nullptr)
+      return;
     std::lock_guard<std::mutex> lock(context->cachedModelsMutex);
     context->cachedModelsRefCount[modelCacheKey] -= 1;
     assert(context->cachedModelsRefCount[modelCacheKey] >= 0);
@@ -2457,6 +2478,19 @@ void NeuralNet::getOutput(
   const int batchSize = numBatchEltsFilled;
   const int nnXLen = computeHandle->context->nnXLen;
   const int nnYLen = computeHandle->context->nnYLen;
+
+  if(computeHandle->sparseModel != nullptr) {
+    assert(dotsGame);
+    SparseDotsNN::RawOutput raw;
+    for(int row = 0; row < batchSize; row++) {
+      const DotsSparseInput& input = inputBufs[row]->dotsSparseInput;
+      const int symmetry = SparseDotsNN::effectiveSymmetry(inputBufs[row]->symmetry, input.xSize, input.ySize);
+      computeHandle->sparseModel->evaluate(input.withSymmetry(symmetry), raw);
+      SparseDotsNN::writeOutput(input, raw, (float)inputBufs[row]->policyOptimism, *outputs[row]);
+    }
+    return;
+  }
+
   const int modelVersion = computeHandle->model->modelVersion;
 
   const int numSpatialFeatures = NNModelVersion::getNumSpatialFeatures(modelVersion, dotsGame);

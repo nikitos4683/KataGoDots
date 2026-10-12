@@ -495,8 +495,13 @@ void NNEvaluator::fillRowBufs(
     buf.rowMetaBuf.resize(rowMetaLen);
 
   static_assert(NNModelVersion::latestInputsVersionImplemented == 8);
-  if(inputsVersion == NNModelVersion::dotsSparseInputsVersion)
-    throw StringError("Sparse Dots NN inputs are not implemented yet");
+  if(inputsVersion == NNModelVersion::dotsSparseInputsVersion) {
+    if(rowMetaLen > 0)
+      Global::fatalError("Sparse Dots models don't support SGF metadata");
+    buf.hasRowMeta = false;
+    NNInputs::fillDotsSparseInput(board, history, nextPlayer, nnInputParams, buf.dotsSparseInput, false, &buf.dotsReasonableMoves);
+    return;
+  }
   // TODO: it makes sense to pass correct `selfplay` value here
   NNInputs::fillRowVN(inputsVersion, board, history, nextPlayer, nnInputParams, nnXLen, nnYLen, inputsUseNHWC, buf.rowSpatialBuf.data(), buf.rowGlobalBuf.data(), false, board.isDots() ? &buf.dotsReasonableMoves : nullptr);
 
@@ -1492,7 +1497,31 @@ void NNEvaluator::evaluate(
   }
 
   // Postprocess ownermap
-  if(buf.result->whiteOwnerMap != NULL) {
+  if(buf.result->whiteOwnerMap != NULL && inputsVersion == NNModelVersion::dotsSparseInputsVersion) {
+    // Sparse Dots: the net gives a logit per dot outside the areas, the probability that the opponent of its owner
+    // captures it. Dots inside the areas keep their current state: captured ones are owned by the area owner.
+    for(int pos = 0; pos<nnXLen*nnYLen; pos++) {
+      const int y = pos / nnXLen;
+      const int x = pos % nnXLen;
+      float value = 0.0f;
+      if(y < board.y_size && x < board.x_size) {
+        const State state = board.getState(Location::getLoc(x,y,board.x_size));
+        const Color placedColor = getPlacedDotColor(state);
+        const Color activeColor = getActiveColor(state);
+        if(placedColor != C_EMPTY) {
+          if(!isTerritory(state)) {
+            const float captureProb = 1.0f / (1.0f + expf(-buf.result->whiteOwnerMap[pos] * postProcessParams.outputScaleMultiplier));
+            value = placedColor == P_BLACK ? captureProb : -captureProb;
+          }
+          else if(activeColor != placedColor) {
+            value = activeColor == P_WHITE ? 1.0f : -1.0f;
+          }
+        }
+      }
+      buf.result->whiteOwnerMap[pos] = value;
+    }
+  }
+  else if(buf.result->whiteOwnerMap != NULL) {
     if(modelVersion >= 3) {
       for(int pos = 0; pos<nnXLen*nnYLen; pos++) {
         int y = pos / nnXLen;

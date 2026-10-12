@@ -15,6 +15,7 @@
 #include "../program/play.h"
 #include "../command/commandline.h"
 #include "../tests/tests.h"
+#include "../neuralnet/sparsedotsnn.h"
 #include "../main.h"
 
 #include <atomic>
@@ -712,5 +713,112 @@ int MainCmds::dumpsparse(const vector<string>& args) {
     cout << "Next player: " << PlayerIO::playerToString(nextPla, true) << endl;
   }
   cout << input.withSymmetry(symmetry).toJson().dump(1) << endl;
+  return 0;
+}
+
+int MainCmds::dumpsparsenn(const vector<string>& args) {
+  Board::initHash();
+  ScoreValue::initTables();
+
+  string modelFile;
+  string outputFile;
+  int numPositions;
+  int xSize;
+  int ySize;
+  string seed;
+  try {
+    KataGoCommandLine cmd(
+      "Evaluate positions of random Dots games with the CPU reference of a sparse model (version 18) and write the "
+      "inputs and the raw outputs as JSON, to compare with other implementations.");
+    TCLAP::ValueArg<string> modelArg("","model","Sparse Dots model file",true,string(),"FILE");
+    TCLAP::ValueArg<string> outputArg("","output","JSON file to write",true,string(),"FILE");
+    TCLAP::ValueArg<int> numPositionsArg("","num-positions","Number of positions",false,40,"N");
+    TCLAP::ValueArg<int> xSizeArg("","x-size","Board x size",false,Board::DEFAULT_LEN_X_DOTS,"X");
+    TCLAP::ValueArg<int> ySizeArg("","y-size","Board y size",false,Board::DEFAULT_LEN_Y_DOTS,"Y");
+    TCLAP::ValueArg<string> seedArg("","seed","Random seed",false,"dumpsparsenn","SEED");
+    cmd.add(modelArg);
+    cmd.add(outputArg);
+    cmd.add(numPositionsArg);
+    cmd.add(xSizeArg);
+    cmd.add(ySizeArg);
+    cmd.add(seedArg);
+    cmd.parseArgs(args);
+    modelFile = modelArg.getValue();
+    outputFile = outputArg.getValue();
+    numPositions = numPositionsArg.getValue();
+    xSize = xSizeArg.getValue();
+    ySize = ySizeArg.getValue();
+    seed = seedArg.getValue();
+  }
+  catch (TCLAP::ArgException &e) {
+    cerr << "Error: " << e.error() << " for argument " << e.argId() << endl;
+    return 1;
+  }
+
+  ModelDesc desc;
+  ModelDesc::loadFromFileMaybeGZipped(modelFile, desc, "");
+  if(!desc.isSparseDots())
+    throw StringError("dumpsparsenn: not a sparse Dots model");
+  const SparseDotsNN::Model model(*desc.sparseDots);
+
+  Rand rand(seed);
+  nlohmann::json result = nlohmann::json::array();
+  int numGames = 0;
+  while((int)result.size() < numPositions) {
+    Rules rules = Rules::DEFAULT_DOTS;
+    rules.startPos = rand.nextBool(0.5) ? Rules::START_POS_CROSS : Rules::START_POS_CROSS_4;
+    rules.startPosIsRandom = rules.startPos == Rules::START_POS_CROSS_4;
+    Board board(xSize, ySize, rules);
+    BoardHistory hist(board, P_BLACK, rules, 0, BoardHistoryModes());
+    Player pla = P_BLACK;
+    numGames++;
+    // Sample positions from the whole game, more of them later when there are more areas
+    const double recordProb = 4.0 / (xSize * ySize * 0.3);
+    for(int moveIdx = 0; moveIdx < xSize * ySize && !hist.isGameFinished && (int)result.size() < numPositions; moveIdx++) {
+      MiscNNInputParams params;
+      DotsSparseInput input;
+      NNInputs::fillDotsSparseInput(board, hist, pla, params, input, false);
+      if(input.candidates.empty() && !input.groundAllowed)
+        break;
+      if(rand.nextBool(recordProb)) {
+        const int symmetry = SparseDotsNN::effectiveSymmetry(
+          (int)rand.nextUInt(SymmetryHelpers::NUM_SYMMETRIES), input.xSize, input.ySize);
+        const DotsSparseInput transformed = input.withSymmetry(symmetry);
+        SparseDotsNN::RawOutput raw;
+        model.evaluate(transformed, raw);
+        nlohmann::json entry;
+        entry["symmetry"] = symmetry;
+        entry["input"] = transformed.toJson();
+        entry["policy"] = raw.policy;
+        entry["value"] = std::vector<float>(raw.value, raw.value + 3);
+        entry["scoreValue"] = std::vector<float>(raw.scoreValue, raw.scoreValue + 6);
+        entry["ownership"] = raw.ownership;
+        result.push_back(entry);
+      }
+      Loc loc;
+      if(input.candidates.empty() || (input.groundAllowed && rand.nextBool(0.02))) {
+        loc = Board::PASS_LOC;
+      }
+      else {
+        vector<int> captures;
+        for(int i = 0; i < (int)input.candidates.size(); i++)
+          if(input.candidates[i].gainMy != 0)
+            captures.push_back(i);
+        int idx;
+        if(!captures.empty() && rand.nextBool(0.5))
+          idx = captures[rand.nextUInt((uint32_t)captures.size())];
+        else
+          idx = (int)rand.nextUInt((uint32_t)input.candidates.size());
+        loc = input.candidateLocs[idx];
+      }
+      hist.makeBoardMoveAssumeLegal(board, loc, pla, nullptr);
+      pla = getOpp(pla);
+    }
+  }
+  ofstream out;
+  FileUtils::open(out, outputFile);
+  out << result.dump() << endl;
+  out.close();
+  cout << "Wrote " << result.size() << " positions from " << numGames << " games to " << outputFile << endl;
   return 0;
 }

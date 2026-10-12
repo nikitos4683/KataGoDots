@@ -508,6 +508,8 @@ ComputeContext* NeuralNet::createComputeContext(
   const LoadedModel* loadedModel,
   ConfigParser& cfg
 ) {
+  if(loadedModel != NULL && NeuralNet::getModelDesc(loadedModel).isSparseDots())
+    throw StringError("OpenCL backend does not support sparse Dots models (version 18), use the CUDA or Eigen backend");
   if(gpuIdxs.size() <= 0)
     throw StringError("NeuralNet::createComputeContext - specified no gpus to use");
 

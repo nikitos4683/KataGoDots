@@ -490,6 +490,78 @@ struct ValueHeadDesc {
   void releaseWeights();
 };
 
+// Sparse Dots model (model version 18), see docs/DotsSparseNN.md section 9.3 for the file layout.
+// Tokens: [GLOBAL][POINT x P][AREA x A], action candidates are decoder queries.
+struct SparseDotsDesc {
+  bool areaRopeMean; // areas take the mean RoPE over their boundary vertices, otherwise no positions
+  int numPointFeatures;
+  int numVertexFeatures;
+  int numAreaScalarFeatures;
+  int numCandFeatures;
+  int numGroundFeatures;
+  int numGlobalFeatures;
+
+  // Embeddings
+  MatMulLayerDesc pointMul;
+  MatBiasLayerDesc pointBias;
+  MatMulLayerDesc vertexMul1;
+  MatBiasLayerDesc vertexBias1;
+  ActivationLayerDesc vertexActivation;
+  MatMulLayerDesc vertexMul2;
+  MatBiasLayerDesc vertexBias2;
+  MatMulLayerDesc areaMul1;
+  MatBiasLayerDesc areaBias1;
+  ActivationLayerDesc areaActivation;
+  MatMulLayerDesc areaMul2;
+  MatBiasLayerDesc areaBias2;
+  MatBiasLayerDesc globalToken;
+  MatMulLayerDesc globalMul;
+
+  // Trunk
+  int numBlocks;
+  int trunkNumChannels;
+  int midNumChannels;
+  std::vector<std::pair<int, unique_ptr_void>> blocks;
+  RMSNormLayerDesc trunkTipRMSNorm;
+  ActivationLayerDesc trunkTipActivation;
+
+  // Candidate decoder
+  int decoderNumChannels;
+  int decoderNumLayers;
+  MatMulLayerDesc candMul;
+  MatBiasLayerDesc candBias;
+  MatMulLayerDesc groundMul;
+  MatBiasLayerDesc groundBias;
+  MatMulLayerDesc poolMul;
+  std::vector<TransformerAttentionDesc> decoderAttention; // k/v projections read the trunk channels
+  std::vector<TransformerFFNDesc> decoderFFN;
+  TransformerRMSNormDesc decoderFinalNorm;
+  MatMulLayerDesc decoderOutMul; // policy and short-term optimistic policy
+
+  // Value head
+  MatMulLayerDesc v1Mul;
+  MatBiasLayerDesc v1Bias;
+  ActivationLayerDesc v1Activation;
+  MatMulLayerDesc v2Mul;
+  MatBiasLayerDesc v2Bias;
+  ActivationLayerDesc v2Activation;
+  MatMulLayerDesc v3Mul;
+  MatBiasLayerDesc v3Bias;
+  MatMulLayerDesc sv3Mul;
+  MatBiasLayerDesc sv3Bias;
+  MatMulLayerDesc ownershipMul;
+
+  SparseDotsDesc();
+  ~SparseDotsDesc();
+  SparseDotsDesc(std::istream& in, int modelVersion, bool binaryFloats, int numPointFeatures, int numGlobalFeatures);
+
+  SparseDotsDesc(const SparseDotsDesc&) = delete;
+  SparseDotsDesc& operator=(const SparseDotsDesc&) = delete;
+
+  int64_t getNumParameters() const;
+  void releaseWeights();
+};
+
 struct ModelPostProcessParams {
   double tdScoreMultiplier;
   double scoreMeanMultiplier;
@@ -537,6 +609,10 @@ struct ModelDesc {
   TrunkDesc trunk;
   PolicyHeadDesc policyHead;
   ValueHeadDesc valueHead;
+
+  //Set for the sparse Dots models (version 18) instead of trunk/policyHead/valueHead.
+  std::unique_ptr<SparseDotsDesc> sparseDots;
+  bool isSparseDots() const { return sparseDots != nullptr; }
 
   //Architecture summary values that are normally derived by walking trunk/policyHead/valueHead.
   //Set (present = true) only for a desc reconstructed from a .onnx file, which has no layer

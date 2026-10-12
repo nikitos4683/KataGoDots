@@ -1040,6 +1040,7 @@ add_executable(katago
   neuralnet/nninputs.cpp
   neuralnet/nninputsdots.cpp
   neuralnet/nninputsdotssparse.cpp
+  neuralnet/sparsedotsnn.cpp
   neuralnet/sgfmetadata.cpp
   neuralnet/modelversion.cpp
   neuralnet/nneval.cpp
@@ -1775,6 +1776,17 @@ if(USE_BACKEND STREQUAL "TENSORRT" OR USE_BACKEND STREQUAL "ONNX")
   # package config (e.g. vcpkg), the variable can resolve to the DLL itself rather than the import
   # lib, and it also omits protobuf's own dependencies such as abseil.
   target_link_libraries(katago protobuf::libprotobuf)
+endif()
+
+# The CPU reference of the sparse Dots models (neuralnet/sparsedotsnn.cpp) uses Eigen for its matrix
+# products when it is available, in any backend. Without Eigen it falls back to plain loops.
+if(NOT USE_BACKEND STREQUAL "EIGEN")
+  find_package(Eigen3 QUIET)
+  if(TARGET Eigen3::Eigen)
+    target_link_libraries(katago Eigen3::Eigen)
+    target_compile_definitions(katago PRIVATE KATAGO_HAS_EIGEN)
+    message(STATUS "Found Eigen3 for the sparse Dots CPU reference")
+  endif()
 endif()
 
 if(DOTS_GAME)

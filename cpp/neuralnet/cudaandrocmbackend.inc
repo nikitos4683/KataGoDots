@@ -4849,6 +4849,8 @@ ComputeContext* NeuralNet::createComputeContext(
   const LoadedModel* loadedModel,
   ConfigParser& cfg
 ) {
+  if(loadedModel != NULL && NeuralNet::getModelDesc(loadedModel).isSparseDots())
+    throw StringError("CUDA/ROCm backend: sparse Dots models (version 18) are not supported yet, use the Eigen backend");
   (void)gpuIdxs;
   (void)logger;
   (void)homeDataDirOverride;
@@ -4889,6 +4891,8 @@ ComputeContext* NeuralNet::createComputeContext(
   const LoadedModel* loadedModel,
   ConfigParser& cfg
 ) {
+  if(loadedModel != NULL && NeuralNet::getModelDesc(loadedModel).isSparseDots())
+    throw StringError("CUDA/ROCm backend: sparse Dots models (version 18) are not supported yet, use the Eigen backend");
   (void)gpuIdxs;
   (void)logger;
   (void)homeDataDirOverride;
