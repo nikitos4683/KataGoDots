@@ -503,7 +503,7 @@ void TrainingWriteBuffers::addRow(
   const ReanalysisData& reanalysisData,
   const bool selfplay
 ) {
-  static_assert(NNModelVersion::latestInputsVersionImplemented == 7, "");
+  static_assert(NNModelVersion::latestInputsVersionImplemented == 8, "");
   if(inputsVersion < 3 || inputsVersion > 7)
     throw StringError("Training write buffers: Does not support input version: " + Global::intToString(inputsVersion));
 

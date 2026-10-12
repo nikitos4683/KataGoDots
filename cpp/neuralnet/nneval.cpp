@@ -158,7 +158,7 @@ NNEvaluator::NNEvaluator(
   }
   else {
     internalModelName = "random";
-    modelVersion = NNModelVersion::defaultModelVersion;
+    modelVersion = NNModelVersion::getDefaultModelVersion(newDotsGame);
   }
   inputsVersion = NNModelVersion::getInputsVersion(modelVersion, newDotsGame);
 
@@ -494,7 +494,9 @@ void NNEvaluator::fillRowBufs(
   if(buf.rowMetaBuf.size() < rowMetaLen)
     buf.rowMetaBuf.resize(rowMetaLen);
 
-  static_assert(NNModelVersion::latestInputsVersionImplemented == 7);
+  static_assert(NNModelVersion::latestInputsVersionImplemented == 8);
+  if(inputsVersion == NNModelVersion::dotsSparseInputsVersion)
+    throw StringError("Sparse Dots NN inputs are not implemented yet");
   // TODO: it makes sense to pass correct `selfplay` value here
   NNInputs::fillRowVN(inputsVersion, board, history, nextPlayer, nnInputParams, nnXLen, nnYLen, inputsUseNHWC, buf.rowSpatialBuf.data(), buf.rowGlobalBuf.data(), false, board.isDots() ? &buf.dotsReasonableMoves : nullptr);
 

@@ -37,7 +37,7 @@ Rules::Rules(const bool initIsDots) : Rules(
   initIsDots ? 0 : KO_POSITIONAL,
   initIsDots ? 0 : SCORING_AREA,
   initIsDots ? 0 : TAX_NONE,
-  initIsDots,
+  false, // Suicide (a move into the opponent's empty base) is illegal by default in Dots too
   false,
   initIsDots ? 0 : WHB_ZERO,
   false,

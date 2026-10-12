@@ -94,7 +94,7 @@ int MainCmds::selfplay(const vector<string>& args) {
     dataBoardLenIsSpecified ? dataBoardLen : Board::MAX_LEN_Y);
 
   const bool dotsGame = cfg.getOrDefaultBool(DOTS_KEY, false);
-  const int inputsVersion = cfg.getOrDefaultInt("inputsVersion", 0, 10000, NNModelVersion::getInputsVersion(NNModelVersion::defaultModelVersion, dotsGame));
+  const int inputsVersion = cfg.getOrDefaultInt("inputsVersion", 0, 10000, NNModelVersion::getInputsVersion(NNModelVersion::getDefaultModelVersion(dotsGame), dotsGame));
   //Max number of games that we will allow to be queued up and not written out
   const int maxDataQueueSize = cfg.getInt("maxDataQueueSize",1,1000000);
   const int maxRowsPerTrainFile = cfg.getInt("maxRowsPerTrainFile",1,100000000);

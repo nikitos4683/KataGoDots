@@ -168,6 +168,22 @@ namespace NNInputs {
   static_assert(NUM_FEATURES_SPATIAL_V7_DOTS == NUM_FEATURES_SPATIAL_V7); // Might be changed later if needed
   static_assert(NUM_FEATURES_GLOBAL_V7_DOTS == NUM_FEATURES_GLOBAL_V7);
 
+  // Global features of the sparse Dots format (model version 18), see docs/DotsSparseNN.md section 5.
+  // Everything is relative to the player to move.
+  enum class DotsSparseGlobalFeature : uint8_t {
+    HistoryGround_0, // 0: grounding in the considered history
+    Komi_1, // 1: komi / 20
+    GroundReasonable_2, // 2: finishing by grounding is reasonable
+    ScoreMy_3, // 3: own captures / 20
+    ScoreOpp_4, // 4: opponent captures / 20
+    ScoreDiffPlusKomi_5, // 5: (own - opponent captures + komi) / 20
+    XSize_6, // 6: board x size / 40
+    YSize_7, // 7: board y size / 40
+
+    COUNT, // = 8
+  };
+  constexpr int NUM_FEATURES_GLOBAL_DOTS_SPARSE = static_cast<int>(DotsSparseGlobalFeature::COUNT);
+
   Hash128 getHash(
     const Board& board, const BoardHistory& boardHistory, Player nextPlayer,
     const MiscNNInputParams& nnInputParams

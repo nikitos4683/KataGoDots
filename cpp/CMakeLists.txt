@@ -2133,7 +2133,9 @@ if(WIN32 AND USE_BACKEND STREQUAL "ROCM")
   endif()
 endif()
 
-if(NOT "${CMAKE_BINARY_DIR}" STREQUAL "${CMAKE_SOURCE_DIR}")
+# Disable for side builds (tests, other backends) that must not replace cpp/katago
+option(KATAGO_COPY_EXECUTABLE_TO_SOURCE_DIR "Copy the built katago executable into the cpp directory" ON)
+if(KATAGO_COPY_EXECUTABLE_TO_SOURCE_DIR AND NOT "${CMAKE_BINARY_DIR}" STREQUAL "${CMAKE_SOURCE_DIR}")
 add_custom_command(TARGET katago POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:katago> ${CMAKE_SOURCE_DIR}/$<TARGET_FILE_NAME:katago>
         COMMENT "Copying executable to cpp directory"

@@ -188,7 +188,8 @@ void Tests::runNNInputsV3V4Tests() {
     rowGlobal = new float[numFeaturesGlobal];
   };
 
-  static_assert(NNModelVersion::latestInputsVersionImplemented == 7, "");
+  // Version 8 is the sparse Dots format and is tested separately
+  static_assert(NNModelVersion::latestInputsVersionImplemented == 8, "");
   int minVersion = 3;
   int maxVersion = 7;
 
@@ -1500,7 +1501,7 @@ void Tests::runExcludeTerritoryAtariNNInputsTests() {
     int nnXLen = 7;
     int nnYLen = 7;
     double drawEquivalentWinsForWhite = 0.5;
-    static_assert(NNModelVersion::latestInputsVersionImplemented == 7, "");
+    static_assert(NNModelVersion::latestInputsVersionImplemented == 8, "");
     int numFeaturesBin = version == 6 ? NNInputs::NUM_FEATURES_SPATIAL_V6 : NNInputs::NUM_FEATURES_SPATIAL_V7;
     int numFeaturesGlobal = version == 6 ? NNInputs::NUM_FEATURES_GLOBAL_V6 : NNInputs::NUM_FEATURES_GLOBAL_V7;
     float* rowBin = new float[numFeaturesBin * nnXLen * nnYLen];

@@ -704,7 +704,8 @@ int MainCmds::writetrainingdata(const vector<string>& args) {
   if(dataBoardLen > Board::MAX_LEN)
     throw StringError("dataBoardLen > maximum board len, must recompile to increase");
 
-  static_assert(NNModelVersion::latestInputsVersionImplemented == 7, "");
+  // Converts human Go games only, the dense V7 inputs are the latest for Go
+  static_assert(NNModelVersion::latestInputsVersionImplemented == 8, "");
   const int inputsVersion = 7;
   const int numBinaryChannels = NNInputs::NUM_FEATURES_SPATIAL_V7;
   const int numGlobalChannels = NNInputs::NUM_FEATURES_GLOBAL_V7;

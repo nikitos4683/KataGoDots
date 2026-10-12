@@ -215,7 +215,7 @@ HASH: 42AC4303D65557034CC3593CB26EA615
  1 .  .  .  .  .  .  .  .  .  .
 
 
-Rules dotsCaptureEmptyBase0startPosCROSSsui1komi0
+Rules dotsCaptureEmptyBase0startPosCROSSsui0komi0
 White bonus score 0
 Presumed next pla Player2
 Game result 0 Empty 0 0 0 0
@@ -234,7 +234,7 @@ HASH: 0DA92BDDCA4F4D6C671150CA59232AE4
  1 .  .  .  .  .  .  .  .  .  .
 
 
-Rules dotsCaptureEmptyBase0startPosCROSSsui1komi0
+Rules dotsCaptureEmptyBase0startPosCROSSsui0komi0
 White bonus score 0
 Presumed next pla Player2
 Game result 1 Player1 -1 1 0 0

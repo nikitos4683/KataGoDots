@@ -2511,6 +2511,10 @@ ModelDesc::ModelDesc(istream& in, const string& sha256_, const bool binaryFloats
     throw StringError("This neural net is from an extremely old version of KataGo and is no longer supported by the engine. Model version: " + Global::intToString(modelVersion));
   if(modelVersion > NNModelVersion::latestModelVersionImplemented)
     throw StringError("This neural net requires a newer KataGo version. Obtain a newer KataGo at https://github.com/lightvector/KataGo. Model version: " + Global::intToString(modelVersion));
+  // Rejects dense Dots models and Dots-only versions for Go with a descriptive message
+  NNModelVersion::checkSupported(modelVersion, isDotsGame);
+  if(NNModelVersion::isDotsSparse(modelVersion, isDotsGame))
+    throw StringError(name + ": sparse Dots models are not implemented yet");
 
   in >> numInputChannels;
   if(in.fail())
