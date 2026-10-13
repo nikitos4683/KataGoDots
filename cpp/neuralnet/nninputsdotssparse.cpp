@@ -355,7 +355,7 @@ void NNInputs::fillDotsSparseInput(
   const int scoreOpp = pla == P_WHITE ? blackScore : whiteScore;
 
   setGlobal(DotsSparseGlobalFeature::Komi_1, selfKomi / NNPos::KOMI_CLIP_RADIUS);
-  if(!hasReasonableNonGroundMove || hist.isGroundReasonable(board)) {
+  if(!hasReasonableNonGroundMove || hist.isGroundReasonable(board, pla)) {
     setGlobal(DotsSparseGlobalFeature::GroundReasonable_2, 1.0f);
   }
   setGlobal(DotsSparseGlobalFeature::ScoreMy_3, static_cast<float>(scoreMy) / NNPos::KOMI_CLIP_RADIUS);

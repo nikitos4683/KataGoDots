@@ -195,7 +195,7 @@ void NNInputs::fillRowV7Dots(
     setGlobal(DotsGlobalFeature::CaptureEmpty_17);
   }
 
-  if (!hasReasonableNonGroundMove || hist.isGroundReasonable(board)) {
+  if (!hasReasonableNonGroundMove || hist.isGroundReasonable(board, nextPlayer)) {
     // Train to better understand grounding
     setGlobal(DotsGlobalFeature::EndByGrounding_14);
   }

@@ -4,6 +4,8 @@
 #include "../game/graphhash.h"
 #include "../program/playutils.h"
 
+#include <algorithm>
+
 using namespace std;
 using namespace TestCommon;
 
@@ -719,7 +721,7 @@ R"(
 
     // Grounding after grounding is unreasonable because of ungrounded dots (although already captured)
     const auto history = BoardHistory(boardWithMoveRecords.board);
-    testAssert(!history.isGroundReasonable(boardWithMoveRecords.board));
+    testAssert(!history.isGroundReasonable(boardWithMoveRecords.board, P_BLACK) && !history.isGroundReasonable(boardWithMoveRecords.board, P_WHITE));
 
     boardWithMoveRecords.undo();
     testAssert(!boardWithMoveRecords.board.is_finished);
@@ -738,7 +740,7 @@ R"(
 
     // Grounding after grounding is unreasonable because of ungrounded dots (although already captured)
     const auto history2 = BoardHistory(boardWithMoveRecords.board);
-    testAssert(!history2.isGroundReasonable(boardWithMoveRecords.board));
+    testAssert(!history2.isGroundReasonable(boardWithMoveRecords.board, P_BLACK) && !history2.isGroundReasonable(boardWithMoveRecords.board, P_WHITE));
 
     boardWithMoveRecords.undo();
   }
@@ -755,7 +757,7 @@ R"(
     testAssert(boardWithMoveRecords.getWhiteScore() == boardWithMoveRecords.board.whiteScoreIfBlackGrounds);
     // Grounding after grounding is reasonable because all dots are grounded
     const auto history = BoardHistory(boardWithMoveRecords.board);
-    testAssert(history.isGroundReasonable(boardWithMoveRecords.board));
+    testAssert(history.isGroundReasonable(boardWithMoveRecords.board, P_BLACK) && history.isGroundReasonable(boardWithMoveRecords.board, P_WHITE));
     boardWithMoveRecords.undo();
 
     boardWithMoveRecords.playGroundingMove(P_WHITE);
@@ -763,7 +765,7 @@ R"(
     testAssert(boardWithMoveRecords.getBlackScore() == boardWithMoveRecords.board.blackScoreIfWhiteGrounds);
     // Grounding after grounding is reasonable because all dots are grounded
     const auto history2 = BoardHistory(boardWithMoveRecords.board);
-    testAssert(history2.isGroundReasonable(boardWithMoveRecords.board));
+    testAssert(history2.isGroundReasonable(boardWithMoveRecords.board, P_BLACK) && history2.isGroundReasonable(boardWithMoveRecords.board, P_WHITE));
     boardWithMoveRecords.undo();
 }
 );
@@ -872,7 +874,7 @@ void Tests::runDotsBoardHistoryGroundingTests() {
     auto boardHistory = BoardHistory(board);
 
     // No draw because there are some ungrounded dots
-    testAssert(!boardHistory.isGroundReasonable(board));
+    testAssert(!boardHistory.isGroundReasonable(board, P_BLACK) && !boardHistory.isGroundReasonable(board, P_WHITE));
     testAssert(!boardHistory.isResignReasonable(board, P_BLACK));
     testAssert(!boardHistory.isResignReasonable(board, P_WHITE));
 
@@ -908,7 +910,7 @@ void Tests::runDotsBoardHistoryGroundingTests() {
     auto boardHistory = BoardHistory(board);
 
     // Effective draw because all dots are grounded
-    testAssert(boardHistory.isGroundReasonable(board));
+    testAssert(boardHistory.isGroundReasonable(board, P_BLACK) && boardHistory.isGroundReasonable(board, P_WHITE));
     testAssert(!boardHistory.isResignReasonable(board, P_BLACK));
     testAssert(!boardHistory.isResignReasonable(board, P_WHITE));
 
@@ -937,7 +939,7 @@ x o x . . .
     const auto boardHistory = BoardHistory(board);
 
     // Also effective draw because all bases are grounded
-    testAssert(boardHistory.isGroundReasonable(board));
+    testAssert(boardHistory.isGroundReasonable(board, P_BLACK) && boardHistory.isGroundReasonable(board, P_WHITE));
 
     testAssert(0.0f == boardHistory.whiteScoreIfGroundingAlive(board));
     testAssert(0.0f == boardHistory.whiteScoreIfAllDotsAreGrounded(board));
@@ -957,7 +959,7 @@ x o x . x .
     const auto boardHistory = BoardHistory(board);
 
     // No effective draw because there are ungrounded dots
-    testAssert(!boardHistory.isGroundReasonable(board));
+    testAssert(!boardHistory.isGroundReasonable(board, P_BLACK) && !boardHistory.isGroundReasonable(board, P_WHITE));
 
     testAssert(std::isnan(boardHistory.whiteScoreIfGroundingAlive(board)));
     testAssert(std::isnan(boardHistory.whiteScoreIfAllDotsAreGrounded(board)));
@@ -975,7 +977,12 @@ x o x . x .
     testAssert(1 == board.numBlackCaptures);
     const auto boardHistory = BoardHistory(board);
 
-    testAssert(boardHistory.isGroundReasonable(board));
+    testAssert(!boardHistory.isGroundReasonable(board, P_BLACK) && boardHistory.isGroundReasonable(board, P_WHITE));
+    // Black loses by grounding: it's not among the reasonable moves of black, unlike white
+    const vector<Loc> blackMoves = boardHistory.getReasonableMoves(board, P_BLACK);
+    testAssert(std::find(blackMoves.begin(), blackMoves.end(), Board::PASS_LOC) == blackMoves.end());
+    const vector<Loc> whiteMoves = boardHistory.getReasonableMoves(board, P_WHITE);
+    testAssert(std::find(whiteMoves.begin(), whiteMoves.end(), Board::PASS_LOC) != whiteMoves.end());
     testAssert(boardHistory.isResignReasonable(board, C_BLACK));
     testAssert(!boardHistory.isResignReasonable(board, C_WHITE));
 
@@ -995,7 +1002,7 @@ x o x . x .
     testAssert(1 == board.numWhiteCaptures);
     auto boardHistory = BoardHistory(board);
 
-    testAssert(boardHistory.isGroundReasonable(board));
+    testAssert(boardHistory.isGroundReasonable(board, P_BLACK) && !boardHistory.isGroundReasonable(board, P_WHITE));
     testAssert(boardHistory.isResignReasonable(board, C_WHITE));
     testAssert(!boardHistory.isResignReasonable(board, C_BLACK));
 
@@ -1025,7 +1032,7 @@ x o x . x .
       {XYMove(2, 3, P_BLACK)});
     testAssert(1 == board.numWhiteCaptures);
     const auto boardHistory = BoardHistory(board);
-    testAssert(!boardHistory.isGroundReasonable(board));
+    testAssert(!boardHistory.isGroundReasonable(board, P_BLACK) && !boardHistory.isGroundReasonable(board, P_WHITE));
     testAssert(!boardHistory.isResignReasonable(board, C_WHITE));
     testAssert(!boardHistory.isResignReasonable(board, C_BLACK));
   }
@@ -1092,7 +1099,7 @@ x o x . x .
     boardHistory.makeBoardMoveAssumeLegal(board, Board::PASS_LOC, P_BLACK, nullptr);
     testAssert(-1.0f == boardHistory.finalWhiteMinusBlackScore);
     // Grounding after grounding is reasonable because it anyway wins the game
-    testAssert(boardHistory.isGroundReasonable(board));
+    testAssert(boardHistory.isGroundReasonable(board, P_BLACK) && !boardHistory.isGroundReasonable(board, P_WHITE));
   }
 
   {
@@ -1175,7 +1182,7 @@ o x o . o .
     boardHistory.makeBoardMoveAssumeLegal(board, Board::PASS_LOC, P_WHITE, nullptr);
     testAssert(1.0f == boardHistory.finalWhiteMinusBlackScore);
     // Grounding after grounding is reasonable because it anyway wins the game
-    testAssert(boardHistory.isGroundReasonable(board));
+    testAssert(!boardHistory.isGroundReasonable(board, P_BLACK) && boardHistory.isGroundReasonable(board, P_WHITE));
   }
 
   {
@@ -1306,7 +1313,7 @@ x x x x x
     auto boardHistory = BoardHistory(board);
 
     // The field is not grounding alive; however, the game should be finished because there are no legal moves for WHITE
-    testAssert(!boardHistory.isGroundReasonable(board));
+    testAssert(!boardHistory.isGroundReasonable(board, P_BLACK) && !boardHistory.isGroundReasonable(board, P_WHITE));
 
     testAssert(!boardHistory.getReasonableMoves(board, P_BLACK).empty());
     // White can and should only ground
