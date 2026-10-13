@@ -292,7 +292,7 @@ struct TrainingWriteBuffers {
   NumpyBuffer<float> metadataInputNC;
 
   //Sparse Dots format (inputs version 8, docs/DotsSparseNN.md 7.2). The spatial buffers above are unused then:
-  //the rows are kept until writing, since the per-entity arrays are padded to the maxima over the rows of the file.
+  //the rows are kept until writing, since the per-entity arrays of all the rows are concatenated in the file.
   struct DotsSparseRow {
     DotsSparseInput input;
     //Visits of the player and of the opponent's reply (projected onto the current candidates)
@@ -365,7 +365,7 @@ struct TrainingWriteBuffers {
   );
 
   void writeToZipFile(const std::string& fileName);
-  //Writes the arrays of the sparse Dots format padded to the maxima over the rows and closes the file
+  //Writes the arrays of the sparse Dots format (per-entity arrays concatenated over the rows) and closes the file
   void writeDotsSparseArrays(ZipFile& zipFile);
   void writeToTextOstream(std::ostream& out);
 

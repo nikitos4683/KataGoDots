@@ -91,7 +91,8 @@ KataGoDots/
 │   │   │   ├── model_sparse_dots.py # Sparse Dots model (create_model picks it for sparse configs)
 │   │   │   ├── metrics_pytorch.py # Loss functions and training metrics
 │   │   │   ├── metrics_sparse_dots.py # Losses of the sparse Dots model
-│   │   │   ├── data_processing_sparse_dots.py # Sparse Dots NPZ loader
+│   │   │   ├── data_processing_sparse_dots.py # Sparse Dots NPZ loader (batches grouped by length)
+│   │   │   ├── sparse_dots_npz.py # Unpadded sparse Dots NPZ format (numpy only, shared with shuffle.py)
 │   │   │   ├── modelconfigs.py    # Model size configurations (for Dots: transformer kinds like b5c384h6nbttflrs-fson-silu-rsnh)
 │   │   │   └── data_processing_pytorch.py # Training data loading and augmentation
 │   │   └── utils/

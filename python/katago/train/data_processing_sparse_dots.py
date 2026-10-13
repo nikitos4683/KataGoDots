@@ -1,6 +1,7 @@
 # Loading of the sparse Dots training data (model version 18), see docs/DotsSparseNN.md 7.2.
-# Files are padded to their own maxima of points and candidates; batches are cut down to the
-# maxima of the batch. Symmetries only transform the coordinates.
+# Files are not padded (see sparse_dots_npz.py); a batch is padded to the maxima of its rows. To keep that padding
+# small, the rows are grouped by length: chunks of a few batches are sorted by the number of points and the batches
+# are played in random order. Symmetries only transform the coordinates.
 
 import logging
 import os
@@ -11,26 +12,35 @@ from typing import Dict, List
 import numpy as np
 import torch
 
-from ..train.data_processing_pytorch import pad_global_targets_nc
-from ..train.model_sparse_dots import NUM_MOVES_AGO, apply_symmetry_to_batch, trim_batch
-
-# All arrays of a sparse data file, in the order they are written by the C++ trainingwrite
-SPARSE_ARRAY_NAMES = [
-    "boardSizeN", "globalInputNC",
-    "pointCountN", "pointCoordsNP", "pointDataNP",
-    "candCountN", "candCoordsNM", "candDataNM",
-    "groundN",
-    "candPolicyTargetsNM", "groundPolicyTargetsN", "candFutureposTargetsNM", "pointOwnershipTargetsNP",
-    "globalTargetsNC", "scoreDistrN",
-]
+from ..train import sparse_dots_npz
+from ..train.model_sparse_dots import NUM_MOVES_AGO, apply_symmetry_to_batch
 
 # Torch dtype of each array in a batch
 _LONG_ARRAYS = {"pointCountN", "candCountN"}
 _INT_ARRAYS = {"boardSizeN", "pointCoordsNP", "pointDataNP", "candCoordsNM", "candDataNM"}
 
+# Rows are sorted by length within chunks of this many batches. The longer the chunk, the less padding and the more
+# alike the positions of a batch are (the same stage of the game): 32 batches leave ~5% padding of the tokens.
+LENGTH_GROUPING_BATCHES = 32
+
 
 def is_sparse_npz(npz) -> bool:
-    return "pointCountN" in npz
+    return sparse_dots_npz.is_sparse_npz_names(npz.files)
+
+
+def group_by_length(rows: np.ndarray, point_counts: np.ndarray, cand_counts: np.ndarray, batch_size: int,
+                    chunk_batches: int, rand: np.random.Generator) -> List[np.ndarray]:
+    """Splits rows (already in random order, a multiple of batch_size) into batches of rows of similar length.
+    The number of points and the number of candidates are strongly anticorrelated (they share the board), so sorting
+    by points makes both of them alike in a batch. Returns the batches in random order."""
+    batches = []
+    chunk_rows = batch_size * max(1, chunk_batches)
+    for start in range(0, len(rows), chunk_rows):
+        chunk = rows[start:start + chunk_rows]
+        if chunk_batches > 1:
+            chunk = chunk[np.lexsort((cand_counts[chunk], point_counts[chunk]))]
+        batches.extend(chunk[i:i + batch_size] for i in range(0, len(chunk), batch_size))
+    return [batches[i] for i in rand.permutation(len(batches))]
 
 
 def drop_history(batch: Dict[str, torch.Tensor], include_history: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -63,26 +73,20 @@ def read_npz_training_data_sparse(
     randomize_symmetries: bool,
     randomize_history: bool = True,
     prefetch_depth: int = 1,
+    length_grouping_batches: int = LENGTH_GROUPING_BATCHES,
 ):
     rand = np.random.default_rng(seed=list(os.urandom(12)))
 
     def load_npz_file(npz_file):
-        with np.load(npz_file) as npz:
-            assert is_sparse_npz(npz), f"{npz_file} is not a sparse Dots data file"
-            num_samples = npz["globalInputNC"].shape[0]
-            num_whole_steps = num_samples // (batch_size * world_size)
-            used = num_whole_steps * world_size * batch_size
-
-            def select_rank_rows(arr):
-                arr = arr[:used]
-                rest = arr.shape[1:]
-                arr = arr.reshape(num_whole_steps, world_size, batch_size, *rest)
-                arr = arr[:, rank]
-                return arr.reshape(num_whole_steps * batch_size, *rest)
-
-            arrays = {name: select_rank_rows(npz[name]) for name in SPARSE_ARRAY_NAMES}
-        arrays["globalTargetsNC"] = pad_global_targets_nc(arrays["globalTargetsNC"])
-        return npz_file, num_whole_steps, arrays
+        arrays = sparse_dots_npz.load_sparse_npz(npz_file)
+        num_samples = sparse_dots_npz.num_rows(arrays)
+        num_whole_steps = num_samples // (batch_size * world_size)
+        used = num_whole_steps * world_size * batch_size
+        # The rows of this rank, the same split as the dense data
+        rows = np.arange(used).reshape(num_whole_steps, world_size, batch_size)[:, rank].reshape(-1)
+        batches = group_by_length(rows, arrays["pointCountN"], arrays["candCountN"], batch_size, length_grouping_batches, rand)
+        starts = {name: sparse_dots_npz.offsets(arrays[name]) for name in ("pointCountN", "candCountN")}
+        return npz_file, num_whole_steps, arrays, starts, batches
 
     if not npz_files:
         return
@@ -96,18 +100,16 @@ def read_npz_training_data_sparse(
             next_index += 1
 
         while pending:
-            npz_file, num_whole_steps, arrays = pending.popleft().result()
+            npz_file, num_whole_steps, arrays, starts, batches = pending.popleft().result()
             logging.info(f"Beginning {npz_file} with {num_whole_steps * world_size} usable batches, my rank is {rank}")
             if next_index < len(npz_files):
                 pending.append(executor.submit(load_npz_file, npz_files[next_index]))
                 next_index += 1
 
-            for n in range(num_whole_steps):
-                start = n * batch_size
-                end = start + batch_size
+            for batch_rows in batches:
                 batch = {}
-                for name, arr in arrays.items():
-                    tensor = torch.from_numpy(np.ascontiguousarray(arr[start:end]))
+                for name, arr in sparse_dots_npz.collate(arrays, batch_rows, starts).items():
+                    tensor = torch.from_numpy(arr)
                     if name in _LONG_ARRAYS:
                         tensor = tensor.long()
                     elif name in _INT_ARRAYS:
@@ -115,7 +117,6 @@ def read_npz_training_data_sparse(
                     else:
                         tensor = tensor.to(torch.float32)
                     batch[name] = tensor
-                batch = trim_batch(batch)
                 if randomize_history:
                     should_stop = torch.rand(batch_size, NUM_MOVES_AGO) >= 0.98
                     include_history = (torch.cumsum(should_stop, dim=1) <= 0).to(torch.float32)

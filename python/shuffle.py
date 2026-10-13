@@ -22,6 +22,8 @@ import multiprocessing
 import numpy as np
 from typing import Sequence
 
+from katago.train import sparse_dots_npz
+
 # Needs to be kept in sync with QVALUE_SPATIAL_TARGET_NUM_CHANNELS in trainingwrite.cpp C++ code among other places.
 EXPECTED_Q_VALUE_TARGETS_NCMOVE_CHANNELS = 3
 
@@ -50,27 +52,12 @@ COMPRESSED_FRACTION_LARGE_FILE = 0.12
 CLIFF_OVERHEAD_BYTES_PER_FILE = 1650
 
 # Sparse Dots data (model version 18, docs/DotsSparseNN.md 7.2) --------------------------------------------------
-# Rows of such files have per-entity arrays padded to the maxima of the file. When rows of different files are
-# concatenated they are padded again, and every output file is cut down to the maxima of its own rows.
-SPARSE_ARRAY_NAMES = [
-    "boardSizeN", "globalInputNC",
-    "pointCountN", "pointCoordsNP", "pointDataNP",
-    "candCountN", "candCoordsNM", "candDataNM",
-    "groundN",
-    "candPolicyTargetsNM", "groundPolicyTargetsN", "candFutureposTargetsNM", "pointOwnershipTargetsNP",
-    "globalTargetsNC", "scoreDistrN",
-]
-# Padded arrays and the count array giving their real length along axis 1
-SPARSE_PADDED_ARRAYS = {
-    "pointCoordsNP": "pointCountN", "pointDataNP": "pointCountN", "pointOwnershipTargetsNP": "pointCountN",
-    "candCoordsNM": "candCountN", "candDataNM": "candCountN", "candPolicyTargetsNM": "candCountN",
-    "candFutureposTargetsNM": "candCountN",
-}
+# The per-entity arrays of such files are not padded (katago/train/sparse_dots_npz.py), older padded files are
+# converted on loading.
 
 def is_sparse_npz_file(filename: str) -> bool:
     with zipfile.ZipFile(filename) as z:
-        names = z.namelist()
-    return "pointCountN.npy" in names or "pointCountN" in names
+        return sparse_dots_npz.is_sparse_npz_names(z.namelist())
 
 def first_existing_file(files: list[str]) -> str | None:
     for f in files:
@@ -78,51 +65,20 @@ def first_existing_file(files: list[str]) -> str | None:
             return f
     return None
 
-def concatenate_sparse(arrays_list: list[dict[str, np.ndarray]]) -> dict[str, np.ndarray]:
-    result = {}
-    for name in SPARSE_ARRAY_NAMES:
-        arrs = [a[name] for a in arrays_list]
-        if name in SPARSE_PADDED_ARRAYS:
-            length = max(arr.shape[1] for arr in arrs)
-            arrs = [
-                arr if arr.shape[1] == length else
-                np.pad(arr, [(0, 0), (0, length - arr.shape[1])] + [(0, 0)] * (arr.ndim - 2))
-                for arr in arrs
-            ]
-        result[name] = arrs[0] if len(arrs) == 1 else np.concatenate(arrs, axis=0)
-    return result
-
-def save_sparse_npz(filename: str, arrays: dict[str, np.ndarray], rows: np.ndarray | slice):
-    save_dict = {}
-    for name in SPARSE_ARRAY_NAMES:
-        save_dict[name] = arrays[name][rows]
-    # Cut the padding down to the maxima of the rows of this file (at least 1)
-    for name, count_name in SPARSE_PADDED_ARRAYS.items():
-        counts = save_dict[count_name]
-        length = max(1, int(counts.max())) if len(counts) > 0 else 1
-        save_dict[name] = save_dict[name][:, :length]
-    np.savez_compressed(filename, **save_dict)
-
-def load_sparse_npz(filename: str) -> dict[str, np.ndarray]:
-    with np.load(filename) as npz:
-        arrays = {name: npz[name] for name in SPARSE_ARRAY_NAMES}
-    arrays["globalTargetsNC"] = pad_global_targets_nc(arrays["globalTargetsNC"])
-    return arrays
-
 def shardify_sparse(input_idx: int, input_file_group: list[str], num_out_files: int, out_tmp_dirs: list[str], keep_prob: float):
     np.random.seed([int.from_bytes(os.urandom(4), byteorder='little') for i in range(4)])
     num_files_not_found = 0
     arrays_list = []
     for input_file in input_file_group:
         try:
-            arrays_list.append(load_sparse_npz(input_file))
+            arrays_list.append(sparse_dots_npz.load_sparse_npz(input_file))
         except FileNotFoundError:
             num_files_not_found += 1
             print("WARNING: file not found by shardify: ", input_file)
     if len(arrays_list) <= 0:
         return num_files_not_found
-    arrays = concatenate_sparse(arrays_list)
-    num_rows = arrays["globalInputNC"].shape[0]
+    arrays = sparse_dots_npz.concatenate(arrays_list)
+    num_rows = sparse_dots_npz.num_rows(arrays)
     num_rows_to_keep = num_rows
     if keep_prob < 1.0:
         num_rows_to_keep = min(num_rows_to_keep, int(round(num_rows_to_keep * keep_prob)))
@@ -130,7 +86,7 @@ def shardify_sparse(input_idx: int, input_file_group: list[str], num_out_files: 
     rand_assts = np.random.randint(num_out_files, size=[num_rows_to_keep])
     for out_idx in range(num_out_files):
         rows = perm[rand_assts == out_idx]
-        save_sparse_npz(os.path.join(out_tmp_dirs[out_idx], str(input_idx) + ".npz"), arrays, rows)
+        sparse_dots_npz.save_sparse_npz(os.path.join(out_tmp_dirs[out_idx], str(input_idx) + ".npz"), arrays, rows)
     return num_files_not_found
 
 def merge_bucket_sparse(out_filenames: list[str], num_shards_to_merge: int, out_tmp_dir: str):
@@ -139,21 +95,21 @@ def merge_bucket_sparse(out_filenames: list[str], num_shards_to_merge: int, out_
     for input_idx in range(num_shards_to_merge):
         shard_filename = os.path.join(out_tmp_dir, str(input_idx) + ".npz")
         try:
-            arrays_list.append(load_sparse_npz(shard_filename))
+            arrays_list.append(sparse_dots_npz.load_sparse_npz(shard_filename))
         except FileNotFoundError:
             print("WARNING: Empty shard in merge_bucket for shard :", input_idx, out_tmp_dir)
     if len(arrays_list) <= 0:
         print("WARNING: empty merge bucket: ", out_tmp_dir)
         return []
-    arrays = concatenate_sparse(arrays_list)
-    num_rows = arrays["globalInputNC"].shape[0]
+    arrays = sparse_dots_npz.concatenate(arrays_list)
+    num_rows = sparse_dots_npz.num_rows(arrays)
     perm = np.random.permutation(num_rows)
     results = []
     num_out_files_here = len(out_filenames)
     for j, filename in enumerate(out_filenames):
         out_file_start = (j * num_rows) // num_out_files_here
         out_file_stop = ((j+1) * num_rows) // num_out_files_here
-        save_sparse_npz(filename, arrays, perm[out_file_start:out_file_stop])
+        sparse_dots_npz.save_sparse_npz(filename, arrays, perm[out_file_start:out_file_stop])
         with open(os.path.splitext(filename)[0] + ".json", "w") as f:
             json.dump({"num_rows": out_file_stop - out_file_start}, f)
         results.append((filename, out_file_stop - out_file_start))
