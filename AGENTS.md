@@ -267,7 +267,7 @@ The loop carries out five stages sequentially:
    - Never replace `Board` parameters by mutable reference if `hist.initialBoard` could be inadvertently mutated.
 
 3. **Neural Net Features and Heads**:
-   - Dots use the sparse token model (model version 18, inputs version 8), specified in `docs/DotsSparseNN.md` (section 9 lists the implementation decisions). The input is `DotsSparseInput` (`cpp/neuralnet/nninputs.h`, extracted in `nninputsdotssparse.cpp`): points (with the facts of the areas whose boundary they are on), move candidates and 8 global features.
+   - Dots use the sparse token model (model version 18, inputs version 8), specified in `docs/DotsSparseNN.md` (sections 8–10: the PyTorch model, the model file and the C++ implementation). The input is `DotsSparseInput` (`cpp/neuralnet/nninputs.h`, extracted in `nninputsdotssparse.cpp`): points (with the facts of the areas whose boundary they are on), move candidates and 8 global features.
    - Any model change must be made in PyTorch (`model_sparse_dots.py`), the export (`export_model_pytorch.py`), the C++ descriptor (`desc.cpp`), the CPU reference (`sparsedotsnn.cpp`) and CUDA (`cudasparsedotsmodel.cpp`), then checked with `test_sparse_dots_cpp_parity.py` and `katago testsparsenn`.
    - Only the CUDA and Eigen backends run sparse Dots models; the other backends reject them with an error.
    - The old dense Dots path (`nninputsdots.cpp`, 22 spatial and 19 global features, model versions up to 17) is still in the code but dense Dots models are rejected; it is to be removed once the sparse path is in use.

@@ -22,7 +22,7 @@
 //15 = V7 features, Extra nonlinearity for pass output
 //16 = V7 features, Q value predictions in the policy head
 //17 = V7 features, dropped Q value predictions, introduced transformers and added guards to unused params
-//18 = Dots only: sparse token format (points, areas, action candidates), see docs/DotsSparseNN.md
+//18 = Dots only: sparse token format (points with the facts of their areas, action candidates), see docs/DotsSparseNN.md
 
 static void fail(const int modelVersion, const bool dotsGame) {
   if(dotsGame && modelVersion >= NNModelVersion::oldestModelVersionImplemented && modelVersion < NNModelVersion::dotsSparseModelVersion) {

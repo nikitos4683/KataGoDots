@@ -490,7 +490,7 @@ struct ValueHeadDesc {
   void releaseWeights();
 };
 
-// Sparse Dots model (model version 18), see docs/DotsSparseNN.md section 9.3 for the file layout.
+// Sparse Dots model (model version 18), see docs/DotsSparseNN.md section 9 for the file layout.
 // Tokens: [GLOBAL][POINT x P][AREA x A], action candidates are decoder queries.
 struct SparseDotsDesc {
   int numPointFeatures;

@@ -2981,7 +2981,7 @@ Rules ModelDesc::getSupportedRules(const Rules& desiredRules, bool& supported) c
 }
 
 //-----------------------------------------------------------------------------
-// Sparse Dots model (version 18), see docs/DotsSparseNN.md section 9.3
+// Sparse Dots model (version 18), see docs/DotsSparseNN.md section 9
 
 SparseDotsDesc::SparseDotsDesc()
   : numPointFeatures(0),

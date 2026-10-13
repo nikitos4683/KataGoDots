@@ -1,4 +1,4 @@
-"""Tests of the sparse Dots model (model version 18), see docs/DotsSparseNN.md and DotsSparseNNPlan.md stage 2."""
+"""Tests of the sparse Dots model (model version 18), see docs/DotsSparseNN.md."""
 
 import os
 import subprocess
