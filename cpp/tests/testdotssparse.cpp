@@ -439,6 +439,34 @@ o x . . .
     const DotsSparseInput input = fillSparse(board, hist, P_WHITE, &reasonableMoves);
     checkSparseInvariants(board, hist, P_WHITE, input, reasonableMoves);
   }
+
+  // Only the move making the largest surrounding is a candidate: the move at (2,2) surrounds each white dot
+  // separately, the move at (2,4) surrounds all of them, and (2,2), (2,3) lie inside that surrounding
+  {
+    Board board = parseDotsFieldDefault(R"(
+. . x . .
+. x o x .
+x o . o x
+. x . x .
+. . . . .
+)");
+    BoardHistory hist(board, P_BLACK, board.rules, 0, BoardHistoryModes());
+    vector<Loc> reasonableMoves;
+    const DotsSparseInput input = fillSparse(board, hist, P_BLACK, &reasonableMoves);
+    checkSparseInvariants(board, hist, P_BLACK, input, reasonableMoves);
+    auto candidateIndex = [&](int x, int y) {
+      const Loc loc = Location::getLoc(x, y, board.x_size);
+      for(size_t i = 0; i < input.candidateLocs.size(); i++)
+        if(input.candidateLocs[i] == loc)
+          return (int)i;
+      return -1;
+    };
+    testAssert(candidateIndex(2, 2) < 0);
+    testAssert(candidateIndex(2, 3) < 0);
+    const int largest = candidateIndex(2, 4);
+    testAssert(largest >= 0);
+    testAssert(input.candidates[largest].gainMy == 3);
+  }
 }
 
 static void runDotsSparseRandomGames(const int xSize, const int ySize, const int numGames, const int symmetry, const int startPos, const uint64_t seed) {
@@ -548,7 +576,8 @@ static void runDotsSparseRandomGames(const int xSize, const int ySize, const int
             for(const auto& area : afterInput.areas) {
               if(getAreaBoundaryLocs(afterInput, area) == expectedBoundary) {
                 found = true;
-                testAssert(area.movesAgo == 1);
+                // Without reasonable moves except grounding the history is not provided (docs/DotsSparseNN.md 3)
+                testAssert(area.movesAgo == (afterInput.candidates.empty() ? 0 : 1));
               }
             }
             testAssert(found);
