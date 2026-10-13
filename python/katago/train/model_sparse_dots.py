@@ -508,13 +508,6 @@ class SparseValueHead(torch.nn.Module):
         return out_value, out_miscvalue, out_moremiscvalue, out_ownership, out_scorebelief_logprobs
 
 
-_SPARSE_TRUNK_BLOCK_KINDS = {
-    "bottlenest2transformerrope": (2, False),
-    "bottlenest2transformerropesg": (2, True),
-    "bottlenest3transformerropesg": (3, True),
-}
-
-
 class SparseDotsModel(torch.nn.Module):
     def __init__(self, config: modelconfigs.ModelConfig, pos_len_x: int, pos_len_y: int, games=None, katago_git_rev: str = None, katago_backend: str = None):
         super().__init__()
@@ -543,10 +536,8 @@ class SparseDotsModel(torch.nn.Module):
         self.metadata_encoder = None
         self.trunk_final_rmsnorm = True
         self.trunk_normless = False
-        assert config.get("trunk_final_rmsnorm", False) and config.get("trunk_rmsnorm_spatial", False), \
-            "Sparse Dots models need the spatial RMSNorm trunk tip (-rsnh)"
-        assert config.get("rmsnorm_spatial_cgroup_size") is None
-        assert config.get("learnable_rope", False), "Sparse Dots models need learnable RoPE"
+        config_error = modelconfigs.sparse_dots_config_error(config)
+        assert config_error is None, f"Not a sparse Dots trunk: {config_error}"
 
         self.td_score_multiplier = 20.0
         self.scoremean_multiplier = 20.0
@@ -564,8 +555,7 @@ class SparseDotsModel(torch.nn.Module):
         # Trunk
         self.blocks = torch.nn.ModuleList()
         for block_name, block_kind in self.block_kind:
-            assert block_kind in _SPARSE_TRUNK_BLOCK_KINDS, f"Block kind {block_kind} is not supported by sparse Dots models"
-            internal_length, use_swiglu = _SPARSE_TRUNK_BLOCK_KINDS[block_kind]
+            internal_length, use_swiglu = modelconfigs.SPARSE_DOTS_TRUNK_BLOCK_KINDS[block_kind]
             block = NestedBottleneckTransformerBlock(
                 name=block_name,
                 internal_length=internal_length,

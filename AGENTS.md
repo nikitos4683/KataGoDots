@@ -92,7 +92,7 @@ KataGoDots/
 │   │   │   ├── metrics_pytorch.py # Loss functions and training metrics
 │   │   │   ├── metrics_sparse_dots.py # Losses of the sparse Dots model
 │   │   │   ├── data_processing_sparse_dots.py # Sparse Dots NPZ loader
-│   │   │   ├── modelconfigs.py    # Model size configurations (e.g. b6c96, b10c128)
+│   │   │   ├── modelconfigs.py    # Model size configurations (for Dots: transformer kinds like b5c384h6nbttflrs-fson-silu-rsnh)
 │   │   │   └── data_processing_pytorch.py # Training data loading and augmentation
 │   │   └── utils/
 │   │       └── training_data_generator.py # Training data file cycling and gap-delay shuffler
@@ -241,7 +241,7 @@ For selfplay training on a single machine, use `python/selfplay/synchronous_loop
 ```
 Example:
 ```bash
-./python/selfplay/synchronous_loop.sh dotsrun /d/Dots/training run1 b6c96 0
+./python/selfplay/synchronous_loop.sh dotsrun /d/Dots/training run1 b5c384h6nbttflrs-fson-silu-rsnh 0
 ```
 The loop carries out five stages sequentially:
 1. **Gatekeeper** (optional, C++): Matches candidate model against the current best.

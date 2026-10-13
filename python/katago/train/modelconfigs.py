@@ -19,7 +19,7 @@ well or best: "-fson-mish-rvgl-bnh"
   but the latter is used for inference.
 """
 
-from typing import Dict, Any, Union
+from typing import Dict, Any, Optional, Union
 
 ModelConfig = Dict[str,Any]
 
@@ -2145,6 +2145,25 @@ SPARSE_DOTS_VERSION = 18
 SPARSE_DOTS_SUFFIXES = {
     "-dec1": {"candidate_decoder_layers": 1},
 }
+# Trunk block kinds of the sparse model: internal length of the nested bottleneck, SwiGLU FFN
+SPARSE_DOTS_TRUNK_BLOCK_KINDS = {
+    "bottlenest2transformerrope": (2, False),
+    "bottlenest2transformerropesg": (2, True),
+    "bottlenest3transformerropesg": (3, True),
+}
+
+def sparse_dots_config_error(config: ModelConfig) -> Optional[str]:
+    """Why the trunk of the config can't be the trunk of a sparse Dots model, None if it can."""
+    for _, block_kind in config["block_kind"]:
+        if block_kind not in SPARSE_DOTS_TRUNK_BLOCK_KINDS:
+            return f"block kind {block_kind} is not a transformer block with RoPE"
+    if not config.get("learnable_rope", False):
+        return "no learnable RoPE"
+    if not (config.get("trunk_final_rmsnorm", False) and config.get("trunk_rmsnorm_spatial", False)):
+        return "no spatial RMSNorm trunk tip (-rsnh)"
+    if config.get("rmsnorm_spatial_cgroup_size") is not None:
+        return "RMSNorm channel groups are not supported"
+    return None
 
 def make_sparse_dots_config(config: ModelConfig, overrides: Dict[str,Any] = None) -> ModelConfig:
     result = dict(config)
@@ -2170,4 +2189,8 @@ def get_config(name: str, dots: bool) -> ModelConfig:
                 name = name[:-len(suffix)]
                 overrides.update(suffix_overrides)
                 stripped = True
+    error = sparse_dots_config_error(config_of_name[name])
+    if error is not None:
+        raise ValueError(f"Model kind {name} can't be a Dots model: {error}. Dots models are sparse and need a "
+                         f"transformer trunk with learnable RoPE, e.g. b5c384h6nbttflrs-fson-silu-rsnh")
     return make_sparse_dots_config(config_of_name[name], overrides)

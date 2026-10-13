@@ -2971,6 +2971,11 @@ Rules ModelDesc::getSupportedRules(const Rules& desiredRules, bool& supported) c
       supported = false;
     }
   }
+  // The sparse Dots models are trained only with suicide forbidden
+  if(isSparseDots() && rules.isDots && rules.multiStoneSuicideLegal) {
+    rules.multiStoneSuicideLegal = false;
+    supported = false;
+  }
 
   return rules;
 }
