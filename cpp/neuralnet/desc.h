@@ -494,6 +494,8 @@ struct ValueHeadDesc {
 // Tokens: [GLOBAL][POINT x P][AREA x A], action candidates are decoder queries.
 struct SparseDotsDesc {
   bool areaRopeMean; // areas take the mean RoPE over their boundary vertices, otherwise no positions
+  // In every trunk attention block the areas also attend to the points of their boundary only
+  bool areaBoundaryAttention;
   int numPointFeatures;
   int numVertexFeatures;
   int numAreaScalarFeatures;
@@ -524,6 +526,8 @@ struct SparseDotsDesc {
   std::vector<std::pair<int, unique_ptr_void>> blocks;
   RMSNormLayerDesc trunkTipRMSNorm;
   ActivationLayerDesc trunkTipActivation;
+  // Output projections of the area boundary attention, one per trunk attention block in order
+  std::vector<MatMulLayerDesc> trunkBoundaryOut;
 
   // Candidate decoder
   int decoderNumChannels;

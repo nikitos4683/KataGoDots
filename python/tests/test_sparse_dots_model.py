@@ -1,6 +1,8 @@
 """Tests of the sparse Dots model (model version 18), see docs/DotsSparseNN.md and DotsSparseNNPlan.md stage 2."""
 
+import math
 import os
+import random
 import subprocess
 import sys
 
@@ -13,7 +15,7 @@ from katago.train.model_pytorch import Game, apply_learnable_rotary_emb
 from katago.train.model_sparse_dots import SparsePositions, apply_symmetry_to_batch, count_mask, create_model, trim_batch
 from katago.train.sparse_dots_bin import load_sparse_dots_bin
 
-from sparse_dots_testutils import random_batch, tiny_sparse_config
+from sparse_dots_testutils import collate, random_batch, random_row, tiny_sparse_config
 
 PYTHON_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -278,3 +280,40 @@ def test_export_round_trip(tmp_path, area_rope, decoder_layers):
     assert torch.allclose(moremisc[:, 0:2], moremisc_l[:, 0:2], atol=1e-5)
     point_mask = count_mask(batch["pointCountN"], batch["pointCoordsNP"].shape[1]) > 0
     assert torch.allclose(ownership[point_mask], ownership_l[point_mask], atol=1e-5)
+
+
+def test_boundary_attention_matches_naive():
+    """Every area attends exactly to the points of its boundary: vectorized code vs loops."""
+    from katago.train.model_sparse_dots import BoundaryLinks, boundary_attention, vertex_point_index
+    rng = random.Random(7)
+    torch.manual_seed(7)
+    rows = [random_row(rng, 12, 9) for _ in range(6)]
+    batch = trim_batch({k: torch.as_tensor(v) for k, v in collate(rows, pad_extra=2).items()})
+    vertex_point = vertex_point_index(batch["pointCoordsNP"], batch["pointCountN"], batch["vertexCoordsNV"], batch["vertexCountN"])
+    num_vertices = batch["vertexCoordsNV"].shape[1]
+    vertex_mask = torch.arange(num_vertices).view(1, -1) < batch["vertexCountN"].view(-1, 1)
+    # Every real vertex is a point of the position, padding has no point
+    assert bool(torch.all((vertex_point >= 0) == vertex_mask))
+    n = len(rows)
+    num_points = batch["pointCoordsNP"].shape[1]
+    num_areas = batch["areaDataNA"].shape[1]
+    seq_len = 1 + num_points + num_areas
+    heads, kv_heads, dim = 4, 2, 8
+    q = torch.randn(n, seq_len, heads, dim)
+    k = torch.randn(n, seq_len, kv_heads, dim)
+    v = torch.randn(n, seq_len, kv_heads, dim)
+    vertex_area = batch["vertexAreaNV"].long().clamp(min=0)
+    links = BoundaryLinks(vertex_area, vertex_point, num_points, num_areas)
+    out = boundary_attention(q, k, v, links, heads // kv_heads, 1.0 / math.sqrt(dim)).view(n, num_areas, heads, dim)
+    for i in range(n):
+        for a in range(num_areas):
+            members = [int(vertex_point[i, j]) for j in range(num_vertices) if bool(vertex_mask[i, j]) and int(vertex_area[i, j]) == a]
+            for h in range(heads):
+                kvh = h * kv_heads // heads
+                if not members:
+                    assert torch.all(out[i, a, h] == 0)
+                    continue
+                tokens = [1 + m for m in members]
+                scores = torch.stack([q[i, 1 + num_points + a, h] @ k[i, t, kvh] for t in tokens]) / math.sqrt(dim)
+                expected = (torch.softmax(scores, dim=0).unsqueeze(-1) * torch.stack([v[i, t, kvh] for t in tokens])).sum(0)
+                assert torch.allclose(out[i, a, h], expected, atol=1e-5)

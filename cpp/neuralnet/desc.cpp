@@ -2980,6 +2980,7 @@ Rules ModelDesc::getSupportedRules(const Rules& desiredRules, bool& supported) c
 
 SparseDotsDesc::SparseDotsDesc()
   : areaRopeMean(true),
+    areaBoundaryAttention(false),
     numPointFeatures(0),
     numVertexFeatures(0),
     numAreaScalarFeatures(0),
@@ -3023,7 +3024,12 @@ SparseDotsDesc::SparseDotsDesc(istream& in, int modelVersion, bool binaryFloats,
   if(areaRopeInt != 0 && areaRopeInt != 1)
     throw StringError("sparse_dots_model: unknown area rope mode " + Global::intToString(areaRopeInt));
   areaRopeMean = areaRopeInt == 1;
-  for(int i = 0; i < 4; i++) {
+  int boundaryAttentionInt = 0;
+  in >> boundaryAttentionInt;
+  if(boundaryAttentionInt != 0 && boundaryAttentionInt != 1)
+    throw StringError("sparse_dots_model: unknown area boundary attention mode " + Global::intToString(boundaryAttentionInt));
+  areaBoundaryAttention = boundaryAttentionInt == 1;
+  for(int i = 0; i < 3; i++) {
     int unused = 0;
     in >> unused;
     if(unused != 0)
@@ -3032,7 +3038,7 @@ SparseDotsDesc::SparseDotsDesc(istream& in, int modelVersion, bool binaryFloats,
   numPointFeatures = nPointFeatures;
   numGlobalFeatures = nGlobalFeatures;
   // The features are computed by the engine, their layout must be exactly the known one
-  if(numPointFeatures != 11 || numVertexFeatures != 24 || numAreaScalarFeatures != 10 || numCandFeatures != 8 ||
+  if(numPointFeatures != 12 || numVertexFeatures != 24 || numAreaScalarFeatures != 10 || numCandFeatures != 8 ||
      numGroundFeatures != 1 || numGlobalFeatures != 8)
     throw StringError("sparse_dots_model: unsupported numbers of input features");
 
@@ -3109,6 +3115,25 @@ SparseDotsDesc::SparseDotsDesc(istream& in, int modelVersion, bool binaryFloats,
   if(trunkTipRMSNorm.numChannels != trunkNumChannels || !trunkTipRMSNorm.spatial)
     throw StringError("sparse_dots_model: the trunk tip must be a spatial RMSNorm of the trunk channels");
   trunkTipActivation = ActivationLayerDesc(in, modelVersion);
+
+  if(areaBoundaryAttention) {
+    in >> tag;
+    if(tag != "model.boundary_attention")
+      throw StringError("sparse_dots_model: expected model.boundary_attention, got " + tag);
+    int numBoundaryOut = 0;
+    in >> numBoundaryOut;
+    vector<const TransformerAttentionDesc*> attentions;
+    for(const auto& block : blocks)
+      for(const auto& sub : static_cast<const NestedBottleneckResidualBlockDesc*>(block.second.get())->blocks)
+        if(sub.first == TRANSFORMER_ATTENTION_BLOCK_KIND)
+          attentions.push_back(static_cast<const TransformerAttentionDesc*>(sub.second.get()));
+    if(in.fail() || numBoundaryOut != (int)attentions.size())
+      throw StringError("sparse_dots_model: the boundary attention needs one projection per trunk attention block");
+    for(const TransformerAttentionDesc* attention : attentions) {
+      trunkBoundaryOut.emplace_back(in, binaryFloats);
+      checkMatMul(trunkBoundaryOut.back(), attention->numHeads * attention->vHeadDim, midNumChannels);
+    }
+  }
 
   string decoderName;
   in >> decoderName;
@@ -3201,6 +3226,8 @@ int64_t SparseDotsDesc::getNumParameters() const {
   for(const auto& block : blocks)
     result += static_cast<const NestedBottleneckResidualBlockDesc*>(block.second.get())->getNumParameters();
   result += trunkTipRMSNorm.getNumParameters();
+  for(const auto& boundaryOut : trunkBoundaryOut)
+    result += boundaryOut.getNumParameters();
   for(const auto& attention : decoderAttention)
     result += attention.getNumParameters();
   for(const auto& ffn : decoderFFN)
@@ -3219,6 +3246,8 @@ void SparseDotsDesc::releaseWeights() {
   for(auto& block : blocks)
     static_cast<NestedBottleneckResidualBlockDesc*>(block.second.get())->releaseWeights();
   trunkTipRMSNorm.releaseWeights();
+  for(auto& boundaryOut : trunkBoundaryOut)
+    boundaryOut.releaseWeights();
   for(auto& attention : decoderAttention)
     attention.releaseWeights();
   for(auto& ffn : decoderFFN)

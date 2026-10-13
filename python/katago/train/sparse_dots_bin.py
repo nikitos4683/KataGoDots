@@ -172,7 +172,7 @@ def load_sparse_dots_bin(path: str, config: modelconfigs.ModelConfig) -> Tuple[S
     model = SparseDotsModel(config, pos_len_x, pos_len_y, [Game.DOTS])
     model.initialize()
 
-    assert reader.int() == 11 and reader.int() == 8
+    assert reader.int() == 12 and reader.int() == 8
     info["multipliers"] = [reader.float() for _ in range(7)]
     meta = [reader.int() for _ in range(8)]
     assert meta == [0] * 8
@@ -180,7 +180,8 @@ def load_sparse_dots_bin(path: str, config: modelconfigs.ModelConfig) -> Tuple[S
     area_rope = reader.int()
     assert (area_rope == 1) == (model.area_rope == "mean")
     assert [reader.int() for _ in range(4)] == [24, 10, 8, 1]
-    assert [reader.int() for _ in range(4)] == [0, 0, 0, 0]
+    assert reader.int() == (1 if model.area_boundary_attention else 0)
+    assert [reader.int() for _ in range(3)] == [0, 0, 0]
 
     _load_linear(reader, "model.linear_point", model.linear_point)
     _load_linear(reader, "model.linear_vertex1", model.linear_vertex1)
@@ -221,6 +222,18 @@ def load_sparse_dots_bin(path: str, config: modelconfigs.ModelConfig) -> Tuple[S
     _set(model.norm_trunkfinal.gamma, gamma)
     _set(model.norm_trunkfinal.beta, beta)
     reader.activation("model.act_trunkfinal")
+
+    if model.area_boundary_attention:
+        reader.expect("model.boundary_attention")
+        boundary_blocks = [
+            (f"model.blocks.{i}.blockstack.{j}", sub)
+            for i, block in enumerate(model.blocks)
+            for j, sub in enumerate(block.blockstack)
+            if isinstance(sub, TransformerAttentionBlock)
+        ]
+        assert reader.int() == len(boundary_blocks)
+        for name, sub in boundary_blocks:
+            _set(sub.boundary_out_proj.weight, reader.matmul(name + ".boundary_out_proj"))
 
     decoder = model.decoder
     reader.expect("model.decoder")

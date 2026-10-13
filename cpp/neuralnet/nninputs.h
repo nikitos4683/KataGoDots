@@ -199,6 +199,7 @@ struct DotsSparseInput {
     int8_t owner; // 0 - the player to move, 1 - the opponent
     int8_t grounded;
     int8_t movesAgo; // 0 - not in the history, 1..5 - placed that many moves ago
+    int8_t boundary; // on the boundary of an area (always an area of the owner of the dot)
   };
   // A completed enclosure, the outer contour only
   struct Area {
@@ -230,6 +231,8 @@ struct DotsSparseInput {
   std::vector<Point> points;
   std::vector<Area> areas;
   std::vector<Vertex> vertices; // grouped by area in the order of `areas`
+  // Index in `points` of the dot at each vertex: the boundary of an area is made of points
+  std::vector<int32_t> vertexPoints;
   std::vector<Candidate> candidates;
   bool groundAllowed = false;
   // Own minus opponent score plus komi if the player to move grounds now (the game ends)

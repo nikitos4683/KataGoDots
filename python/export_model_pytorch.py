@@ -886,8 +886,8 @@ def main(args):
         writeln(model_sparse_dots.NUM_AREA_SCALAR_FEATURES)
         writeln(model_sparse_dots.NUM_CAND_FEATURES)
         writeln(model_sparse_dots.NUM_GROUND_FEATURES)
+        writeln(1 if model.area_boundary_attention else 0)
         # Spare slots for future options
-        writeln(0)
         writeln(0)
         writeln(0)
         writeln(0)
@@ -919,6 +919,19 @@ def main(args):
             write_block("model.blocks."+str(i), block)
         write_rmsnorm("model.norm_trunkfinal", model.norm_trunkfinal)
         write_activation("model.act_trunkfinal", model.act_trunkfinal)
+
+        if model.area_boundary_attention:
+            # Output projections of the area boundary attention, one per trunk attention block in order
+            boundary_blocks = [
+                (f"model.blocks.{i}.blockstack.{j}", sub)
+                for i, block in enumerate(model.blocks)
+                for j, sub in enumerate(block.blockstack)
+                if isinstance(sub, model_sparse_dots.SparseRoPEAttentionBlock)
+            ]
+            writeln("model.boundary_attention")
+            writeln(len(boundary_blocks))
+            for name, sub in boundary_blocks:
+                write_matmul(name + ".boundary_out_proj", sub.boundary_out_proj.weight)
 
         decoder = model.decoder
         writeln("model.decoder")

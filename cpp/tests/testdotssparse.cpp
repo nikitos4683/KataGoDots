@@ -113,6 +113,26 @@ void checkSparseInvariants(const Board& board, const BoardHistory& hist, const P
     }
   }
 
+  // Every vertex is the point at the same coordinates, the boundary bit marks exactly these points,
+  // and the points of a boundary belong to the owner of the area
+  {
+    testAssert(input.vertexPoints.size() == input.vertices.size());
+    vector<int8_t> isBoundary(input.points.size(), 0);
+    for(const auto& area : input.areas) {
+      for(int i = 0; i < area.boundaryLen; i++) {
+        const int32_t pointIdx = input.vertexPoints[area.vertexStart + i];
+        testAssert(pointIdx >= 0 && pointIdx < (int32_t)input.points.size());
+        const auto& point = input.points[pointIdx];
+        const auto& vertex = input.vertices[area.vertexStart + i];
+        testAssert(point.x == vertex.x && point.y == vertex.y);
+        testAssert(point.owner == area.owner);
+        isBoundary[pointIdx] = 1;
+      }
+    }
+    for(size_t i = 0; i < input.points.size(); i++)
+      testAssert(input.points[i].boundary == isBoundary[i]);
+  }
+
   // Sum of the opponent dots inside my areas = my captures and vice versa
   {
     int insideOppOfMyAreas = 0;

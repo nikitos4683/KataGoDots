@@ -2146,6 +2146,7 @@ SPARSE_DOTS_VERSION = 18
 SPARSE_DOTS_SUFFIXES = {
     "-arnone": {"area_rope": "none"},
     "-dec1": {"candidate_decoder_layers": 1},
+    "-noab": {"area_boundary_attention": False},
 }
 
 def make_sparse_dots_config(config: ModelConfig, overrides: Dict[str,Any] = None) -> ModelConfig:
@@ -2157,6 +2158,7 @@ def make_sparse_dots_config(config: ModelConfig, overrides: Dict[str,Any] = None
     result.setdefault("candidate_decoder_channels", config["mid_num_channels"])
     result.setdefault("candidate_decoder_ffn_channels", config["transformer_ffn_channels"])
     result.setdefault("vertex_encoder_channels", 192)
+    result.setdefault("area_boundary_attention", True)
     if overrides:
         result.update(overrides)
     return result

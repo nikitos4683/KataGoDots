@@ -894,8 +894,11 @@ int MainCmds::testsparsenn(const vector<string>& args) {
     throw StringError("testsparsenn: not a sparse Dots model");
   const SparseDotsNN::Model reference(*desc.sparseDots);
 
-  const int nnXLen = std::max(xSize, ySize);
-  const int nnYLen = std::max(xSize, ySize);
+  // Transposing symmetries are not applied to rectangular boards, so the outputs have the board shape
+  const int nnXLen = xSize;
+  const int nnYLen = ySize;
+  if(nnXLen < 1 || nnYLen < 1 || nnXLen > NNPos::MAX_BOARD_LEN_X || nnYLen > NNPos::MAX_BOARD_LEN_Y)
+    throw StringError("testsparsenn: the board size doesn't fit the compiled max board size");
   ConfigParser cfg(std::map<string, string>{});
   ComputeContext* context = NeuralNet::createComputeContext({0}, &logger, nnXLen, nnYLen, "", useFP16, loadedModel, cfg);
   ComputeHandle* handle = NeuralNet::createComputeHandle(context, loadedModel, &logger, batchSize, false, true, 0, 0);
@@ -957,6 +960,11 @@ int MainCmds::testsparsenn(const vector<string>& args) {
         policyPositions.push_back(NNPos::getPassPos(nnXLen, nnYLen));
       for(int pos : policyPositions) {
         const double diff = std::fabs((double)actual.policyProbs[pos] - expected->policyProbs[pos]);
+        if(diff > tolerance && diff > maxPolicyDiff)
+          cout << "Policy diff " << diff << " at position " << (start + i) << " pos " << pos << " (pass "
+               << NNPos::getPassPos(nnXLen, nnYLen) << "): " << actual.policyProbs[pos] << " vs " << expected->policyProbs[pos]
+               << ", candidates " << input.candidates.size() << ", ground " << input.groundAllowed << ", points "
+               << input.points.size() << ", areas " << input.areas.size() << endl;
         maxPolicyDiff = std::max(maxPolicyDiff, diff);
         sumPolicyDiff += diff;
         numPolicyValues++;

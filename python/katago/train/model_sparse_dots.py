@@ -36,7 +36,7 @@ from ..train.model_pytorch import (
 
 NUM_GLOBAL_FEATURES = 8
 NUM_MOVES_AGO = 5
-NUM_POINT_FEATURES = 11  # owner, 4 edge distances, grounded, moves ago one-hot
+NUM_POINT_FEATURES = 12  # owner, 4 edge distances, grounded, boundary of an area, moves ago one-hot
 FOURIER_PERIODS = (4, 8, 16, 32, 64)
 NUM_VERTEX_FEATURES = 4 + 4 * len(FOURIER_PERIODS)  # 24
 NUM_AREA_SCALAR_FEATURES = 10  # owner, insideMy, insideOpp, boundaryLen, grounded, moves ago one-hot
@@ -67,6 +67,7 @@ PADDED_ARRAYS = {
 COUNT_KEY_OF_DIM = {"P": "pointCountN", "A": "areaCountN", "V": "vertexCountN", "M": "candCountN"}
 
 SPARSE_POSITIONS = "sparse_positions"
+SPARSE_BOUNDARY = "sparse_boundary"
 
 
 def is_sparse_dots_config(config: modelconfigs.ModelConfig) -> bool:
@@ -88,8 +89,10 @@ def moves_ago_one_hot(moves_ago: torch.Tensor) -> torch.Tensor:
     return (moves_ago.unsqueeze(-1) == values).to(torch.float32)
 
 
-def point_features(point_coords: torch.Tensor, point_data: torch.Tensor, board_size: torch.Tensor) -> torch.Tensor:
-    """point_coords [N,P,2], point_data [N,P,3] (owner, grounded, movesAgo), board_size [N,2]. Returns [N,P,11]."""
+def point_features(point_coords: torch.Tensor, point_data: torch.Tensor, point_boundary: torch.Tensor,
+                   board_size: torch.Tensor) -> torch.Tensor:
+    """point_coords [N,P,2], point_data [N,P,3] (owner, grounded, movesAgo), point_boundary [N,P] (the point is on
+    the boundary of an area, always an area of its owner), board_size [N,2]. Returns [N,P,12]."""
     coords = point_coords.to(torch.float32)
     owner = point_data[..., 0:1].to(torch.float32)
     grounded = point_data[..., 1:2].to(torch.float32)
@@ -97,8 +100,69 @@ def point_features(point_coords: torch.Tensor, point_data: torch.Tensor, board_s
         owner,
         edge_features(coords, board_size.unsqueeze(1)),
         grounded,
+        point_boundary.to(torch.float32).unsqueeze(-1),
         moves_ago_one_hot(point_data[..., 2].long()),
     ], dim=-1)
+
+
+def vertex_point_index(point_coords: torch.Tensor, point_count: torch.Tensor, vertex_coords: torch.Tensor,
+                       vertex_count: torch.Tensor) -> torch.Tensor:
+    """Index of the POINT at the coordinates of each boundary vertex [N,V], -1 for padding (and for a vertex
+    without a point, which never happens: the boundary of an area is made of dots outside the area interiors)."""
+    num_points = point_coords.shape[1]
+    point_mask = count_mask(point_count, num_points) > 0
+    vertex_mask = count_mask(vertex_count, vertex_coords.shape[1]) > 0
+    point_key = point_coords[..., 1].long() * 256 + point_coords[..., 0].long()
+    point_key = torch.where(point_mask, point_key, torch.full_like(point_key, 1 << 30))
+    vertex_key = vertex_coords[..., 1].long() * 256 + vertex_coords[..., 0].long()
+    sorted_key, order = torch.sort(point_key, dim=1)
+    pos = torch.searchsorted(sorted_key, vertex_key).clamp(max=num_points - 1)
+    found = (torch.gather(sorted_key, 1, pos) == vertex_key) & vertex_mask
+    return torch.where(found, torch.gather(order, 1, pos), torch.full_like(pos, -1))
+
+
+class BoundaryLinks:
+    """For each boundary vertex: the flat token index (row * S + token) of its AREA and of its POINT.
+    Padding vertices point to the extra row num_rows and are masked."""
+
+    def __init__(self, vertex_area, vertex_point, num_points, num_areas):
+        n, v = vertex_point.shape
+        seq_len = 1 + num_points + num_areas
+        self.num_rows = n * seq_len
+        self.area_start = 1 + num_points
+        self.num_areas = num_areas
+        valid = vertex_point >= 0
+        row_start = (torch.arange(n, device=vertex_point.device) * seq_len).view(-1, 1)
+        self.valid = valid.reshape(-1)
+        self.area_flat = torch.where(valid, row_start + self.area_start + vertex_area,
+                                     torch.full_like(vertex_area, self.num_rows)).reshape(-1)
+        self.point_flat = torch.where(valid, row_start + 1 + vertex_point, torch.zeros_like(vertex_point)).reshape(-1)
+
+
+def boundary_attention(q, k, v, links: BoundaryLinks, n_rep: int, scale: float) -> torch.Tensor:
+    """Attention of each AREA to the POINTs of its boundary only. q [N,S,H,Dq], k [N,S,Hkv,Dq], v [N,S,Hkv,Dv]
+    (after RoPE). Returns [N,A,H*Dv] in float32, zeros for areas without vertices."""
+    n, seq_len, num_heads, _ = q.shape
+    v_head_dim = v.shape[-1]
+    q_area = q.reshape(n * seq_len, num_heads, -1)[links.area_flat.clamp(max=links.num_rows - 1)].to(torch.float32)
+    k_point = k.reshape(n * seq_len, k.shape[2], -1)[links.point_flat].to(torch.float32)
+    v_point = v.reshape(n * seq_len, v.shape[2], -1)[links.point_flat].to(torch.float32)
+    if n_rep > 1:
+        k_point = k_point.repeat_interleave(n_rep, dim=1)
+        v_point = v_point.repeat_interleave(n_rep, dim=1)
+    scores = (q_area * k_point).sum(dim=-1) * scale
+    scores = scores.masked_fill(~links.valid.unsqueeze(-1), float("-inf"))
+    segment = links.area_flat.unsqueeze(-1).expand(-1, num_heads)
+    seg_max = scores.new_full((links.num_rows + 1, num_heads), float("-inf")).scatter_reduce(
+        0, segment, scores, reduce="amax", include_self=True)
+    seg_max = torch.nan_to_num(seg_max.detach(), neginf=0.0)
+    weights = torch.exp(scores - seg_max[links.area_flat])
+    denom = scores.new_zeros((links.num_rows + 1, num_heads)).index_add(0, links.area_flat, weights)
+    out = scores.new_zeros((links.num_rows + 1, num_heads, v_head_dim)).index_add(
+        0, links.area_flat, weights.unsqueeze(-1) * v_point)
+    out = out / denom.clamp(min=1e-30).unsqueeze(-1)
+    out = out[:links.num_rows].view(n, seq_len, num_heads * v_head_dim)
+    return out[:, links.area_start:links.area_start + links.num_areas]
 
 
 def vertex_features(vertex_coords: torch.Tensor, board_size: torch.Tensor) -> torch.Tensor:
@@ -264,7 +328,9 @@ def _key_padding_bias(mask: torch.Tensor, dtype) -> torch.Tensor:
 class SparseRoPEAttentionBlock(TransformerAttentionBlock):
     """Self-attention over the token sequence (NSC layout) with RoPE from the weighted position sets.
     Same parameters as TransformerAttentionBlock, so the export and the C++ descriptors are reused.
-    Instances are created as TransformerAttentionBlock and switched to this class."""
+    Instances are created as TransformerAttentionBlock and switched to this class.
+    With area boundary attention the AREA tokens also attend to the POINTs of their own boundary only, with the
+    same q/k/v and a separate output projection boundary_out_proj (exported after the trunk)."""
 
     def forward(self, x, mask, mask_sum_hw, mask_sum: float, extra_outputs: Optional[ExtraOutputs], block_shared_data: Optional[Dict[str, Any]] = None):
         assert x.dim() == 3
@@ -278,6 +344,7 @@ class SparseRoPEAttentionBlock(TransformerAttentionBlock):
         cos_k, sin_k = positions.token_tables(self.rope_freqs)
         cos_q, sin_q = _expand_kv_tables(cos_k, sin_k, self.n_rep, self.num_heads)
         q, k = apply_learnable_rotary_emb(q, k, cos_q, sin_q, cos_k, sin_k)
+        q_rot, k_rot, v_rot = q, k, v
 
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
@@ -291,6 +358,14 @@ class SparseRoPEAttentionBlock(TransformerAttentionBlock):
         )
         attn_output = attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_len, self.num_heads * self.v_head_dim)
         result = self.out_proj(attn_output)
+
+        # Areas also attend to the points of their own boundary only, with the same q/k/v
+        boundary_out_proj = getattr(self, "boundary_out_proj", None)
+        links: Optional[BoundaryLinks] = block_shared_data.get(SPARSE_BOUNDARY)
+        if boundary_out_proj is not None and links is not None and links.num_areas > 0:
+            area_output = boundary_attention(q_rot, k_rot, v_rot, links, self.n_rep, 1.0 / math.sqrt(self.q_head_dim))
+            area_result = boundary_out_proj(area_output.to(result.dtype))
+            result = torch.cat([result[:, :links.area_start], result[:, links.area_start:] + area_result], dim=1)
         if extra_outputs is not None:
             extra_outputs.report(self.name + ".out", result)
         return result
@@ -585,6 +660,7 @@ class SparseDotsModel(torch.nn.Module):
         self.c_vertex = config.get("vertex_encoder_channels", 192)
         self.area_rope = config.get("area_rope", "mean")
         assert self.area_rope in ("mean", "none")
+        self.area_boundary_attention = config.get("area_boundary_attention", True)
         self.activation = config.get("activation", "relu")
         self.has_intermediate_head = False
         self.metadata_encoder = None
@@ -634,6 +710,9 @@ class SparseDotsModel(torch.nn.Module):
             for sub in block.blockstack:
                 if isinstance(sub, TransformerAttentionBlock):
                     sub.__class__ = SparseRoPEAttentionBlock
+                    if self.area_boundary_attention:
+                        sub.boundary_out_proj = torch.nn.Linear(
+                            sub.num_heads * sub.v_head_dim, sub.out_proj.out_features, bias=False)
             self.blocks.append(block)
         self.norm_trunkfinal = SparseRMSNormMask(self.c_trunk)
         self.act_trunkfinal = act(self.activation)
@@ -717,7 +796,8 @@ class SparseDotsModel(torch.nn.Module):
             block.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
 
     def embed(self, batch: Dict[str, torch.Tensor]):
-        """Returns tokens [N,S,C], mask [N,S,1], number of tokens [N], positions, board size [N,2] float."""
+        """Returns tokens [N,S,C], mask [N,S,1], number of tokens [N], positions, boundary links (or None),
+        board size [N,2] float."""
         board_size = batch["boardSizeN"].to(torch.float32)
         input_global = batch["globalInputNC"].to(torch.float32)
         n = board_size.shape[0]
@@ -728,7 +808,12 @@ class SparseDotsModel(torch.nn.Module):
         area_mask = count_mask(batch["areaCountN"], num_areas)
         vertex_mask = count_mask(batch["vertexCountN"], num_vertices)
 
-        point_tokens = self.linear_point(point_features(batch["pointCoordsNP"], batch["pointDataNP"], board_size))
+        vertex_point = vertex_point_index(
+            batch["pointCoordsNP"], batch["pointCountN"], batch["vertexCoordsNV"], batch["vertexCountN"])
+        point_boundary = point_mask.new_zeros(point_mask.shape).scatter_add(
+            1, vertex_point.clamp(min=0), (vertex_point >= 0).to(point_mask.dtype)).clamp(max=1.0)
+        point_tokens = self.linear_point(
+            point_features(batch["pointCoordsNP"], batch["pointDataNP"], point_boundary, board_size))
 
         # Area encoder: vertex MLP -> mean | max | log(1+|B|) | area scalars -> area MLP
         area_data = batch["areaDataNA"]
@@ -764,19 +849,20 @@ class SparseDotsModel(torch.nn.Module):
             cand_xy=batch["candCoordsNM"].to(torch.float32),
             area_rope=self.area_rope,
         )
-        return tokens, mask, num_tokens, positions, board_size
+        links = BoundaryLinks(vertex_area, vertex_point, num_points, num_areas) if self.area_boundary_attention else None
+        return tokens, mask, num_tokens, positions, links, board_size
 
     def forward(self, batch: Dict[str, torch.Tensor], extra_outputs: Optional[ExtraOutputs] = None):
         """Returns a tuple with one tuple of outputs (like Model.forward):
         policy logits [N,6,M+1] (the last candidate is grounding, masked ones get -5000),
         value [N,3], miscvalue [N,10], moremiscvalue [N,8], ownership logits [N,P],
         futurepos pretanh [N,2,M], scorebelief log probs [N,L]."""
-        tokens, mask, num_tokens, positions, board_size = self.embed(batch)
+        tokens, mask, num_tokens, positions, links, board_size = self.embed(batch)
         num_points = batch["pointCoordsNP"].shape[1]
         num_cands = batch["candCoordsNM"].shape[1]
         mask_sum_hw = num_tokens.view(-1, 1, 1)
         mask_sum = torch.sum(mask)
-        block_shared_data = {SPARSE_POSITIONS: positions}
+        block_shared_data = {SPARSE_POSITIONS: positions, SPARSE_BOUNDARY: links}
 
         if extra_outputs is not None:
             extra_outputs.report("trunk_after_embedding", tokens)

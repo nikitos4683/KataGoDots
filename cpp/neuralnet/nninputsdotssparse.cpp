@@ -13,6 +13,7 @@ void DotsSparseInput::clear() {
   points.clear();
   areas.clear();
   vertices.clear();
+  vertexPoints.clear();
   candidates.clear();
   groundAllowed = false;
   groundResult = 0.0f;
@@ -192,6 +193,7 @@ void NNInputs::fillDotsSparseInput(
   setGlobal(DotsSparseGlobalFeature::HistoryGround_0, groundIsEncountered ? 1.0f : 0.0f);
 
   // Points: placed dots outside the interiors of the areas -----------------------------------------------------
+  vector<int32_t> pointIdxOfLoc(Board::MAX_ARR_SIZE, -1);
   for(int y = 0; y < ySize; y++) {
     for(int x = 0; x < xSize; x++) {
       const Loc loc = Location::getLoc(x, y, xSize);
@@ -207,6 +209,7 @@ void NNInputs::fillDotsSparseInput(
       point.owner = placedColor == pla ? 0 : 1;
       point.grounded = isGrounded(state) ? 1 : 0;
       point.movesAgo = movesAgoOfLoc[loc];
+      pointIdxOfLoc[loc] = static_cast<int32_t>(result.points.size());
       result.points.push_back(point);
       result.pointLocs.push_back(loc);
     }
@@ -304,6 +307,11 @@ void NNInputs::fillDotsSparseInput(
           result.vertices.push_back({
             static_cast<int8_t>(Location::getX(loc, xSize)), static_cast<int8_t>(Location::getY(loc, xSize))
           });
+          // The boundary dots are active dots of the owner outside the interiors, so they are points
+          const int32_t pointIdx = pointIdxOfLoc[loc];
+          testAssert(pointIdx >= 0);
+          result.vertexPoints.push_back(pointIdx);
+          result.points[pointIdx].boundary = 1;
         }
         result.areas.push_back(area);
       }

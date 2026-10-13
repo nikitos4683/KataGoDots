@@ -200,6 +200,8 @@ struct TrunkBlock {
   vector<Attention> attentions;
   vector<FFN> ffns;
   vector<bool> isAttention;
+  // Output projections of the area boundary attention, one per attention sub-block (empty if disabled)
+  vector<Linear> boundaryOut;
   ScaleBiasAct post;
   Linear postConv;
 };
@@ -229,7 +231,8 @@ void SparseDotsNN::pointFeatures(const DotsSparseInput& input, int i, float* out
   out[0] = p.owner;
   edgeFeatures(input, p.x, p.y, out + 1);
   out[5] = p.grounded;
-  movesAgoOneHot(p.movesAgo, out + 6);
+  out[6] = p.boundary;
+  movesAgoOneHot(p.movesAgo, out + 7);
 }
 
 void SparseDotsNN::vertexFeatures(const DotsSparseInput& input, int i, float* out) {
@@ -326,6 +329,7 @@ struct SparseDotsNN::Model::Impl {
     globalToken = desc.globalToken.weights;
     global.init(desc.globalMul);
 
+    size_t boundaryOutIdx = 0;
     for(const auto& blockPair : desc.blocks) {
       const auto& nested = *static_cast<const NestedBottleneckResidualBlockDesc*>(blockPair.second.get());
       TrunkBlock block;
@@ -336,6 +340,10 @@ struct SparseDotsNN::Model::Impl {
           block.attentions.emplace_back();
           block.attentions.back().init(*static_cast<const TransformerAttentionDesc*>(sub.second.get()));
           block.isAttention.push_back(true);
+          if(desc.areaBoundaryAttention) {
+            block.boundaryOut.emplace_back();
+            block.boundaryOut.back().init(desc.trunkBoundaryOut[boundaryOutIdx++]);
+          }
         }
         else {
           testAssert(sub.first == TRANSFORMER_FFN_BLOCK_KIND);
@@ -348,6 +356,7 @@ struct SparseDotsNN::Model::Impl {
       block.postConv.initConv1x1(nested.postConv);
       blocks.push_back(std::move(block));
     }
+    testAssert(boundaryOutIdx == desc.trunkBoundaryOut.size());
     tipGamma = desc.trunkTipRMSNorm.gamma;
     tipBeta = desc.trunkTipRMSNorm.beta;
     tipEpsilon = desc.trunkTipRMSNorm.epsilon;
@@ -454,11 +463,13 @@ struct SparseDotsNN::Model::Impl {
 
   // Attention of the normalized queries [numQueries x Cq] to the keys/values source [seqLen x Ckv].
   // Returns the output projection [numQueries x Cq] in result.
+  // q, k and v after RoPE are kept in qkv if it's not null
   static void attend(
     const Attention& layer,
     const float* queriesNorm, int numQueries, const RopeTables& queryTables,
     const float* source, int seqLen, const RopeTables& keyTables,
-    vector<float>& result
+    vector<float>& result,
+    vector<float>* qkv = nullptr
   ) {
     const int heads = layer.numHeads;
     const int kvHeads = layer.numKVHeads;
@@ -505,6 +516,71 @@ struct SparseDotsNN::Model::Impl {
     }
     result.resize((size_t)numQueries * layer.out.outC);
     layer.out.apply(attnOut.data(), numQueries, result.data());
+    if(qkv != nullptr) {
+      qkv[0] = std::move(q);
+      qkv[1] = std::move(k);
+      qkv[2] = std::move(v);
+    }
+  }
+
+  // Attention of every area to the points of its boundary only, with the q, k, v of the trunk attention.
+  // Adds the projected result to the area tokens of mid.
+  static void boundaryAttend(
+    const Attention& layer, const Linear& outProj, const DotsSparseInput& input, const vector<float>* qkv, float* mid
+  ) {
+    const int numPoints = (int)input.points.size();
+    const int numAreas = (int)input.areas.size();
+    if(numAreas == 0)
+      return;
+    const int heads = layer.numHeads;
+    const int kvHeads = layer.numKVHeads;
+    const int dq = layer.qHeadDim;
+    const int dv = layer.vHeadDim;
+    const float scale = 1.0f / sqrtf((float)dq);
+    const vector<float>& q = qkv[0];
+    const vector<float>& k = qkv[1];
+    const vector<float>& v = qkv[2];
+    vector<float> out((size_t)numAreas * heads * dv, 0.0f);
+    vector<float> scores;
+    for(int a = 0; a < numAreas; a++) {
+      const auto& area = input.areas[a];
+      const int areaToken = 1 + numPoints + a;
+      scores.resize(area.boundaryLen);
+      for(int h = 0; h < heads; h++) {
+        const int kvh = h * kvHeads / heads;
+        const float* qa = q.data() + (size_t)areaToken * heads * dq + (size_t)h * dq;
+        float maxScore = -1e30f;
+        for(int i = 0; i < area.boundaryLen; i++) {
+          const int pointToken = 1 + input.vertexPoints[area.vertexStart + i];
+          const float* kp = k.data() + (size_t)pointToken * kvHeads * dq + (size_t)kvh * dq;
+          float dot = 0.0f;
+          for(int d = 0; d < dq; d++)
+            dot += qa[d] * kp[d];
+          scores[i] = dot * scale;
+          maxScore = std::max(maxScore, scores[i]);
+        }
+        float sum = 0.0f;
+        for(int i = 0; i < area.boundaryLen; i++) {
+          scores[i] = expf(scores[i] - maxScore);
+          sum += scores[i];
+        }
+        float* o = out.data() + (size_t)a * heads * dv + (size_t)h * dv;
+        for(int i = 0; i < area.boundaryLen; i++) {
+          const int pointToken = 1 + input.vertexPoints[area.vertexStart + i];
+          const float* vp = v.data() + (size_t)pointToken * kvHeads * dv + (size_t)kvh * dv;
+          const float weight = scores[i] / sum;
+          for(int d = 0; d < dv; d++)
+            o[d] += weight * vp[d];
+        }
+      }
+    }
+    vector<float> projected((size_t)numAreas * outProj.outC);
+    outProj.apply(out.data(), numAreas, projected.data());
+    for(int a = 0; a < numAreas; a++) {
+      float* m = mid + (size_t)(1 + numPoints + a) * outProj.outC;
+      for(int i = 0; i < outProj.outC; i++)
+        m[i] += projected[(size_t)a * outProj.outC + i];
+    }
   }
 
   void evaluate(const DotsSparseInput& input, RawOutput& result) const {
@@ -578,6 +654,7 @@ struct SparseDotsNN::Model::Impl {
     vector<float> mid((size_t)seqLen * midChannels);
     vector<float> midTmp((size_t)seqLen * midChannels);
     vector<float> attnOut;
+    vector<float> qkv[3];
     for(const TrunkBlock& block : blocks) {
       block.pre.apply(trunk.data(), seqLen, tmp.data());
       block.preConv.apply(tmp.data(), seqLen, mid.data());
@@ -585,12 +662,16 @@ struct SparseDotsNN::Model::Impl {
       size_t ffnIdx = 0;
       for(bool isAttention : block.isAttention) {
         if(isAttention) {
-          const Attention& layer = block.attentions[attentionIdx++];
+          const Attention& layer = block.attentions[attentionIdx];
+          const bool boundary = !block.boundaryOut.empty();
           layer.norm.apply(mid.data(), seqLen, midTmp.data());
           tokenTables(layer, input, tables);
-          attend(layer, midTmp.data(), seqLen, tables, midTmp.data(), seqLen, tables, attnOut);
+          attend(layer, midTmp.data(), seqLen, tables, midTmp.data(), seqLen, tables, attnOut, boundary ? qkv : nullptr);
           for(size_t i = 0; i < mid.size(); i++)
             mid[i] += attnOut[i];
+          if(boundary)
+            boundaryAttend(layer, block.boundaryOut[attentionIdx], input, qkv, mid.data());
+          attentionIdx++;
         }
         else {
           block.ffns[ffnIdx++].applyResidual(mid.data(), seqLen);

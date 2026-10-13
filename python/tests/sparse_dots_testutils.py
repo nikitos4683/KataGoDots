@@ -9,7 +9,7 @@ import torch
 from katago.train import modelconfigs
 
 
-def tiny_sparse_config(area_rope="mean", decoder_layers=2):
+def tiny_sparse_config(area_rope="mean", decoder_layers=2, boundary_attention=True):
     config = dict(modelconfigs.config_of_name["b5c384h6nbttflrs-fson-silu-rsnh"])
     config.update({
         "trunk_num_channels": 64,
@@ -29,6 +29,7 @@ def tiny_sparse_config(area_rope="mean", decoder_layers=2):
         "candidate_decoder_channels": 32,
         "candidate_decoder_ffn_channels": 64,
         "vertex_encoder_channels": 24,
+        "area_boundary_attention": boundary_attention,
     })
 
 
@@ -41,8 +42,9 @@ def random_row(rng: random.Random, x_size: int, y_size: int) -> Dict:
     areas = []
     vertices = []
     vertex_area = []
-    for a in range(rng.randint(0, 3)):
-        boundary = rng.sample(points if len(points) >= 8 else cells, rng.randint(4, 8))
+    # Boundaries are made of the points of the position, as in the engine
+    for a in range(rng.randint(0, 3) if len(points) >= 4 else 0):
+        boundary = rng.sample(points, rng.randint(4, min(8, len(points))))
         areas.append([rng.randint(0, 1), rng.randint(0, 1), rng.randint(0, 5), rng.randint(0, 6), rng.randint(0, 6), len(boundary)])
         vertices.extend(boundary)
         vertex_area.extend([a] * len(boundary))

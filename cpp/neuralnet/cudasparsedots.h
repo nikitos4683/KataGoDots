@@ -47,6 +47,10 @@ void sparseDotsRMSNorm(
   const T* in, T* out, const float* weight, const float* mask, long long rows, int channels, float epsilon,
   cudaStream_t stream);
 
+// dst[dstRows[r], :] += src[r, :] for r < numRows
+template <typename T>
+void sparseDotsScatterAddRows(const T* src, T* dst, const int* dstRows, int numRows, int channels, cudaStream_t stream);
+
 // x += delta * mask (mask may be null)
 template <typename T>
 void sparseDotsResidualAdd(T* x, const T* delta, const float* mask, long long rows, int channels, cudaStream_t stream);
@@ -83,6 +87,16 @@ template <typename T>
 void sparseDotsAttention(
   const T* Q, const T* K, const T* V, const float* kvMask, T* output,
   int batchSize, int qLen, int kvLen, int numHeads, int numKVHeads, int qHeadDim, int vHeadDim, cudaStream_t stream);
+
+// Attention of each area to the points of its boundary only. Q [tokens, numHeads, qHeadDim],
+// K [tokens, numKVHeads, qHeadDim], V [tokens, numKVHeads, vHeadDim] (dense rows). Area a is the token areaRows[a],
+// its boundary is the tokens vertexRows[e] for e in [segStart[a], segStart[a+1]).
+// Output [numAreas, numHeads, vHeadDim], zeros for an area without vertices.
+// Head dims (16, 16), (32, 32) and (64, 64) are supported.
+template <typename T>
+void sparseDotsBoundaryAttention(
+  const T* Q, const T* K, const T* V, const int* areaRows, const int* segStart, const int* vertexRows, T* output,
+  int numAreas, int numHeads, int numKVHeads, int qHeadDim, int vHeadDim, cudaStream_t stream);
 
 // Pooling over the valid tokens of x [batch, seqLen, channels], out [batch, 3 * channels]:
 // gpool mode:  [mean, mean * off / 10, max]
