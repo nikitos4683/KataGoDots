@@ -31,6 +31,8 @@ Understanding the differences between Go and Dots is vital when editing game log
 | **Time Controls** | Byo-yomi, Canadian, Fischer | **Bronstein delay** (`time_settings <main> <per-move>`): each move uses per-move delay first; unused delay does not bank |
 | **Expected Game Length** | ~250 moves on 19x19 (~0.69 moves/point) | ~400 moves on 39x32 (~0.32 moves/point). Move temperature decay is normalized against Dots expected length |
 | **Auxiliary Heads** | Seki heads, score distribution heads | Obsolete seki/scoring heads removed. Ownership prediction is masked to placed dots only |
+| **Neural Net** | Dense board tensors (model versions up to 17) | Sparse token model, model version 18 / inputs version 8: a token per placed dot outside the enclosed areas (the facts of an area are features of its boundary dots), a decoder over the move candidates (see `docs/DotsSparseNN.md`). Dense Dots models are rejected |
+| **Suicide** | Rules dependent | Forbidden by default (`Rules::DEFAULT_DOTS`); the sparse model is trained only with this rule |
 
 ---
 
@@ -55,15 +57,18 @@ KataGoDots/
 │   │   ├── common.h               # Core types (Loc, Color, Player, Move, string keys)
 │   │   ├── dotsfield.cpp          # Dots cycle tracing, base boundaries, territory flags
 │   │   ├── dotsfieldCapturesAndTerritories.cpp # Capture/territory calculation
-│   │   ├── dotsfieldLadders.{h,cpp} # Dots tactical ladder solver
 │   │   ├── dotsboardhistory.cpp   # Dots scoring, grounding alive checks, resign reasonableness
 │   │   └── rules.{h,cpp}          # Rules struct, start position generators/recognizers
 │   ├── neuralnet/                 # Neural net backends & feature extractors
-│   │   ├── desc.{h,cpp}           # Model descriptor & weight parsing
+│   │   ├── desc.{h,cpp}           # Model descriptor & weight parsing (SparseDotsDesc for version 18)
 │   │   ├── modelversion.{h,cpp}   # Model version enumerations
 │   │   ├── nneval.{h,cpp}         # Multi-threaded batched evaluation server
-│   │   ├── nninputs.{h,cpp}       # Feature interfaces and Dots feature enums (22 spatial, 19 global)
-│   │   ├── nninputsdots.cpp       # Dots feature extraction
+│   │   ├── nninputs.{h,cpp}       # Feature interfaces, DotsSparseInput, dense feature enums
+│   │   ├── nninputsdots.cpp       # Dense Dots feature extraction (old models, to be removed)
+│   │   ├── nninputsdotssparse.cpp # Sparse Dots position extraction (points with the facts of their areas, candidates)
+│   │   ├── sparsedotsnn.{h,cpp}   # CPU reference of the sparse Dots model (used by Eigen and tests)
+│   │   ├── cudasparsedotsmodel.{h,cpp} # CUDA sparse Dots model
+│   │   ├── cudasparsedots.{h,cu}  # CUDA kernels of the sparse Dots model
 │   │   ├── cudabackend.cpp        # CUDA + cuDNN backend
 │   │   ├── trtbackend.cpp         # TensorRT backend
 │   │   ├── openclbackend.cpp      # OpenCL backend
@@ -83,8 +88,11 @@ KataGoDots/
 │   ├── katago/
 │   │   ├── train/
 │   │   │   ├── model_pytorch.py   # PyTorch model architecture (trunk, policy, value, ownership)
+│   │   │   ├── model_sparse_dots.py # Sparse Dots model (create_model picks it for sparse configs)
 │   │   │   ├── metrics_pytorch.py # Loss functions and training metrics
-│   │   │   ├── modelconfigs.py    # Model size configurations (e.g. b6c96, b10c128)
+│   │   │   ├── metrics_sparse_dots.py # Losses of the sparse Dots model
+│   │   │   ├── data_processing_sparse_dots.py # Sparse Dots NPZ loader
+│   │   │   ├── modelconfigs.py    # Model size configurations (for Dots: transformer kinds like b5c384h6nbttflrs-fson-silu-rsnh)
 │   │   │   └── data_processing_pytorch.py # Training data loading and augmentation
 │   │   └── utils/
 │   │       └── training_data_generator.py # Training data file cycling and gap-delay shuffler
@@ -165,6 +173,9 @@ This comprehensive suite runs:
 
 Additional C++ test commands:
 - `.\katago.exe runoutputtests` — Tests model loading, SGF handling, time controls, and output formatting.
+- `.\katago.exe testsparsenn -model <MODEL> [-use-fp16 true]` — Compares the outputs of the backend of the build (e.g. CUDA) with the CPU reference of a sparse Dots model on positions of random games.
+- `.\katago.exe dumpsparsenn -model <MODEL> -output <JSON>` — Writes inputs and CPU reference outputs for the PyTorch parity test (`python/tests/test_sparse_dots_cpp_parity.py`).
+- `.\katago.exe dumpsparse <SGF>` — Prints the sparse Dots input of a position as JSON.
 - `.\katago.exe version` — Prints engine version, git commit, build type, backend, and board dimensions.
 
 ### 2. C++ Google Test Suite
@@ -174,7 +185,7 @@ When compiled with `katago_tests`:
 .\cpp\builds\msvc-opencl\Release\katago_tests.exe
 ```
 For a single-configuration build (for example Ninja), the executable is directly in the build directory.
-Discovers and tests `tests/testdotsladders.cpp`, `tests/testdotsutils.cpp`, and `tests/testdotsstress.cpp`.
+Builds `tests/testdotsutils.cpp` and `tests/testdotsstress.cpp`; it has no test cases at the moment (the only ones were the Dots ladder solver tests, removed with the solver).
 
 ### 3. Python Unit Tests
 The repository uses `pytest` configured in `pytest.ini`:
@@ -204,6 +215,7 @@ High-throughput parallel board analysis using `cpp/configs/analysis_dots.cfg`:
 .\cpp\katago.exe analysis -config .\cpp\configs\analysis_dots.cfg -model <MODEL_PATH>.bin.gz
 ```
 - Required query fields: string `"id"`, integer `"boardXSize"` and `"boardYSize"`, `"moves"` (an array, which may be empty), and `"rules"` (for example `"bbs"` or `"notago"`).
+- Dots models must be sparse (model version 18) and run on the CUDA or Eigen backend.
 - Optional Dots fields:
   - `"dots": true` — Overrides the game selection; `analysis_dots.cfg` already defaults to Dots.
   - `"playerToMove": "b"` or `"w"` — Specifies whose turn to evaluate.
@@ -215,9 +227,9 @@ High-throughput parallel board analysis using `cpp/configs/analysis_dots.cfg`:
 
 ### Performance Benchmark & Thread Tuning
 ```powershell
-.\cpp\katago.exe benchmark -config .\cpp\configs\gtp_dots.cfg -model <MODEL_PATH>.bin.gz
+.\cpp\katago.exe benchmark -config .\cpp\configs\gtp_dots.cfg -model <MODEL_PATH>.bin.gz -sgf <DOTS_GAME>.sgf
 ```
-Recommends optimal `numSearchThreads` for your hardware.
+Recommends optimal `numSearchThreads` for your hardware. For Dots pass `-sgf` with a Dots game: the default benchmark positions are Go positions.
 
 ---
 
@@ -229,7 +241,7 @@ For selfplay training on a single machine, use `python/selfplay/synchronous_loop
 ```
 Example:
 ```bash
-./python/selfplay/synchronous_loop.sh dotsrun /d/Dots/training run1 b6c96 0
+./python/selfplay/synchronous_loop.sh dotsrun /d/Dots/training run1 b5c384h6nbttflrs-fson-silu-rsnh 0
 ```
 The loop carries out five stages sequentially:
 1. **Gatekeeper** (optional, C++): Matches candidate model against the current best.
@@ -255,10 +267,12 @@ The loop carries out five stages sequentially:
    - Never replace `Board` parameters by mutable reference if `hist.initialBoard` could be inadvertently mutated.
 
 3. **Neural Net Features and Heads**:
-   - Spatial input features (`cpp/neuralnet/nninputsdots.cpp`): 22 channels defined by `DotsSpatialFeature` in `cpp/neuralnet/nninputs.h`. Ladder features (`LadderCaptured_14` through `LadderWorkingMoves_17`) are currently disabled in feature filling by `#if 0`.
-   - Global input features: 19 channels defined by `DotsGlobalFeature` in `cpp/neuralnet/nninputs.h`.
-   - Value / auxiliary heads: KataGo's original Go-specific seki and score distribution heads were removed in commit `885e426f`. Do not reintroduce them without updating model definitions in both C++ and Python (`model_pytorch.py`, `load_model.py`, `train.py`).
-   - Ownership prediction: Masked in `nneval.cpp` and `model_pytorch.py` to only placed dots.
+   - Dots use the sparse token model (model version 18, inputs version 8), specified in `docs/DotsSparseNN.md` (sections 8–10: the PyTorch model, the model file and the C++ implementation). The input is `DotsSparseInput` (`cpp/neuralnet/nninputs.h`, extracted in `nninputsdotssparse.cpp`): points (with the facts of the areas whose boundary they are on), move candidates and 8 global features.
+   - Any model change must be made in PyTorch (`model_sparse_dots.py`), the export (`export_model_pytorch.py`), the C++ descriptor (`desc.cpp`), the CPU reference (`sparsedotsnn.cpp`) and CUDA (`cudasparsedotsmodel.cpp`), then checked with `test_sparse_dots_cpp_parity.py` and `katago testsparsenn`.
+   - Only the CUDA and Eigen backends run sparse Dots models; the other backends reject them with an error.
+   - The old dense Dots path (`nninputsdots.cpp`, 22 spatial and 19 global features, model versions up to 17) is still in the code but dense Dots models are rejected; it is to be removed once the sparse path is in use.
+   - Value / auxiliary heads: KataGo's original Go-specific seki and score distribution heads were removed in commit `885e426f`. Do not reintroduce them without updating model definitions in both C++ and Python.
+   - Ownership is predicted per placed dot (a sigmoid on the point tokens).
 
 4. **Code Formatting & Cleanliness**:
    - **C++**: Follow the rules defined in `.clang-format` (Chromium base, 2-space indentation, 120 characters column limit). Keep headers alphabetically sorted.

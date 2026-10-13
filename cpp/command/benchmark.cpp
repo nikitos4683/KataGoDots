@@ -301,6 +301,9 @@ int MainCmds::benchmark(const vector<string>& args) {
     sgf = CompactSgf::loadFile(sgfFile);
   }
   else {
+    // The default benchmark positions are Go games
+    if(cfg.getOrDefaultBool(DOTS_KEY, false))
+      throw StringError("benchmark: the config is for Dots, pass a Dots game with -sgf to take the positions from");
     if(boardSize == -1) {
       int defaultBoardXSize = TestCommon::DEFAULT_BENCHMARK_SGF_DATA_SIZE;
       int defaultBoardYSize = TestCommon::DEFAULT_BENCHMARK_SGF_DATA_SIZE;

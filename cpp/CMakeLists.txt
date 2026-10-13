@@ -732,6 +732,8 @@ if(USE_BACKEND STREQUAL "CUDA")
     neuralnet/cudabackend.cpp
     neuralnet/cudautils.cpp
     neuralnet/cudahelpers.cu
+    neuralnet/cudasparsedots.cu
+    neuralnet/cudasparsedotsmodel.cpp
   )
   # Optional vendored CUTLASS enables the fused transformer FFN kernel. The fused kernel is
   # built on the DualGemm extension shipped in CUTLASS's example 45, so both the include tree
@@ -1025,7 +1027,6 @@ add_executable(katago
   game/board.cpp
   game/dotsfield.cpp
   game/dotsfieldCapturesAndTerritories.cpp
-  game/dotsfieldLadders.cpp
   game/rules.cpp
   game/boardhistory.cpp
   game/dotsboardhistory.cpp
@@ -1039,6 +1040,8 @@ add_executable(katago
   dataio/files.cpp
   neuralnet/nninputs.cpp
   neuralnet/nninputsdots.cpp
+  neuralnet/nninputsdotssparse.cpp
+  neuralnet/sparsedotsnn.cpp
   neuralnet/sgfmetadata.cpp
   neuralnet/modelversion.cpp
   neuralnet/nneval.cpp
@@ -1098,6 +1101,7 @@ add_executable(katago
   tests/testsgf.cpp
   tests/testsymmetries.cpp
   tests/testnninputs.cpp
+  tests/testdotssparse.cpp
   tests/testownership.cpp
   tests/testsearchcommon.cpp
   tests/testsearchnonn.cpp
@@ -1775,6 +1779,17 @@ if(USE_BACKEND STREQUAL "TENSORRT" OR USE_BACKEND STREQUAL "ONNX")
   target_link_libraries(katago protobuf::libprotobuf)
 endif()
 
+# The CPU reference of the sparse Dots models (neuralnet/sparsedotsnn.cpp) uses Eigen for its matrix
+# products when it is available, in any backend. Without Eigen it falls back to plain loops.
+if(NOT USE_BACKEND STREQUAL "EIGEN")
+  find_package(Eigen3 QUIET)
+  if(TARGET Eigen3::Eigen)
+    target_link_libraries(katago Eigen3::Eigen)
+    target_compile_definitions(katago PRIVATE KATAGO_HAS_EIGEN)
+    message(STATUS "Found Eigen3 for the sparse Dots CPU reference")
+  endif()
+endif()
+
 if(DOTS_GAME)
   if(NOT DEFINED COMPILE_MAX_BOARD_LEN_X)
     set(COMPILE_MAX_BOARD_LEN_X 39)
@@ -2133,7 +2148,9 @@ if(WIN32 AND USE_BACKEND STREQUAL "ROCM")
   endif()
 endif()
 
-if(NOT "${CMAKE_BINARY_DIR}" STREQUAL "${CMAKE_SOURCE_DIR}")
+# Disable for side builds (tests, other backends) that must not replace cpp/katago
+option(KATAGO_COPY_EXECUTABLE_TO_SOURCE_DIR "Copy the built katago executable into the cpp directory" ON)
+if(KATAGO_COPY_EXECUTABLE_TO_SOURCE_DIR AND NOT "${CMAKE_BINARY_DIR}" STREQUAL "${CMAKE_SOURCE_DIR}")
 add_custom_command(TARGET katago POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:katago> ${CMAKE_SOURCE_DIR}/$<TARGET_FILE_NAME:katago>
         COMMENT "Copying executable to cpp directory"
@@ -2156,7 +2173,6 @@ enable_testing()
 
 add_executable(katago_tests
 # Test sources
-tests/testdotsladders.cpp
 tests/testdotsutils.cpp
 tests/testdotsstress.cpp
 
@@ -2179,7 +2195,6 @@ game/boardhistory.cpp
 game/rules.cpp
 game/dotsfield.cpp
 game/dotsfieldCapturesAndTerritories.cpp
-game/dotsfieldLadders.cpp
 game/dotsboardhistory.cpp
 )
 

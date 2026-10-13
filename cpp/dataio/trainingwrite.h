@@ -1,6 +1,7 @@
 #ifndef DATAIO_TRAINING_WRITE_H_
 #define DATAIO_TRAINING_WRITE_H_
 
+#include <array>
 #include <atomic>
 
 #include "../dataio/numpywrite.h"
@@ -290,6 +291,21 @@ struct TrainingWriteBuffers {
 
   NumpyBuffer<float> metadataInputNC;
 
+  //Sparse Dots format (inputs version 8, docs/DotsSparseNN.md 7.2). The spatial buffers above are unused then:
+  //the rows are kept until writing, since the per-entity arrays are padded to the maxima over the rows of the file.
+  struct DotsSparseRow {
+    DotsSparseInput input;
+    //Visits of the player and of the opponent's reply (projected onto the current candidates)
+    std::vector<std::array<int16_t, 2>> candPolicy;
+    std::array<int16_t, 2> groundPolicy{};
+    //+1/-1/0: whose dot is placed at the candidate after 8 and 32 moves
+    std::vector<std::array<int8_t, 2>> candFuturepos;
+    //1 if the opponent of the owner of the point captures it by the end of the game
+    std::vector<int8_t> pointOwnership;
+  };
+  bool dotsSparse;
+  std::vector<DotsSparseRow> dotsSparseRows;
+
   TrainingWriteBuffers(
     int inputsVersion,
     int maxRows,
@@ -349,6 +365,8 @@ struct TrainingWriteBuffers {
   );
 
   void writeToZipFile(const std::string& fileName);
+  //Writes the arrays of the sparse Dots format padded to the maxima over the rows and closes the file
+  void writeDotsSparseArrays(ZipFile& zipFile);
   void writeToTextOstream(std::ostream& out);
 
 };

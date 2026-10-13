@@ -704,10 +704,12 @@ int MainCmds::writetrainingdata(const vector<string>& args) {
   if(dataBoardLen > Board::MAX_LEN)
     throw StringError("dataBoardLen > maximum board len, must recompile to increase");
 
-  static_assert(NNModelVersion::latestInputsVersionImplemented == 7, "");
-  const int inputsVersion = 7;
-  const int numBinaryChannels = NNInputs::NUM_FEATURES_SPATIAL_V7;
-  const int numGlobalChannels = NNInputs::NUM_FEATURES_GLOBAL_V7;
+  // Go games get the dense V7 inputs, Dots games the sparse inputs of model version 18
+  static_assert(NNModelVersion::latestInputsVersionImplemented == 8, "");
+  const bool dotsGame = whatDataSource == DOTS_KEY;
+  const int inputsVersion = NNModelVersion::getInputsVersion(NNModelVersion::getDefaultModelVersion(dotsGame), dotsGame);
+  const int numBinaryChannels = NNInputs::getNumberOfSpatialFeatures(inputsVersion, dotsGame);
+  const int numGlobalChannels = NNInputs::getNumberOfGlobalFeatures(inputsVersion, dotsGame);
 
   const std::set<string> noTrainUsers = loadStrippedTxtFileLines(noTrainUsersFile);
   const std::set<string> onlyTrainUsers =
@@ -833,7 +835,8 @@ int MainCmds::writetrainingdata(const vector<string>& args) {
   std::vector<Search*> threadSearchers;
   for(int threadIdx = 0; threadIdx<numWorkerThreads; threadIdx++) {
     threadRands.push_back(new Rand());
-    const bool hasMetadataInput = true;
+    // The sparse Dots models have no metadata encoder
+    const bool hasMetadataInput = !dotsGame;
     threadDataBuffers.push_back(
       new TrainingWriteBuffers(
         inputsVersion,

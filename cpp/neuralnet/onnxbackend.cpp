@@ -204,6 +204,8 @@ ComputeContext* NeuralNet::createComputeContext(
   const LoadedModel* loadedModel,
   ConfigParser& cfg
 ) {
+  if(loadedModel != NULL && NeuralNet::getModelDesc(loadedModel).isSparseDots())
+    throw StringError("ONNX backend does not support sparse Dots models (version 18), use the CUDA or Eigen backend");
   (void)gpuIdxs;
   (void)homeDataDirOverride;
   // The emitted ONNX graph is fp32, and inference precision is chosen internally by the

@@ -59,6 +59,9 @@
 #include "../neuralnet/sgfmetadata.h"
 #include "../neuralnet/nneval.h"
 #include "../neuralnet/desc.h"
+#ifdef KATAGO_GPU_CUDA
+#include "../neuralnet/cudasparsedotsmodel.h"
+#endif
 
 #include "../core/simpleallocator.h"
 #include "../core/test.h"
@@ -4889,6 +4892,8 @@ ComputeContext* NeuralNet::createComputeContext(
   const LoadedModel* loadedModel,
   ConfigParser& cfg
 ) {
+  if(loadedModel != NULL && NeuralNet::getModelDesc(loadedModel).isSparseDots())
+    throw StringError("ROCm backend: sparse Dots models (version 18) are not supported, use the CUDA or Eigen backend");
   (void)gpuIdxs;
   (void)logger;
   (void)homeDataDirOverride;
@@ -4930,6 +4935,10 @@ void NeuralNet::freeComputeContext(ComputeContext* computeContext) {
 struct ComputeHandle {
   std::unique_ptr<CudaHandles> cudaHandles;
   std::unique_ptr<Model> model;
+#ifdef KATAGO_GPU_CUDA
+  // Set instead of model, scratch and buffers for sparse Dots models
+  std::unique_ptr<SparseDotsCudaModel> sparseModel;
+#endif
   std::unique_ptr<ScratchBuffers> scratch;
   std::unique_ptr<Buffers> buffers;
   const bool usingFP16;
@@ -5012,6 +5021,13 @@ struct ComputeHandle {
     if(context->useFusedFFNMode == enabled_t::True)
       throw StringError("Cuda backend: cudaUseFusedFFN=true but this build was compiled without CUTLASS (external/cutlass missing at build time)");
 #endif
+    if(loadedModel->modelDesc.isSparseDots()) {
+      sparseModel = std::make_unique<SparseDotsCudaModel>(
+        *loadedModel->modelDesc.sparseDots, useFP16, cudaHandles->mmaAttentionEnabled,
+        cudaHandles->stream.stream, cudaHandles->cublas.handle, logger);
+      CUDA_ERR("ComputeHandle", cudaDeviceSynchronize());
+      return;
+    }
     model = std::make_unique<Model>(
       cudaHandles.get(), &(loadedModel->modelDesc), maxBatchSize,
       nnXLen, nnYLen, inputsUseNHWC, useFP16, useNHWC
@@ -5359,6 +5375,29 @@ struct InputBuffers {
     const ModelDesc& m = loadedModel->modelDesc;
 
     maxBatchSize = maxBatchSz;
+    userInputBuffer = NULL;
+    userInputGlobalBuffer = NULL;
+    userInputMetaBuffer = NULL;
+    policyPassResults = NULL;
+    policyResults = NULL;
+    valueResults = NULL;
+    scoreValueResults = NULL;
+    ownershipResults = NULL;
+    if(m.isSparseDots()) {
+      // Sparse Dots models read DotsSparseInput directly from the result buffers
+      singleInputElts = singleInputBytes = 0;
+      singleInputGlobalElts = singleInputGlobalBytes = 0;
+      singleInputMetaElts = singleInputMetaBytes = 0;
+      singlePolicyPassResultElts = singlePolicyPassResultBytes = 0;
+      singlePolicyResultElts = singlePolicyResultBytes = 0;
+      singleValueResultElts = singleValueResultBytes = 0;
+      singleScoreValueResultElts = singleScoreValueResultBytes = 0;
+      singleOwnershipResultElts = singleOwnershipResultBytes = 0;
+      userInputBufferBytes = userInputGlobalBufferBytes = userInputMetaBufferBytes = 0;
+      policyPassResultBufferBytes = policyResultBufferBytes = 0;
+      valueResultBufferBytes = scoreValueResultBufferBytes = ownershipResultBufferBytes = 0;
+      return;
+    }
     singleInputElts = (size_t)m.numInputChannels * nnXLen * nnYLen;
     singleInputBytes = (size_t)m.numInputChannels * nnXLen * nnYLen * sizeof(float);
     singleInputGlobalElts = (size_t)m.numInputGlobalChannels;
@@ -5488,6 +5527,26 @@ void NeuralNet::getOutput(
   const int batchSize = numBatchEltsFilled;
   const int nnXLen = gpuHandle->nnXLen;
   const int nnYLen = gpuHandle->nnYLen;
+
+#ifdef KATAGO_GPU_CUDA
+  if(gpuHandle->sparseModel != nullptr) {
+    testAssert(dotsGame);
+    std::vector<DotsSparseInput> symmetric(batchSize);
+    std::vector<const DotsSparseInput*> inputs(batchSize);
+    for(int row = 0; row < batchSize; row++) {
+      const DotsSparseInput& input = inputBufs[row]->dotsSparseInput;
+      const int symmetry = SparseDotsNN::effectiveSymmetry(inputBufs[row]->symmetry, input.xSize, input.ySize);
+      symmetric[row] = input.withSymmetry(symmetry);
+      inputs[row] = &symmetric[row];
+    }
+    std::vector<SparseDotsNN::RawOutput> raw;
+    gpuHandle->sparseModel->evaluate(inputs, raw);
+    for(int row = 0; row < batchSize; row++)
+      SparseDotsNN::writeOutput(inputBufs[row]->dotsSparseInput, raw[row], (float)inputBufs[row]->policyOptimism, *outputs[row]);
+    return;
+  }
+#endif
+
   const int modelVersion = gpuHandle->model->modelVersion;
 
   const int numSpatialFeatures = NNModelVersion::getNumSpatialFeatures(modelVersion, dotsGame);

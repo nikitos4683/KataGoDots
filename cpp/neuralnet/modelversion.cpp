@@ -22,18 +22,48 @@
 //15 = V7 features, Extra nonlinearity for pass output
 //16 = V7 features, Q value predictions in the policy head
 //17 = V7 features, dropped Q value predictions, introduced transformers and added guards to unused params
+//18 = Dots only: sparse token format (points with the facts of their areas, action candidates), see docs/DotsSparseNN.md
 
 static void fail(const int modelVersion, const bool dotsGame) {
+  if(dotsGame && modelVersion >= NNModelVersion::oldestModelVersionImplemented && modelVersion < NNModelVersion::dotsSparseModelVersion) {
+    throw StringError(
+      "NNModelVersion: dense Dots models (version " + Global::intToString(modelVersion) +
+      ") are no longer supported. Dots requires a sparse model of version " +
+      Global::intToString(NNModelVersion::dotsSparseModelVersion) + ", see docs/DotsSparseNN.md"
+    );
+  }
+  if(!dotsGame && modelVersion == NNModelVersion::dotsSparseModelVersion) {
+    throw StringError(
+      "NNModelVersion: model version " + Global::intToString(modelVersion) + " is only supported for the Dots game"
+    );
+  }
   throw StringError("NNModelVersion: Model version not currently implemented or supported: " + Global::intToString(modelVersion) +
     (dotsGame ? " (Dots game)" : ""));
 }
 
 static_assert(NNModelVersion::oldestModelVersionImplemented == 3);
 static_assert(NNModelVersion::oldestInputsVersionImplemented == 3);
-static_assert(NNModelVersion::latestModelVersionImplemented == 17);
-static_assert(NNModelVersion::latestInputsVersionImplemented == 7);
+static_assert(NNModelVersion::latestModelVersionImplemented == 18);
+static_assert(NNModelVersion::latestInputsVersionImplemented == 8);
+
+int NNModelVersion::getDefaultModelVersion(const bool dotsGame) {
+  return dotsGame ? dotsSparseModelVersion : defaultModelVersion;
+}
+
+bool NNModelVersion::isDotsSparse(const int modelVersion, const bool dotsGame) {
+  return dotsGame && modelVersion == dotsSparseModelVersion;
+}
+
+void NNModelVersion::checkSupported(const int modelVersion, const bool dotsGame) {
+  getInputsVersion(modelVersion, dotsGame);
+}
 
 int NNModelVersion::getInputsVersion(const int modelVersion, const bool dotsGame) {
+  if(dotsGame) {
+    if(modelVersion == dotsSparseModelVersion)
+      return dotsSparseInputsVersion;
+    fail(modelVersion, dotsGame);
+  }
   switch(modelVersion) {
     case 3:
     case 4:
@@ -57,7 +87,7 @@ int NNModelVersion::getInputsVersion(const int modelVersion, const bool dotsGame
       }
       break;
     default:
-      if (modelVersion <= latestModelVersionImplemented) {
+      if (modelVersion < dotsSparseModelVersion) {
         return 7;
       }
       break;
@@ -68,6 +98,11 @@ int NNModelVersion::getInputsVersion(const int modelVersion, const bool dotsGame
 }
 
 int NNModelVersion::getNumSpatialFeatures(const int modelVersion, const bool dotsGame) {
+  if(dotsGame) {
+    if(modelVersion == dotsSparseModelVersion)
+      return 0;
+    fail(modelVersion, dotsGame);
+  }
   switch(modelVersion) {
     case 3:
     case 4:
@@ -91,8 +126,8 @@ int NNModelVersion::getNumSpatialFeatures(const int modelVersion, const bool dot
       }
       break;
     default:
-      if (modelVersion <= latestModelVersionImplemented) {
-        return NNInputs::NUM_FEATURES_SPATIAL_V7; // Use NUM_FEATURES_SPATIAL_V7_DOTS if it's value is changed
+      if (modelVersion < dotsSparseModelVersion) {
+        return NNInputs::NUM_FEATURES_SPATIAL_V7;
       }
       break;
   }
@@ -102,6 +137,11 @@ int NNModelVersion::getNumSpatialFeatures(const int modelVersion, const bool dot
 }
 
 int NNModelVersion::getNumGlobalFeatures(const int modelVersion, const bool dotsGame) {
+  if(dotsGame) {
+    if(modelVersion == dotsSparseModelVersion)
+      return NNInputs::NUM_FEATURES_GLOBAL_DOTS_SPARSE;
+    fail(modelVersion, dotsGame);
+  }
   switch(modelVersion) {
     case 3:
     case 4:
@@ -125,8 +165,8 @@ int NNModelVersion::getNumGlobalFeatures(const int modelVersion, const bool dots
       }
       break;
     default:
-      if (modelVersion <= latestModelVersionImplemented) {
-        return NNInputs::NUM_FEATURES_GLOBAL_V7;  // Use NUM_FEATURES_GLOBAL_V7_DOTS if it's value is changed
+      if (modelVersion < dotsSparseModelVersion) {
+        return NNInputs::NUM_FEATURES_GLOBAL_V7;
       }
       break;
   }

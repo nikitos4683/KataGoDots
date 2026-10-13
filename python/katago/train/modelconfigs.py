@@ -19,7 +19,7 @@ well or best: "-fson-mish-rvgl-bnh"
   but the latter is used for inference.
 """
 
-from typing import Dict, Any, Union
+from typing import Dict, Any, Optional, Union
 
 ModelConfig = Dict[str,Any]
 
@@ -2135,3 +2135,86 @@ for name, base_config in list(config_of_name.items()):
         "internal_num_channels": config["trunk_num_channels"],
     }
     config_of_name[name+"-meta"] = config
+
+
+# Sparse Dots models (model version 18), see docs/DotsSparseNN.md --------------------------------------------------
+# For Dots, every transformer config name gives the sparse model with the same trunk: the convolutional stem is
+# replaced by token embeddings and the policy head by a candidate decoder. Optional suffixes for comparisons:
+#   -dec1    one candidate decoder layer instead of two
+SPARSE_DOTS_VERSION = 18
+SPARSE_DOTS_SUFFIXES = {
+    "-dec1": {"candidate_decoder_layers": 1},
+}
+# What the sparse model implements (in PyTorch, the export, the CPU reference and CUDA).
+# Trunk block kinds: internal length of the nested bottleneck. The C++ FFN is SwiGLU only.
+SPARSE_DOTS_TRUNK_BLOCK_KINDS = {
+    "bottlenest2transformerropesg": 2,
+    "bottlenest3transformerropesg": 3,
+}
+SPARSE_DOTS_NORM_KINDS = ("fixup", "fixscale", "fixscaleonenorm")  # batch norms need the spatial layout
+SPARSE_DOTS_ACTIVATIONS = ("relu", "mish", "silu")
+# Options of the dense models the sparse model doesn't implement: they must be off
+SPARSE_DOTS_UNSUPPORTED_OPTIONS = (
+    "attention_qk_norm",
+    "attention_num_rw_registers",
+    "inline_registers",
+    "transformer_ffn_depthwise_conv",
+    "use_trunk_channel_gate",
+    "use_trunk_residual_backout",
+    "use_repvgg_init",
+    "use_repvgg_linear",
+    "metadata_encoder",
+    "has_intermediate_head",
+    "trunk_normless",
+)
+
+def sparse_dots_config_error(config: ModelConfig) -> Optional[str]:
+    """Why the config can't be the base of a sparse Dots model, None if it can."""
+    for _, block_kind in config["block_kind"]:
+        if block_kind not in SPARSE_DOTS_TRUNK_BLOCK_KINDS:
+            return f"block kind {block_kind} is not supported (only {', '.join(SPARSE_DOTS_TRUNK_BLOCK_KINDS)})"
+    if not config.get("learnable_rope", False):
+        return "no learnable RoPE"
+    if not (config.get("trunk_final_rmsnorm", False) and config.get("trunk_rmsnorm_spatial", False)):
+        return "no spatial RMSNorm trunk tip (-rsnh)"
+    if config.get("rmsnorm_spatial_cgroup_size") is not None:
+        return "RMSNorm channel groups are not supported"
+    if config["norm_kind"] not in SPARSE_DOTS_NORM_KINDS:
+        return f"norm kind {config['norm_kind']} is not supported (only {', '.join(SPARSE_DOTS_NORM_KINDS)})"
+    activation = config.get("activation", "relu")
+    if activation not in SPARSE_DOTS_ACTIVATIONS:
+        return f"activation {activation} is not supported (only {', '.join(SPARSE_DOTS_ACTIVATIONS)})"
+    for option in SPARSE_DOTS_UNSUPPORTED_OPTIONS:
+        if config.get(option):
+            return f"option {option} is not supported"
+    return None
+
+def make_sparse_dots_config(config: ModelConfig, overrides: Dict[str,Any] = None) -> ModelConfig:
+    result = dict(config)
+    result["version"] = SPARSE_DOTS_VERSION
+    result["sparse_dots"] = True
+    result.setdefault("candidate_decoder_layers", 2)
+    result.setdefault("candidate_decoder_channels", config["mid_num_channels"])
+    result.setdefault("candidate_decoder_ffn_channels", config["transformer_ffn_channels"])
+    if overrides:
+        result.update(overrides)
+    return result
+
+def get_config(name: str, dots: bool) -> ModelConfig:
+    """Config of the model name for the game. Dots configs are always sparse."""
+    if not dots:
+        return config_of_name[name]
+    overrides = {}
+    stripped = True
+    while stripped:
+        stripped = False
+        for suffix, suffix_overrides in SPARSE_DOTS_SUFFIXES.items():
+            if name.endswith(suffix):
+                name = name[:-len(suffix)]
+                overrides.update(suffix_overrides)
+                stripped = True
+    error = sparse_dots_config_error(config_of_name[name])
+    if error is not None:
+        raise ValueError(f"Model kind {name} can't be a Dots model: {error}. Dots models are sparse, "
+                         f"see docs/DotsSparseNN.md; the target kind is b5c384h6nbttflrs-fson-silu-rsnh")
+    return make_sparse_dots_config(config_of_name[name], overrides)

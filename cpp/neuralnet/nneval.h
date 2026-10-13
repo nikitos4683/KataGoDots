@@ -55,6 +55,8 @@ struct NNResultBuf {
   std::vector<float> rowGlobalBuf;
   std::vector<float> rowMetaBuf;
   std::vector<Loc> dotsReasonableMoves;
+  // Input of the sparse Dots models (version 18) instead of the row buffers
+  DotsSparseInput dotsSparseInput;
   bool hasRowMeta;
   std::shared_ptr<NNOutput> result;
   bool errorLogLockout; // error flag to restrict log to 1 error to prevent spam

@@ -507,6 +507,8 @@ ComputeContext* NeuralNet::createComputeContext(
   enabled_t useFP16Mode,
   const LoadedModel* loadedModel,
   ConfigParser& cfg) {
+  if(loadedModel != NULL && NeuralNet::getModelDesc(loadedModel).isSparseDots())
+    throw StringError("Metal backend does not support sparse Dots models (version 18), use the CUDA or Eigen backend");
 
   // Only ANE-only configurations may free the engine's in-memory weights: the
   // GPU/MPSGraph path reads them via modelDescToSwift, so freeing is unsafe

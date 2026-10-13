@@ -133,6 +133,8 @@ ComputeContext* NeuralNet::createComputeContext(
   enabled_t useFP16Mode,
   const LoadedModel* loadedModel,
   ConfigParser& cfg) {
+  if(loadedModel != NULL && NeuralNet::getModelDesc(loadedModel).isSparseDots())
+    throw StringError("TensorRT backend does not support sparse Dots models (version 18), use the CUDA or Eigen backend");
   (void)gpuIdxs;
 
   ComputeContext* context = new ComputeContext();

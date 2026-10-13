@@ -294,16 +294,25 @@ TrainingWriteBuffers::TrainingWriteBuffers(
    hasMetadataInput(includeMetadata),
    curRows(0),
    binaryInputNCHWUnpacked(NULL),
-   binaryInputNCHWPacked({maxRws, numBChannels, packedBoardArea}),
+   binaryInputNCHWPacked({(iVersion == NNModelVersion::dotsSparseInputsVersion ? 1 : maxRws), std::max(1, numBChannels), packedBoardArea}),
    globalInputNC({maxRws, numFChannels}),
-   policyTargetsNCMove({maxRws, POLICY_TARGET_NUM_CHANNELS, NNPos::getPolicySize(xLen,yLen)}),
+   //The spatial buffers are not used by the sparse Dots format, keep them minimal then
+   policyTargetsNCMove({(iVersion == NNModelVersion::dotsSparseInputsVersion ? 1 : maxRws), POLICY_TARGET_NUM_CHANNELS, NNPos::getPolicySize(xLen,yLen)}),
    globalTargetsNC({maxRws, GLOBAL_TARGET_NUM_CHANNELS}),
    scoreDistrN({maxRws, xLen*yLen*2+NNPos::EXTRA_SCORE_DISTR_RADIUS*2}),
-   valueTargetsNCHW({maxRws, VALUE_SPATIAL_TARGET_NUM_CHANNELS, yLen, xLen}),
-   qValueTargetsNCMove({maxRws, QVALUE_SPATIAL_TARGET_NUM_CHANNELS, NNPos::getPolicySize(xLen,yLen)}),
-   metadataInputNC({(includeMetadata ? maxRws : 1), SGFMetadata::METADATA_INPUT_NUM_CHANNELS})
+   valueTargetsNCHW({(iVersion == NNModelVersion::dotsSparseInputsVersion ? 1 : maxRws), VALUE_SPATIAL_TARGET_NUM_CHANNELS, yLen, xLen}),
+   qValueTargetsNCMove({(iVersion == NNModelVersion::dotsSparseInputsVersion ? 1 : maxRws), QVALUE_SPATIAL_TARGET_NUM_CHANNELS, NNPos::getPolicySize(xLen,yLen)}),
+   metadataInputNC({(includeMetadata ? maxRws : 1), SGFMetadata::METADATA_INPUT_NUM_CHANNELS}),
+   dotsSparse(iVersion == NNModelVersion::dotsSparseInputsVersion),
+   dotsSparseRows()
 {
-  binaryInputNCHWUnpacked = new float[numBChannels * xLen * yLen];
+  binaryInputNCHWUnpacked = new float[std::max(1, numBChannels * xLen * yLen)];
+  if(dotsSparse) {
+    testAssert(numBChannels == 0);
+    testAssert(numFChannels == NNInputs::NUM_FEATURES_GLOBAL_DOTS_SPARSE);
+    testAssert(!includeMetadata);
+    dotsSparseRows.reserve(maxRws);
+  }
 }
 
 TrainingWriteBuffers::~TrainingWriteBuffers()
@@ -313,6 +322,7 @@ TrainingWriteBuffers::~TrainingWriteBuffers()
 
 void TrainingWriteBuffers::clear() {
   curRows = 0;
+  dotsSparseRows.clear();
 }
 
 //Copy floats that are all 0-1 into bits, packing 8 to a byte, big-endian-style within each byte.
@@ -503,9 +513,11 @@ void TrainingWriteBuffers::addRow(
   const ReanalysisData& reanalysisData,
   const bool selfplay
 ) {
-  static_assert(NNModelVersion::latestInputsVersionImplemented == 7, "");
-  if(inputsVersion < 3 || inputsVersion > 7)
+  static_assert(NNModelVersion::latestInputsVersionImplemented == 8, "");
+  if(inputsVersion < 3 || inputsVersion > 8)
     throw StringError("Training write buffers: Does not support input version: " + Global::intToString(inputsVersion));
+  if(dotsSparse != hist.rules.isDots)
+    throw StringError("Training write buffers: Dots games need the sparse inputs version " + Global::intToString(NNModelVersion::dotsSparseInputsVersion));
 
   int posArea = dataXLen*dataYLen;
   testAssert(curRows < maxRows);
@@ -528,6 +540,13 @@ void TrainingWriteBuffers::addRow(
     testAssert(NNInputs::getNumberOfSpatialFeatures(inputsVersion, hist.rules.isDots) == numBinaryChannels);
     testAssert(NNInputs::getNumberOfGlobalFeatures(inputsVersion, hist.rules.isDots) == numGlobalChannels);
 
+    if(dotsSparse) {
+      testAssert(dotsSparseRows.size() == (size_t)curRows);
+      dotsSparseRows.emplace_back();
+      NNInputs::fillDotsSparseInput(board, hist, nextPlayer, nnInputParams, dotsSparseRows.back().input, selfplay);
+      std::copy(dotsSparseRows.back().input.global, dotsSparseRows.back().input.global + numGlobalChannels, rowGlobal);
+    }
+    else {
     NNInputs::fillRowVN(
       inputsVersion,
       board,
@@ -546,7 +565,9 @@ void TrainingWriteBuffers::addRow(
     uint8_t* rowBinPacked = binaryInputNCHWPacked.data + curRows * numBinaryChannels * packedBoardArea;
     for(int c = 0; c<numBinaryChannels; c++)
       packBits(rowBin + c * posArea, posArea, rowBinPacked + c * packedBoardArea);
+    }
   }
+  DotsSparseRow* sparseRow = dotsSparse ? &dotsSparseRows.back() : nullptr;
 
   //Vector for global targets and metadata
   float* rowGlobal = globalTargetsNC.data + curRows * GLOBAL_TARGET_NUM_CHANNELS;
@@ -558,9 +579,36 @@ void TrainingWriteBuffers::addRow(
 
   //Fill policy
   const int policySize = NNPos::getPolicySize(dataXLen,dataYLen);
-  int16_t* rowPolicy = policyTargetsNCMove.data + curRows * POLICY_TARGET_NUM_CHANNELS * policySize;
+  int16_t* rowPolicy = dotsSparse ? NULL : policyTargetsNCMove.data + curRows * POLICY_TARGET_NUM_CHANNELS * policySize;
 
-  if(policyTarget0 != NULL) {
+  if(dotsSparse) {
+    //Visits by candidate. The opponent's reply is projected onto the current candidates by location,
+    //its grounding onto the grounding candidate. Moves that are not candidates now are dropped.
+    const DotsSparseInput& input = sparseRow->input;
+    sparseRow->candPolicy.assign(input.candidates.size(), {0, 0});
+    sparseRow->groundPolicy = {0, 0};
+    std::vector<int> candIdxOfLoc(Board::MAX_ARR_SIZE, -1);
+    for(size_t i = 0; i < input.candidateLocs.size(); i++)
+      candIdxOfLoc[input.candidateLocs[i]] = (int)i;
+    auto project = [&](const vector<PolicyTargetMove>& moves, int channel) {
+      for(const PolicyTargetMove& move : moves) {
+        if(move.loc == Board::PASS_LOC) {
+          if(input.groundAllowed)
+            sparseRow->groundPolicy[channel] = move.policyTarget;
+        }
+        else if(move.loc >= 0 && move.loc < Board::MAX_ARR_SIZE && candIdxOfLoc[move.loc] >= 0) {
+          sparseRow->candPolicy[candIdxOfLoc[move.loc]][channel] = move.policyTarget;
+        }
+      }
+    };
+    if(policyTarget0 != NULL)
+      project(*policyTarget0, 0);
+    if(policyTarget1 != NULL)
+      project(*policyTarget1, 1);
+    rowGlobal[26] = policyTarget0 != NULL ? 1.0f : 0.0f;
+    rowGlobal[28] = policyTarget1 != NULL ? 1.0f : 0.0f;
+  }
+  else if(policyTarget0 != NULL) {
     fillPolicyTarget(*policyTarget0, policySize, dataXLen, dataYLen, board.x_size, rowPolicy + 0 * policySize);
     rowGlobal[26] = 1.0f;
   }
@@ -569,7 +617,10 @@ void TrainingWriteBuffers::addRow(
     rowGlobal[26] = 0.0f;
   }
 
-  if(policyTarget1 != NULL) {
+  if(dotsSparse) {
+    //Filled above
+  }
+  else if(policyTarget1 != NULL) {
     fillPolicyTarget(*policyTarget1, policySize, dataXLen, dataYLen, board.x_size, rowPolicy + 1 * policySize);
     rowGlobal[28] = 1.0f;
   }
@@ -723,7 +774,10 @@ void TrainingWriteBuffers::addRow(
   int scoreDistrLen = posArea*2 + NNPos::EXTRA_SCORE_DISTR_RADIUS*2;
   int scoreDistrMid = posArea + NNPos::EXTRA_SCORE_DISTR_RADIUS;
   int8_t* rowScoreDistr = scoreDistrN.data + curRows * scoreDistrLen;
-  int8_t* rowOwnership = valueTargetsNCHW.data + curRows * VALUE_SPATIAL_TARGET_NUM_CHANNELS * posArea;
+  //The spatial value targets are not used by the sparse Dots format, it writes into a scratch row then
+  int8_t* rowOwnership = valueTargetsNCHW.data + (dotsSparse ? 0 : curRows) * VALUE_SPATIAL_TARGET_NUM_CHANNELS * posArea;
+  if(dotsSparse)
+    sparseRow->pointOwnership.assign(sparseRow->input.points.size(), 0);
 
   if(finalOwnership == NULL || (actualGameEndHist.isGameFinished && actualGameEndHist.isNoResult)) {
     rowGlobal[27] = 0.0f;
@@ -776,6 +830,16 @@ void TrainingWriteBuffers::addRow(
       }
     }
 
+    if(dotsSparse) {
+      //1 if the dot ends up captured by the opponent of its owner (also by grounding of the owner)
+      const DotsSparseInput& input = sparseRow->input;
+      for(size_t i = 0; i < input.pointLocs.size(); i++) {
+        const Loc loc = input.pointLocs[i];
+        const Color owner = getPlacedDotColor(board.getState(loc));
+        sparseRow->pointOwnership[i] = finalOwnership[loc] == getOpp(owner) ? 1 : 0;
+      }
+    }
+
     //Fill score vector "onehot"-like
     for(int i = 0; i<scoreDistrLen; i++)
       rowScoreDistr[i] = 0;
@@ -812,7 +876,35 @@ void TrainingWriteBuffers::addRow(
     }
   }
 
-  if(posHistForFutureBoards == NULL) {
+  if(dotsSparse) {
+    const DotsSparseInput& input = sparseRow->input;
+    sparseRow->candFuturepos.assign(input.candidates.size(), {0, 0});
+    if(posHistForFutureBoards == NULL) {
+      rowGlobal[33] = 0.0f;
+    }
+    else {
+      const vector<Board>& boards = *posHistForFutureBoards;
+      testAssert(boards.size() == whiteValueTargets.size());
+      testAssert(boards.size() > 0);
+      rowGlobal[33] = 1.0f;
+      const int endIdx = (int)boards.size()-1;
+      const Board& board2 = boards[std::min(whiteValueTargetsIdx+8,endIdx)];
+      const Board& board3 = boards[std::min(whiteValueTargetsIdx+32,endIdx)];
+      testAssert(board2.y_size == board.y_size && board2.x_size == board.x_size);
+      testAssert(board3.y_size == board.y_size && board3.x_size == board.x_size);
+      //The placed color, not the active one: empty points inside areas are not dots
+      auto sign = [&](Color color) -> int8_t {
+        return color == nextPlayer ? 1 : color == getOpp(nextPlayer) ? -1 : 0;
+      };
+      for(size_t i = 0; i < input.candidateLocs.size(); i++) {
+        const Loc loc = input.candidateLocs[i];
+        sparseRow->candFuturepos[i] = {
+          sign(getPlacedDotColor(board2.getState(loc))), sign(getPlacedDotColor(board3.getState(loc)))
+        };
+      }
+    }
+  }
+  else if(posHistForFutureBoards == NULL) {
     rowGlobal[33] = 0.0f;
     for(int i = 0; i<posArea; i++) {
       rowOwnership[i+posArea*2] = 0;
@@ -880,7 +972,7 @@ void TrainingWriteBuffers::addRow(
 
 
   //Q values
-  {
+  if(!dotsSparse) {
     testAssert(whiteValueTargetsIdx < whiteQValueTargets.size());
     int16_t* rowQValues = qValueTargetsNCMove.data + curRows * QVALUE_SPATIAL_TARGET_NUM_CHANNELS * policySize;
     fillQValueTarget(whiteQValueTargets[whiteValueTargetsIdx].targets, nextPlayer, policySize, dataXLen, dataYLen, board.x_size, rowQValues, rand);
@@ -895,8 +987,114 @@ void TrainingWriteBuffers::addRow(
   curRows++;
 }
 
+template <typename T>
+static void writeNumpyToZip(ZipFile& zipFile, const char* name, NumpyBuffer<T>& buffer, int64_t numRows) {
+  const uint64_t numBytes = buffer.prepareHeaderWithNumRows(numRows);
+  zipFile.writeBuffer(name, buffer.dataIncludingHeader, numBytes);
+}
+
+void TrainingWriteBuffers::writeDotsSparseArrays(ZipFile& zipFile) {
+  testAssert(dotsSparseRows.size() == (size_t)curRows);
+  const int64_t n = curRows;
+  //Padded lengths, at least 1 to avoid empty dimensions
+  int64_t maxPoints = 1, maxCands = 1;
+  for(const DotsSparseRow& row : dotsSparseRows) {
+    maxPoints = std::max(maxPoints, (int64_t)row.input.points.size());
+    maxCands = std::max(maxCands, (int64_t)row.input.candidates.size());
+  }
+
+  NumpyBuffer<int8_t> boardSizeN({n, 2});
+  NumpyBuffer<int16_t> pointCountN({n});
+  NumpyBuffer<int8_t> pointCoordsNP({n, maxPoints, 2});
+  //owner, grounded, movesAgo, areaCount, areaMovesAgo, insideMy, insideOpp
+  NumpyBuffer<int16_t> pointDataNP({n, maxPoints, 7});
+  NumpyBuffer<int16_t> candCountN({n});
+  NumpyBuffer<int8_t> candCoordsNM({n, maxCands, 2});
+  NumpyBuffer<int16_t> candDataNM({n, maxCands, 4});
+  NumpyBuffer<float> groundN({n, 2});
+  NumpyBuffer<int16_t> candPolicyTargetsNM({n, maxCands, 2});
+  NumpyBuffer<int16_t> groundPolicyTargetsN({n, 2});
+  NumpyBuffer<int8_t> candFutureposTargetsNM({n, maxCands, 2});
+  NumpyBuffer<int8_t> pointOwnershipTargetsNP({n, maxPoints});
+
+  std::fill(pointCoordsNP.data, pointCoordsNP.data + pointCoordsNP.dataLen, (int8_t)0);
+  std::fill(pointDataNP.data, pointDataNP.data + pointDataNP.dataLen, (int16_t)0);
+  std::fill(candCoordsNM.data, candCoordsNM.data + candCoordsNM.dataLen, (int8_t)0);
+  std::fill(candDataNM.data, candDataNM.data + candDataNM.dataLen, (int16_t)0);
+  std::fill(candPolicyTargetsNM.data, candPolicyTargetsNM.data + candPolicyTargetsNM.dataLen, (int16_t)0);
+  std::fill(candFutureposTargetsNM.data, candFutureposTargetsNM.data + candFutureposTargetsNM.dataLen, (int8_t)0);
+  std::fill(pointOwnershipTargetsNP.data, pointOwnershipTargetsNP.data + pointOwnershipTargetsNP.dataLen, (int8_t)0);
+
+  for(int64_t r = 0; r < n; r++) {
+    const DotsSparseRow& row = dotsSparseRows[r];
+    const DotsSparseInput& in = row.input;
+    boardSizeN.data[r * 2 + 0] = (int8_t)in.xSize;
+    boardSizeN.data[r * 2 + 1] = (int8_t)in.ySize;
+
+    pointCountN.data[r] = (int16_t)in.points.size();
+    for(size_t i = 0; i < in.points.size(); i++) {
+      const auto& p = in.points[i];
+      int8_t* coords = pointCoordsNP.data + (r * maxPoints + (int64_t)i) * 2;
+      coords[0] = p.x;
+      coords[1] = p.y;
+      int16_t* data = pointDataNP.data + (r * maxPoints + (int64_t)i) * 7;
+      data[0] = p.owner;
+      data[1] = p.grounded;
+      data[2] = p.movesAgo;
+      data[3] = p.areaCount;
+      data[4] = p.areaMovesAgo;
+      data[5] = p.insideMy;
+      data[6] = p.insideOpp;
+      pointOwnershipTargetsNP.data[r * maxPoints + (int64_t)i] = row.pointOwnership[i];
+    }
+
+    candCountN.data[r] = (int16_t)in.candidates.size();
+    for(size_t i = 0; i < in.candidates.size(); i++) {
+      const auto& c = in.candidates[i];
+      const int64_t idx = r * maxCands + (int64_t)i;
+      candCoordsNM.data[idx * 2 + 0] = c.x;
+      candCoordsNM.data[idx * 2 + 1] = c.y;
+      candDataNM.data[idx * 4 + 0] = c.gainMy;
+      candDataNM.data[idx * 4 + 1] = c.gainOpp;
+      candDataNM.data[idx * 4 + 2] = c.inMyHouse;
+      candDataNM.data[idx * 4 + 3] = c.inOppHouse;
+      candPolicyTargetsNM.data[idx * 2 + 0] = row.candPolicy[i][0];
+      candPolicyTargetsNM.data[idx * 2 + 1] = row.candPolicy[i][1];
+      candFutureposTargetsNM.data[idx * 2 + 0] = row.candFuturepos[i][0];
+      candFutureposTargetsNM.data[idx * 2 + 1] = row.candFuturepos[i][1];
+    }
+    groundN.data[r * 2 + 0] = in.groundAllowed ? 1.0f : 0.0f;
+    groundN.data[r * 2 + 1] = in.groundResult;
+    groundPolicyTargetsN.data[r * 2 + 0] = row.groundPolicy[0];
+    groundPolicyTargetsN.data[r * 2 + 1] = row.groundPolicy[1];
+  }
+
+  writeNumpyToZip(zipFile, "boardSizeN", boardSizeN, n);
+  writeNumpyToZip(zipFile, "globalInputNC", globalInputNC, n);
+  writeNumpyToZip(zipFile, "pointCountN", pointCountN, n);
+  writeNumpyToZip(zipFile, "pointCoordsNP", pointCoordsNP, n);
+  writeNumpyToZip(zipFile, "pointDataNP", pointDataNP, n);
+  writeNumpyToZip(zipFile, "candCountN", candCountN, n);
+  writeNumpyToZip(zipFile, "candCoordsNM", candCoordsNM, n);
+  writeNumpyToZip(zipFile, "candDataNM", candDataNM, n);
+  writeNumpyToZip(zipFile, "groundN", groundN, n);
+  writeNumpyToZip(zipFile, "candPolicyTargetsNM", candPolicyTargetsNM, n);
+  writeNumpyToZip(zipFile, "groundPolicyTargetsN", groundPolicyTargetsN, n);
+  writeNumpyToZip(zipFile, "candFutureposTargetsNM", candFutureposTargetsNM, n);
+  writeNumpyToZip(zipFile, "pointOwnershipTargetsNP", pointOwnershipTargetsNP, n);
+  writeNumpyToZip(zipFile, "globalTargetsNC", globalTargetsNC, n);
+  writeNumpyToZip(zipFile, "scoreDistrN", scoreDistrN, n);
+  //libzip reads the buffers only when closing, so close while the local buffers are alive
+  zipFile.close();
+}
+
 void TrainingWriteBuffers::writeToZipFile(const string& fileName) {
   ZipFile zipFile(fileName);
+
+  if(dotsSparse) {
+    writeDotsSparseArrays(zipFile);
+    return;
+  }
 
   uint64_t numBytes;
 
@@ -931,6 +1129,22 @@ void TrainingWriteBuffers::writeToZipFile(const string& fileName) {
 
 void TrainingWriteBuffers::writeToTextOstream(ostream& out) {
   int64_t len;
+
+  if(dotsSparse) {
+    //Debug output of the sparse format: the inputs and the targets of every row
+    for(int r = 0; r < curRows; r++) {
+      const DotsSparseRow& row = dotsSparseRows[r];
+      nlohmann::json json;
+      json["input"] = row.input.toJson();
+      json["candPolicy"] = row.candPolicy;
+      json["groundPolicy"] = row.groundPolicy;
+      json["candFuturepos"] = row.candFuturepos;
+      json["pointOwnership"] = row.pointOwnership;
+      json["globalTargets"] = std::vector<float>(globalTargetsNC.data + r * GLOBAL_TARGET_NUM_CHANNELS, globalTargetsNC.data + (r + 1) * GLOBAL_TARGET_NUM_CHANNELS);
+      out << json.dump() << endl;
+    }
+    return;
+  }
 
   auto printHeader = [&out](const char* dataIncludingHeader) {
     //In actuality our headers aren't that long, so we cut it off at half the total header bytes

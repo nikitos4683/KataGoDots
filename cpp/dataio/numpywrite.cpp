@@ -204,6 +204,13 @@ uint64_t NumpyBuffer<T>::prepareHeaderWithNumRows(int64_t numWriteableRows) {
         throw StringError("Numpy header is too long, datatype and shape are too long");
     }
   }
+  //A one-element tuple needs a trailing comma in Python syntax
+  if(shape.size() == 1) {
+    s[idx] = ',';
+    idx += 1;
+    if(idx >= TOTAL_HEADER_BYTES)
+      throw StringError("Numpy header is too long, datatype and shape are too long");
+  }
   //Finish
   s[idx] = ')'; //close tuple for shape
   idx += 1;

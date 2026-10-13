@@ -1024,6 +1024,19 @@ Hash128 NNInputs::getHash(
     hash.hash1 = Hash::rrmxmx(hash.hash1 + hash.hash0 + (uint64_t)policyOptimismDiscretized);
   }
 
+  //Fold in the recent moves for Dots: the sparse inputs mark the dots and the areas of the last moves,
+  //so the cache key covers the whole input.
+  if(hist.rules.isDots && nnInputParams.maxHistory > 0) {
+    const int historyLen = static_cast<int>(hist.moveHistory.size());
+    const int numMoves = std::min(std::min(DOTS_SPARSE_MAX_MOVES_AGO, nnInputParams.maxHistory), historyLen);
+    for(int i = 0; i < numMoves; i++) {
+      const Move& move = hist.moveHistory[historyLen - 1 - i];
+      const uint64_t value = (static_cast<uint64_t>(move.loc) << 16) ^ (static_cast<uint64_t>(move.pla) << 8) ^ static_cast<uint64_t>(i + 1);
+      hash.hash0 = Hash::splitMix64(hash.hash0 + value);
+      hash.hash1 = Hash::rrmxmx(hash.hash1 ^ (value * 0x9E3779B97F4A7C15ULL));
+    }
+  }
+
   return hash;
 }
 
@@ -1057,6 +1070,7 @@ int NNInputs::getNumberOfSpatialFeatures(const int version, const bool isDots) {
     case 5: if (!isDots) return NUM_FEATURES_SPATIAL_V5; break;
     case 6: if (!isDots) return NUM_FEATURES_SPATIAL_V6; break;
     case 7: return NUM_FEATURES_SPATIAL_V7; // Use NUM_FEATURES_SPATIAL_V7_DOTS if it's value is changed
+    case 8: if (isDots) return 0; break; // Sparse Dots format has no spatial features
     default: break;
   }
   throw std::range_error("Invalid input version: " + to_string(version) + (isDots ? " (Dots game)" : ""));
@@ -1069,6 +1083,7 @@ int NNInputs::getNumberOfGlobalFeatures(const int version, const bool isDots) {
     case 5: if (!isDots) return NUM_FEATURES_GLOBAL_V5; break;
     case 6: if (!isDots) return NUM_FEATURES_GLOBAL_V6; break;
     case 7: return NUM_FEATURES_GLOBAL_V7;  // Use NUM_FEATURES_GLOBAL_V7_DOTS if it's value is changed
+    case 8: if (isDots) return NUM_FEATURES_GLOBAL_DOTS_SPARSE; break;
     default: break;
   }
   throw std::range_error("Invalid input version: " + to_string(version) + (isDots ? " (Dots game)" : ""));
