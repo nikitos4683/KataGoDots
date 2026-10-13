@@ -1352,7 +1352,7 @@ struct GTPEngine {
       //Implement cleanupBeforePass hack - if the bot wants to pass, instead cleanup if there is something to clean
       //and we are in a ruleset where this is necessary or the user has configured it.
       moveLoc = PlayUtils::maybeCleanupBeforePass(gargs.cleanupBeforePass, gargs.friendlyPass, pla, moveLoc, bot);
-    } else if (hist.isGroundReasonable(search->getRootBoard())) {
+    } else if (hist.isGroundReasonable(search->getRootBoard(), pla)) {
       moveLoc = Board::PASS_LOC;
     }
 

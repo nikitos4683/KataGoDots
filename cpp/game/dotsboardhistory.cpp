@@ -12,8 +12,11 @@ void BoardHistory::setPresumedNextMovePla(const Player pla) {
   presumedNextMovePla = pla;
 }
 
-bool BoardHistory::isGroundReasonable(const Board& board) const {
-  return !std::isnan(whiteScoreIfGroundingAlive(board));
+bool BoardHistory::isGroundReasonable(const Board& board, const Player pla) const {
+  // Not NaN when some player wins by grounding (both players can't) or when all dots are grounded
+  const float whiteScore = whiteScoreIfGroundingAlive(board);
+  if (std::isnan(whiteScore)) return false;
+  return pla == P_WHITE ? whiteScore >= 0.0f : whiteScore <= 0.0f;
 }
 
 bool BoardHistory::isResignReasonable(const Board& board, const Player pla) const {

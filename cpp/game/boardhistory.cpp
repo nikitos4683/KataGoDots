@@ -953,7 +953,7 @@ std::vector<Loc> BoardHistory::getReasonableMoves(
   }
 
   // We need at least one reasonable move. If there is no any move on board, add the PASS (GROUND) move
-  if (banMove != Board::PASS_LOC && (!isDots || result.empty() || isGroundReasonable(board))) {
+  if (banMove != Board::PASS_LOC && (!isDots || result.empty() || isGroundReasonable(board, currentPla))) {
     result.push_back(Board::PASS_LOC);
   }
 

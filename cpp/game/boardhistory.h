@@ -235,8 +235,9 @@ struct BoardHistory {
   //this keeps the moves played so far, which the evaluation of a Dots position depends on.
   void setPresumedNextMovePla(Player pla);
 
-  // Returns true if all dots are grounded or some player wins by grounding
-  bool isGroundReasonable(const Board& board) const;
+  // Returns true if the player doesn't lose by grounding now: the player wins by grounding,
+  // or all dots are grounded and the game is a draw
+  bool isGroundReasonable(const Board& board, Player pla) const;
   // Returns true if opp player wins by grounding
   bool isResignReasonable(const Board& board, Player pla) const;
   // Returns true if all dots are grounded or pla can win by grounding without losing any dot
