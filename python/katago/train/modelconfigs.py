@@ -2140,25 +2140,19 @@ for name, base_config in list(config_of_name.items()):
 # Sparse Dots models (model version 18), see docs/DotsSparseNN.md --------------------------------------------------
 # For Dots, every transformer config name gives the sparse model with the same trunk: the convolutional stem is
 # replaced by token embeddings and the policy head by a candidate decoder. Optional suffixes for comparisons:
-#   -arnone  areas have no RoPE positions (NoPE) instead of the mean over their boundary
 #   -dec1    one candidate decoder layer instead of two
 SPARSE_DOTS_VERSION = 18
 SPARSE_DOTS_SUFFIXES = {
-    "-arnone": {"area_rope": "none"},
     "-dec1": {"candidate_decoder_layers": 1},
-    "-noab": {"area_boundary_attention": False},
 }
 
 def make_sparse_dots_config(config: ModelConfig, overrides: Dict[str,Any] = None) -> ModelConfig:
     result = dict(config)
     result["version"] = SPARSE_DOTS_VERSION
     result["sparse_dots"] = True
-    result.setdefault("area_rope", "mean")
     result.setdefault("candidate_decoder_layers", 2)
     result.setdefault("candidate_decoder_channels", config["mid_num_channels"])
     result.setdefault("candidate_decoder_ffn_channels", config["transformer_ffn_channels"])
-    result.setdefault("vertex_encoder_channels", 192)
-    result.setdefault("area_boundary_attention", True)
     if overrides:
         result.update(overrides)
     return result

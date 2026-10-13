@@ -42,14 +42,9 @@ namespace SparseDotsNN {
   };
 
   // Input features of the tokens, shared with the GPU backends
-  constexpr int NUM_POINT_FEATURES = 12;
-  constexpr int NUM_VERTEX_FEATURES = 24;
-  // log1p(boundary length) and the 10 area scalars, concatenated after the vertex mean and max
-  constexpr int NUM_AREA_SCALAR_FEATURES = 11;
+  constexpr int NUM_POINT_FEATURES = 19;
   constexpr int NUM_CAND_FEATURES = 8;
   void pointFeatures(const DotsSparseInput& input, int i, float* out);
-  void vertexFeatures(const DotsSparseInput& input, int i, float* out);
-  void areaScalarFeatures(const DotsSparseInput& input, int a, float* out);
   void candidateFeatures(const DotsSparseInput& input, int i, float* out);
   float groundFeature(const DotsSparseInput& input);
 

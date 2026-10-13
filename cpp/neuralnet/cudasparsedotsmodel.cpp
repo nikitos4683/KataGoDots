@@ -147,8 +147,6 @@ struct TrunkBlock {
   vector<unique_ptr<Attention>> attentions;
   vector<unique_ptr<FFN>> ffns;
   vector<bool> isAttention;
-  // Output projections of the area boundary attention, one per attention sub-block (empty if disabled)
-  vector<unique_ptr<Linear>> boundaryOut;
   DeviceBuf postScale, postBias;
   int postActivation = ACTIVATION_IDENTITY;
   Linear postConv;
@@ -215,19 +213,11 @@ struct SparseDotsCudaModel::Impl {
     }
   }
 
-  bool areaRopeMean;
   int trunkChannels;
   int midChannels;
-  int vertexChannels;
   int decoderChannels;
 
   Linear point;
-  Linear vertex1;
-  int vertexActivation;
-  Linear vertex2;
-  Linear area1;
-  int areaActivation;
-  Linear area2;
   DeviceBuf globalToken;
   Linear global;
 
@@ -260,37 +250,25 @@ struct SparseDotsCudaModel::Impl {
   // Work buffers
   DeviceBuf inputDev;
   DeviceBuf seqF, trunkH, tmp, mid, midN, q, k, v, att, ffA, ffG, delta, cosT, sinT, maskH, sumSq;
-  DeviceBuf boundaryAtt, boundaryDelta;
-  DeviceBuf pointEmb, vertexH1, vertexH, areaH1, areaH, globalProj;
+  DeviceBuf pointEmb, globalProj;
   DeviceBuf pooled, poolProj, queries, queriesNorm, candEmb, groundEmb, dq, dk, dv, datt, dffA, dffG;
   DeviceBuf queriesF, cosQ, sinQ, policyH, policy;
   DeviceBuf outV1, pooledV, outV2, value, scoreValue, ownershipOut;
 
   Impl(const SparseDotsDesc& desc, bool fp16, bool mma, cudaStream_t stream_, cublasHandle_t cublas_, Logger* logger_)
     : useFP16(fp16), useMmaAttention(mma && fp16), stream(stream_), cublas(cublas_), logger(logger_) {
-    areaRopeMean = desc.areaRopeMean;
     trunkChannels = desc.trunkNumChannels;
     midChannels = desc.midNumChannels;
-    vertexChannels = desc.vertexMul1.outChannels;
     decoderChannels = desc.decoderNumChannels;
     testAssert(desc.numPointFeatures == SparseDotsNN::NUM_POINT_FEATURES);
-    testAssert(desc.numVertexFeatures == SparseDotsNN::NUM_VERTEX_FEATURES);
     testAssert(desc.numCandFeatures == SparseDotsNN::NUM_CAND_FEATURES);
     testAssert(desc.numGlobalFeatures == NNInputs::NUM_FEATURES_GLOBAL_DOTS_SPARSE);
-    testAssert(desc.areaMul1.inChannels == 2 * vertexChannels + SparseDotsNN::NUM_AREA_SCALAR_FEATURES);
 
     point.init(desc.pointMul, &desc.pointBias, false);
-    vertex1.init(desc.vertexMul1, &desc.vertexBias1, false);
-    vertexActivation = desc.vertexActivation.activation;
-    vertex2.init(desc.vertexMul2, &desc.vertexBias2, false);
-    area1.init(desc.areaMul1, &desc.areaBias1, false);
-    areaActivation = desc.areaActivation.activation;
-    area2.init(desc.areaMul2, &desc.areaBias2, false);
     testAssert(desc.globalToken.numChannels == trunkChannels);
     globalToken.upload(desc.globalToken.name, desc.globalToken.weights, false);
     global.init(desc.globalMul, nullptr, false);
 
-    size_t numBoundaryOut = 0;
     for(const auto& blockPair : desc.blocks) {
       testAssert(blockPair.first == NESTED_BOTTLENECK_BLOCK_KIND);
       const auto& nested = *static_cast<const NestedBottleneckResidualBlockDesc*>(blockPair.second.get());
@@ -310,11 +288,6 @@ struct SparseDotsCudaModel::Impl {
           maxHP = std::max(maxHP, attention->numKVHeadPairs());
           block->attentions.push_back(std::move(attention));
           block->isAttention.push_back(true);
-          if(desc.areaBoundaryAttention) {
-            auto boundaryOut = std::make_unique<Linear>();
-            boundaryOut->init(desc.trunkBoundaryOut[numBoundaryOut++], nullptr, useFP16);
-            block->boundaryOut.push_back(std::move(boundaryOut));
-          }
         }
         else {
           testAssert(sub.first == TRANSFORMER_FFN_BLOCK_KIND);
@@ -332,7 +305,6 @@ struct SparseDotsCudaModel::Impl {
       testAssert(block->preConv.outC == midChannels && block->postConv.outC == trunkChannels);
       blocks.push_back(std::move(block));
     }
-    testAssert(numBoundaryOut == desc.trunkBoundaryOut.size());
     tipGamma.upload(desc.trunkTipRMSNorm.name, desc.trunkTipRMSNorm.gamma, false);
     tipBeta.upload(desc.trunkTipRMSNorm.name, desc.trunkTipRMSNorm.beta, false);
     tipEpsilon = desc.trunkTipRMSNorm.epsilon;
@@ -402,12 +374,10 @@ struct SparseDotsCudaModel::Impl {
     int n = 0;    // number of positions
     int s = 0;    // padded trunk tokens per position
     int qLen = 0; // padded candidate queries per position
-    int totalPoints = 0, totalAreas = 0, totalVertices = 0, totalCands = 0, totalGrounds = 0;
+    int totalPoints = 0, totalCands = 0, totalGrounds = 0;
     int totalTokPos = 0, totalCandPos = 0;
     // Device pointers into inputDev
     float* pointFeat; int* pointDst;
-    float* vertexFeat; int* vertexSeg; int* vertexPointRow;
-    float* areaAgg; int* areaDst;
     float* global;
     float* mask; float* numTokens; float* boardOffset;
     int* tokSeg; float* tokPos;
@@ -422,31 +392,21 @@ struct SparseDotsCudaModel::Impl {
     int maxQueries = 1;
     for(const DotsSparseInput* in : inputs) {
       const int numPoints = (int)in->points.size();
-      const int numAreas = (int)in->areas.size();
-      maxTokens = std::max(maxTokens, 1 + numPoints + numAreas);
+      maxTokens = std::max(maxTokens, 1 + numPoints);
       maxQueries = std::max(maxQueries, (int)in->candidates.size() + (in->groundAllowed ? 1 : 0));
       b.totalPoints += numPoints;
-      b.totalAreas += numAreas;
-      b.totalVertices += (int)in->vertices.size();
       b.totalCands += (int)in->candidates.size();
       b.totalGrounds += in->groundAllowed ? 1 : 0;
-      b.totalTokPos += numPoints + (areaRopeMean ? (int)in->vertices.size() : 0);
+      b.totalTokPos += numPoints;
       b.totalCandPos += (int)in->candidates.size();
     }
     b.s = (maxTokens + SEQ_LEN_ALIGN - 1) / SEQ_LEN_ALIGN * SEQ_LEN_ALIGN;
     b.qLen = maxQueries;
     const int numTokens = b.n * b.s;
     const int numQueries = b.n * b.qLen;
-    const int aggC = 2 * vertexChannels + SparseDotsNN::NUM_AREA_SCALAR_FEATURES;
-
     host.size = 0;
     const size_t oPointFeat = host.reserve(sizeof(float) * b.totalPoints * SparseDotsNN::NUM_POINT_FEATURES);
     const size_t oPointDst = host.reserve(sizeof(int) * b.totalPoints);
-    const size_t oVertexFeat = host.reserve(sizeof(float) * b.totalVertices * SparseDotsNN::NUM_VERTEX_FEATURES);
-    const size_t oVertexSeg = host.reserve(sizeof(int) * (b.totalAreas + 1));
-    const size_t oVertexPointRow = host.reserve(sizeof(int) * b.totalVertices);
-    const size_t oAreaAgg = host.reserve(sizeof(float) * (size_t)b.totalAreas * aggC);
-    const size_t oAreaDst = host.reserve(sizeof(int) * b.totalAreas);
     const size_t oGlobal = host.reserve(sizeof(float) * b.n * NNInputs::NUM_FEATURES_GLOBAL_DOTS_SPARSE);
     const size_t oMask = host.reserve(sizeof(float) * numTokens);
     const size_t oNumTokens = host.reserve(sizeof(float) * b.n);
@@ -464,11 +424,6 @@ struct SparseDotsCudaModel::Impl {
     char* h = host.data.data();
     float* pointFeat = (float*)(h + oPointFeat);
     int* pointDst = (int*)(h + oPointDst);
-    float* vertexFeat = (float*)(h + oVertexFeat);
-    int* vertexSeg = (int*)(h + oVertexSeg);
-    int* vertexPointRow = (int*)(h + oVertexPointRow);
-    float* areaAgg = (float*)(h + oAreaAgg);
-    int* areaDst = (int*)(h + oAreaDst);
     float* global = (float*)(h + oGlobal);
     float* mask = (float*)(h + oMask);
     float* numTokensHost = (float*)(h + oNumTokens);
@@ -482,41 +437,23 @@ struct SparseDotsCudaModel::Impl {
     int* candSeg = (int*)(h + oCandSeg);
     float* candPos = (float*)(h + oCandPos);
 
-    int pointRow = 0, vertexRow = 0, areaRow = 0, candRow = 0, groundRow = 0, tokPosRow = 0, candPosRow = 0;
+    int pointRow = 0, candRow = 0, groundRow = 0, tokPosRow = 0, candPosRow = 0;
     for(int n = 0; n < b.n; n++) {
       const DotsSparseInput& in = *inputs[n];
       const int numPoints = (int)in.points.size();
-      const int numAreas = (int)in.areas.size();
       const int numCands = (int)in.candidates.size();
       const int tokenBase = n * b.s;
       std::copy(in.global, in.global + NNInputs::NUM_FEATURES_GLOBAL_DOTS_SPARSE,
                 global + (size_t)n * NNInputs::NUM_FEATURES_GLOBAL_DOTS_SPARSE);
-      for(int t = 0; t < 1 + numPoints + numAreas; t++)
+      for(int t = 0; t < 1 + numPoints; t++)
         mask[tokenBase + t] = 1.0f;
-      numTokensHost[n] = (float)(1 + numPoints + numAreas);
+      numTokensHost[n] = (float)(1 + numPoints);
       boardOffset[n] = sqrtf((float)in.xSize * (float)in.ySize) - 14.0f;
 
       for(int i = 0; i < numPoints; i++) {
         SparseDotsNN::pointFeatures(in, i, pointFeat + (size_t)(pointRow + i) * SparseDotsNN::NUM_POINT_FEATURES);
         pointDst[pointRow + i] = tokenBase + 1 + i;
       }
-      const int vertexBase = vertexRow;
-      testAssert(in.vertexPoints.size() == in.vertices.size());
-      for(int i = 0; i < (int)in.vertices.size(); i++) {
-        SparseDotsNN::vertexFeatures(in, i, vertexFeat + (size_t)(vertexRow + i) * SparseDotsNN::NUM_VERTEX_FEATURES);
-        vertexPointRow[vertexRow + i] = tokenBase + 1 + in.vertexPoints[i];
-      }
-      int expectedStart = 0;
-      for(int a = 0; a < numAreas; a++) {
-        const auto& area = in.areas[a];
-        testAssert(area.vertexStart == expectedStart);
-        expectedStart += area.boundaryLen;
-        vertexSeg[areaRow + a] = vertexBase + area.vertexStart;
-        SparseDotsNN::areaScalarFeatures(in, a, areaAgg + (size_t)(areaRow + a) * aggC + 2 * vertexChannels);
-        areaDst[areaRow + a] = tokenBase + 1 + numPoints + a;
-      }
-      testAssert(expectedStart == (int)in.vertices.size());
-
       // RoPE positions of the trunk tokens: GLOBAL and padding have none
       tokSeg[tokenBase] = tokPosRow;
       for(int t = 1; t < b.s; t++) {
@@ -527,17 +464,6 @@ struct SparseDotsCudaModel::Impl {
           tokPos[3 * tokPosRow + 1] = p.y;
           tokPos[3 * tokPosRow + 2] = 1.0f;
           tokPosRow++;
-        }
-        else if(t <= numPoints + numAreas && areaRopeMean) {
-          const auto& area = in.areas[t - 1 - numPoints];
-          const float weight = 1.0f / (float)std::max<int>(1, area.boundaryLen);
-          for(int vtx = 0; vtx < area.boundaryLen; vtx++) {
-            const auto& vertex = in.vertices[area.vertexStart + vtx];
-            tokPos[3 * tokPosRow] = vertex.x;
-            tokPos[3 * tokPosRow + 1] = vertex.y;
-            tokPos[3 * tokPosRow + 2] = weight;
-            tokPosRow++;
-          }
         }
       }
 
@@ -563,11 +489,8 @@ struct SparseDotsCudaModel::Impl {
       }
 
       pointRow += numPoints;
-      vertexRow += (int)in.vertices.size();
-      areaRow += numAreas;
       candRow += numCands;
     }
-    vertexSeg[b.totalAreas] = b.totalVertices;
     tokSeg[numTokens] = tokPosRow;
     candSeg[numQueries] = candPosRow;
     testAssert(tokPosRow == b.totalTokPos && candPosRow == b.totalCandPos && groundRow == b.totalGrounds);
@@ -577,11 +500,6 @@ struct SparseDotsCudaModel::Impl {
     CUDA_ERR("SparseDotsCudaModel", cudaMemcpyAsync(d, h, host.size, cudaMemcpyHostToDevice, stream));
     b.pointFeat = (float*)(d + oPointFeat);
     b.pointDst = (int*)(d + oPointDst);
-    b.vertexFeat = (float*)(d + oVertexFeat);
-    b.vertexSeg = (int*)(d + oVertexSeg);
-    b.vertexPointRow = (int*)(d + oVertexPointRow);
-    b.areaAgg = (float*)(d + oAreaAgg);
-    b.areaDst = (int*)(d + oAreaDst);
     b.global = (float*)(d + oGlobal);
     b.mask = (float*)(d + oMask);
     b.numTokens = (float*)(d + oNumTokens);
@@ -620,17 +538,11 @@ struct SparseDotsCudaModel::Impl {
     ffA.ensure(tokens * maxFFN * actBytes);
     ffG.ensure(tokens * maxFFN * actBytes);
     delta.ensure(tokens * m * actBytes);
-    boundaryAtt.ensure((size_t)b.totalAreas * maxAttDim * actBytes);
-    boundaryDelta.ensure((size_t)b.totalAreas * m * actBytes);
     cosT.ensure(tokens * std::max(maxHP, maxDecHP) * fb);
     sinT.ensure(tokens * std::max(maxHP, maxDecHP) * fb);
     sumSq.ensure(b.n * fb);
 
     pointEmb.ensure((size_t)b.totalPoints * c * fb);
-    vertexH1.ensure((size_t)b.totalVertices * vertexChannels * fb);
-    vertexH.ensure((size_t)b.totalVertices * vertexChannels * fb);
-    areaH1.ensure((size_t)b.totalAreas * area1.outC * fb);
-    areaH.ensure((size_t)b.totalAreas * c * fb);
     globalProj.ensure((size_t)b.n * c * fb);
 
     pooled.ensure((size_t)b.n * 3 * c * fb);
@@ -662,7 +574,7 @@ struct SparseDotsCudaModel::Impl {
   }
 
   template <typename T>
-  void trunkAttention(const Attention& layer, const Linear* boundaryOut, const Batch& b) {
+  void trunkAttention(const Attention& layer, const Batch& b) {
     const long long rows = (long long)b.n * b.s;
     T* midT = (T*)mid.ptr;
     T* midNT = (T*)midN.ptr;
@@ -697,15 +609,6 @@ struct SparseDotsCudaModel::Impl {
                              layer.vHeadDim, stream);
     gemm(layer.out, attT, rows, delta.ptr);
     sparseDotsResidualAdd<T>(midT, (const T*)delta.ptr, b.mask, rows, midChannels, stream);
-
-    // The areas also attend to the points of their own boundary only, with the same q, k, v
-    if(boundaryOut != nullptr && b.totalAreas > 0) {
-      sparseDotsBoundaryAttention<T>(
-        qT, kT, vT, b.areaDst, b.vertexSeg, b.vertexPointRow, (T*)boundaryAtt.ptr, b.totalAreas, layer.numHeads,
-        layer.numKVHeads, layer.qHeadDim, layer.vHeadDim, stream);
-      gemm(*boundaryOut, boundaryAtt.ptr, b.totalAreas, boundaryDelta.ptr);
-      sparseDotsScatterAddRows<T>((const T*)boundaryDelta.ptr, midT, b.areaDst, b.totalAreas, midChannels, stream);
-    }
   }
 
   template <typename T>
@@ -737,10 +640,8 @@ struct SparseDotsCudaModel::Impl {
       size_t attentionIdx = 0;
       size_t ffnIdx = 0;
       for(bool isAttention : block->isAttention) {
-        if(isAttention) {
-          const Linear* boundaryOut = block->boundaryOut.empty() ? nullptr : block->boundaryOut[attentionIdx].get();
-          trunkAttention<T>(*block->attentions[attentionIdx++], boundaryOut, b);
-        }
+        if(isAttention)
+          trunkAttention<T>(*block->attentions[attentionIdx++], b);
         else
           ffnResidual<T>(*block->ffns[ffnIdx++], midT, midNT, (T*)ffA.ptr, (T*)ffG.ptr, b.mask, rows);
       }
@@ -814,15 +715,6 @@ struct SparseDotsCudaModel::Impl {
     CUDA_ERR("SparseDotsCudaModel", cudaMemsetAsync(seq, 0, sizeof(float) * tokens * c, stream));
     gemm(point, b.pointFeat, b.totalPoints, pointEmb.ptr);
     sparseDotsScatterRows(pointEmb.f(), seq, b.pointDst, b.totalPoints, c, stream);
-    if(b.totalAreas > 0) {
-      const int aggC = 2 * vertexChannels + SparseDotsNN::NUM_AREA_SCALAR_FEATURES;
-      gemm(vertex1, b.vertexFeat, b.totalVertices, vertexH1.ptr, false, vertexActivation);
-      gemm(vertex2, vertexH1.ptr, b.totalVertices, vertexH.ptr);
-      sparseDotsSegmentMeanMax(vertexH.f(), b.vertexSeg, b.totalAreas, vertexChannels, b.areaAgg, aggC, stream);
-      gemm(area1, b.areaAgg, b.totalAreas, areaH1.ptr, false, areaActivation);
-      gemm(area2, areaH1.ptr, b.totalAreas, areaH.ptr);
-      sparseDotsScatterRows(areaH.f(), seq, b.areaDst, b.totalAreas, c, stream);
-    }
     gemm(global, b.global, b.n, globalProj.ptr);
     sparseDotsAddGlobal(seq, globalToken.f(), globalProj.f(), b.mask, b.n, b.s, c, stream);
 

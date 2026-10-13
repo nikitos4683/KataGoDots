@@ -55,8 +55,6 @@ CLIFF_OVERHEAD_BYTES_PER_FILE = 1650
 SPARSE_ARRAY_NAMES = [
     "boardSizeN", "globalInputNC",
     "pointCountN", "pointCoordsNP", "pointDataNP",
-    "areaCountN", "areaDataNA",
-    "vertexCountN", "vertexCoordsNV", "vertexAreaNV",
     "candCountN", "candCoordsNM", "candDataNM",
     "groundN",
     "candPolicyTargetsNM", "groundPolicyTargetsN", "candFutureposTargetsNM", "pointOwnershipTargetsNP",
@@ -65,8 +63,6 @@ SPARSE_ARRAY_NAMES = [
 # Padded arrays and the count array giving their real length along axis 1
 SPARSE_PADDED_ARRAYS = {
     "pointCoordsNP": "pointCountN", "pointDataNP": "pointCountN", "pointOwnershipTargetsNP": "pointCountN",
-    "areaDataNA": "areaCountN",
-    "vertexCoordsNV": "vertexCountN", "vertexAreaNV": "vertexCountN",
     "candCoordsNM": "candCountN", "candDataNM": "candCountN", "candPolicyTargetsNM": "candCountN",
     "candFutureposTargetsNM": "candCountN",
 }

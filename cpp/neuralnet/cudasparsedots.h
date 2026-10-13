@@ -3,7 +3,7 @@
 
 // CUDA kernels of the sparse Dots models (model version 18), see docs/DotsSparseNN.md and cudasparsedotsmodel.h.
 // Token sequences are laid out as [batch, seqLen, channels] (row-major), the trunk tokens of a row being
-// [GLOBAL][POINT x P][AREA x A] followed by padding. Positions of tokens for RoPE are weighted sets given by
+// [GLOBAL][POINT x P] followed by padding. Positions of tokens for RoPE are weighted sets given by
 // segments: token t owns the entries [segStart[t], segStart[t+1]) of posXYW (x, y, weight).
 // Activations T are float or half, parameters (scales, biases, norm weights, masks) are always float, and all
 // the arithmetic is in float. A mask (may be null where noted) has one value per row (token).
@@ -26,11 +26,6 @@ void sparseDotsAddGlobal(
 // x[n, l, :] += v[n, :]
 void sparseDotsAddRowVector(float* x, const float* v, int batchSize, int len, int channels, cudaStream_t stream);
 
-// For every segment a with entries [segStart[a], segStart[a+1]) of h [entries, channels]:
-// out[a, 0:channels] = mean, out[a, channels:2*channels] = max (zeros for an empty segment).
-void sparseDotsSegmentMeanMax(
-  const float* h, const int* segStart, int numSegments, int channels, float* out, int outStride, cudaStream_t stream);
-
 // out = act(in * scale + bias) * mask
 template <typename T>
 void sparseDotsScaleBiasAct(
@@ -46,10 +41,6 @@ template <typename T>
 void sparseDotsRMSNorm(
   const T* in, T* out, const float* weight, const float* mask, long long rows, int channels, float epsilon,
   cudaStream_t stream);
-
-// dst[dstRows[r], :] += src[r, :] for r < numRows
-template <typename T>
-void sparseDotsScatterAddRows(const T* src, T* dst, const int* dstRows, int numRows, int channels, cudaStream_t stream);
 
 // x += delta * mask (mask may be null)
 template <typename T>
@@ -87,16 +78,6 @@ template <typename T>
 void sparseDotsAttention(
   const T* Q, const T* K, const T* V, const float* kvMask, T* output,
   int batchSize, int qLen, int kvLen, int numHeads, int numKVHeads, int qHeadDim, int vHeadDim, cudaStream_t stream);
-
-// Attention of each area to the points of its boundary only. Q [tokens, numHeads, qHeadDim],
-// K [tokens, numKVHeads, qHeadDim], V [tokens, numKVHeads, vHeadDim] (dense rows). Area a is the token areaRows[a],
-// its boundary is the tokens vertexRows[e] for e in [segStart[a], segStart[a+1]).
-// Output [numAreas, numHeads, vHeadDim], zeros for an area without vertices.
-// Head dims (16, 16), (32, 32) and (64, 64) are supported.
-template <typename T>
-void sparseDotsBoundaryAttention(
-  const T* Q, const T* K, const T* V, const int* areaRows, const int* segStart, const int* vertexRows, T* output,
-  int numAreas, int numHeads, int numKVHeads, int qHeadDim, int vHeadDim, cudaStream_t stream);
 
 // Pooling over the valid tokens of x [batch, seqLen, channels], out [batch, 3 * channels]:
 // gpool mode:  [mean, mean * off / 10, max]

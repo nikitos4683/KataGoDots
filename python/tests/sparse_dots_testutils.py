@@ -9,7 +9,7 @@ import torch
 from katago.train import modelconfigs
 
 
-def tiny_sparse_config(area_rope="mean", decoder_layers=2, boundary_attention=True):
+def tiny_sparse_config(decoder_layers=2):
     config = dict(modelconfigs.config_of_name["b5c384h6nbttflrs-fson-silu-rsnh"])
     config.update({
         "trunk_num_channels": 64,
@@ -24,12 +24,9 @@ def tiny_sparse_config(area_rope="mean", decoder_layers=2, boundary_attention=Tr
         "num_scorebeliefs": 2,
     })
     return modelconfigs.make_sparse_dots_config(config, {
-        "area_rope": area_rope,
         "candidate_decoder_layers": decoder_layers,
         "candidate_decoder_channels": 32,
         "candidate_decoder_ffn_channels": 64,
-        "vertex_encoder_channels": 24,
-        "area_boundary_attention": boundary_attention,
     })
 
 
@@ -39,25 +36,16 @@ def random_row(rng: random.Random, x_size: int, y_size: int) -> Dict:
     num_points = rng.randint(0, min(14, len(cells) // 3))
     points = cells[:num_points]
     rest = cells[num_points:]
-    areas = []
-    vertices = []
-    vertex_area = []
-    # Boundaries are made of the points of the position, as in the engine
-    for a in range(rng.randint(0, 3) if len(points) >= 4 else 0):
-        boundary = rng.sample(points, rng.randint(4, min(8, len(points))))
-        areas.append([rng.randint(0, 1), rng.randint(0, 1), rng.randint(0, 5), rng.randint(0, 6), rng.randint(0, 6), len(boundary)])
-        vertices.extend(boundary)
-        vertex_area.extend([a] * len(boundary))
     num_cands = rng.randint(0, min(12, len(rest)))
     cands = rest[:num_cands]
     ground_allowed = 1 if (num_cands == 0 or rng.random() < 0.5) else 0
     row = {
         "boardSizeN": [x_size, y_size],
         "globalInputNC": [rng.uniform(-1, 1) for _ in range(8)],
-        "points": [(x, y, rng.randint(0, 1), rng.randint(0, 1), rng.randint(0, 5)) for (x, y) in points],
-        "areas": areas,
-        "vertices": vertices,
-        "vertexArea": vertex_area,
+        # x, y, owner, grounded, movesAgo, areaCount, areaMovesAgo, insideMy, insideOpp
+        "points": [(x, y, rng.randint(0, 1), rng.randint(0, 1), rng.randint(0, 5), area_count,
+                    rng.randint(0, 5) if area_count else 0, rng.randint(0, 9) * area_count, rng.randint(0, 9) * area_count)
+                   for (x, y) in points for area_count in [rng.choice([0, 0, 1, 1, 2])]],
         "cands": [(x, y, rng.randint(-3, 3), rng.randint(-3, 3), rng.randint(0, 1), rng.randint(0, 1)) for (x, y) in cands],
         "groundN": [ground_allowed, rng.uniform(-10, 10)],
     }
@@ -91,20 +79,13 @@ def collate(rows: List[Dict], pad_extra: int = 0, score_len: int = None) -> Dict
     """Pads the rows to the max counts plus pad_extra entries of each kind."""
     n = len(rows)
     P = max([len(r["points"]) for r in rows] + [1]) + pad_extra
-    A = max([len(r["areas"]) for r in rows] + [1]) + pad_extra
-    V = max([len(r["vertices"]) for r in rows] + [1]) + pad_extra
     M = max([len(r["cands"]) for r in rows] + [1]) + pad_extra
     b = {
         "boardSizeN": np.zeros((n, 2), np.int8),
         "globalInputNC": np.zeros((n, 8), np.float32),
         "pointCountN": np.zeros(n, np.int16),
         "pointCoordsNP": np.zeros((n, P, 2), np.int8),
-        "pointDataNP": np.zeros((n, P, 3), np.int8),
-        "areaCountN": np.zeros(n, np.int16),
-        "areaDataNA": np.zeros((n, A, 6), np.int16),
-        "vertexCountN": np.zeros(n, np.int16),
-        "vertexCoordsNV": np.zeros((n, V, 2), np.int8),
-        "vertexAreaNV": np.zeros((n, V), np.int16),
+        "pointDataNP": np.zeros((n, P, 7), np.int16),
         "candCountN": np.zeros(n, np.int16),
         "candCoordsNM": np.zeros((n, M, 2), np.int8),
         "candDataNM": np.zeros((n, M, 4), np.int16),
@@ -119,16 +100,9 @@ def collate(rows: List[Dict], pad_extra: int = 0, score_len: int = None) -> Dict
         b["boardSizeN"][i] = r["boardSizeN"]
         b["globalInputNC"][i] = r["globalInputNC"]
         b["pointCountN"][i] = len(r["points"])
-        for j, (x, y, owner, grounded, moves_ago) in enumerate(r["points"]):
-            b["pointCoordsNP"][i, j] = (x, y)
-            b["pointDataNP"][i, j] = (owner, grounded, moves_ago)
-        b["areaCountN"][i] = len(r["areas"])
-        for j, a in enumerate(r["areas"]):
-            b["areaDataNA"][i, j] = a
-        b["vertexCountN"][i] = len(r["vertices"])
-        for j, (x, y) in enumerate(r["vertices"]):
-            b["vertexCoordsNV"][i, j] = (x, y)
-            b["vertexAreaNV"][i, j] = r["vertexArea"][j]
+        for j, point in enumerate(r["points"]):
+            b["pointCoordsNP"][i, j] = point[0:2]
+            b["pointDataNP"][i, j] = point[2:9]
         b["candCountN"][i] = len(r["cands"])
         for j, c in enumerate(r["cands"]):
             b["candCoordsNM"][i, j] = c[0:2]

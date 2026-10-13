@@ -493,12 +493,7 @@ struct ValueHeadDesc {
 // Sparse Dots model (model version 18), see docs/DotsSparseNN.md section 9.3 for the file layout.
 // Tokens: [GLOBAL][POINT x P][AREA x A], action candidates are decoder queries.
 struct SparseDotsDesc {
-  bool areaRopeMean; // areas take the mean RoPE over their boundary vertices, otherwise no positions
-  // In every trunk attention block the areas also attend to the points of their boundary only
-  bool areaBoundaryAttention;
   int numPointFeatures;
-  int numVertexFeatures;
-  int numAreaScalarFeatures;
   int numCandFeatures;
   int numGroundFeatures;
   int numGlobalFeatures;
@@ -506,16 +501,6 @@ struct SparseDotsDesc {
   // Embeddings
   MatMulLayerDesc pointMul;
   MatBiasLayerDesc pointBias;
-  MatMulLayerDesc vertexMul1;
-  MatBiasLayerDesc vertexBias1;
-  ActivationLayerDesc vertexActivation;
-  MatMulLayerDesc vertexMul2;
-  MatBiasLayerDesc vertexBias2;
-  MatMulLayerDesc areaMul1;
-  MatBiasLayerDesc areaBias1;
-  ActivationLayerDesc areaActivation;
-  MatMulLayerDesc areaMul2;
-  MatBiasLayerDesc areaBias2;
   MatBiasLayerDesc globalToken;
   MatMulLayerDesc globalMul;
 
@@ -526,8 +511,6 @@ struct SparseDotsDesc {
   std::vector<std::pair<int, unique_ptr_void>> blocks;
   RMSNormLayerDesc trunkTipRMSNorm;
   ActivationLayerDesc trunkTipActivation;
-  // Output projections of the area boundary attention, one per trunk attention block in order
-  std::vector<MatMulLayerDesc> trunkBoundaryOut;
 
   // Candidate decoder
   int decoderNumChannels;

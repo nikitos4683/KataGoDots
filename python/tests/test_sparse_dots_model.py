@@ -1,8 +1,6 @@
 """Tests of the sparse Dots model (model version 18), see docs/DotsSparseNN.md and DotsSparseNNPlan.md stage 2."""
 
-import math
 import os
-import random
 import subprocess
 import sys
 
@@ -11,18 +9,18 @@ import pytest
 import torch
 
 from katago.train.metrics_sparse_dots import SparseDotsMetrics
-from katago.train.model_pytorch import Game, apply_learnable_rotary_emb
+from katago.train.model_pytorch import Game
 from katago.train.model_sparse_dots import SparsePositions, apply_symmetry_to_batch, count_mask, create_model, trim_batch
 from katago.train.sparse_dots_bin import load_sparse_dots_bin
 
-from sparse_dots_testutils import collate, random_batch, random_row, tiny_sparse_config
+from sparse_dots_testutils import random_batch, tiny_sparse_config
 
 PYTHON_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def make_model(seed=0, area_rope="mean", decoder_layers=2, x=9, y=7):
+def make_model(seed=0, decoder_layers=2, x=9, y=7):
     torch.manual_seed(seed)
-    model = create_model(tiny_sparse_config(area_rope, decoder_layers), x, y, [Game.DOTS])
+    model = create_model(tiny_sparse_config(decoder_layers), x, y, [Game.DOTS])
     model.initialize()
     # Random non-trivial values for the parameters that are zero-initialized
     with torch.no_grad():
@@ -81,9 +79,9 @@ def test_forward_shapes_and_finiteness():
     assert (policy[:, 0][mask == 0] < -1000).all()
 
 
-@pytest.mark.parametrize("area_rope", ["mean", "none"])
-def test_padding_invariance(area_rope):
-    model = make_model(area_rope=area_rope)
+@pytest.mark.parametrize("decoder_layers", [2, 1])
+def test_padding_invariance(decoder_layers):
+    model = make_model(decoder_layers=decoder_layers)
     batch = random_batch(2, n=5)
     padded = random_batch(2, n=5, pad_extra=4)
     out = run(model, batch)
@@ -97,25 +95,17 @@ def test_padding_invariance(area_rope):
 
 
 def permute_row(batch, rng):
-    """Permutes the points, the areas (with their vertices), the vertices and the candidates of each row."""
+    """Permutes the points and the candidates of each row."""
     result = {k: v.clone() for k, v in batch.items()}
     perms = []
     for row in range(batch["boardSizeN"].shape[0]):
         num_points = int(batch["pointCountN"][row])
-        num_areas = int(batch["areaCountN"][row])
-        num_vertices = int(batch["vertexCountN"][row])
         num_cands = int(batch["candCountN"][row])
         pp = torch.from_numpy(rng.permutation(num_points))
-        ap = torch.from_numpy(rng.permutation(num_areas))
-        vp = torch.from_numpy(rng.permutation(num_vertices))
         cp = torch.from_numpy(rng.permutation(num_cands))
         result["pointCoordsNP"][row, :num_points] = batch["pointCoordsNP"][row, pp]
         result["pointDataNP"][row, :num_points] = batch["pointDataNP"][row, pp]
         result["pointOwnershipTargetsNP"][row, :num_points] = batch["pointOwnershipTargetsNP"][row, pp]
-        result["areaDataNA"][row, :num_areas] = batch["areaDataNA"][row, ap]
-        inverse_ap = torch.argsort(ap)
-        result["vertexCoordsNV"][row, :num_vertices] = batch["vertexCoordsNV"][row, vp]
-        result["vertexAreaNV"][row, :num_vertices] = inverse_ap[batch["vertexAreaNV"][row, vp].long()].to(batch["vertexAreaNV"].dtype)
         for key in ["candCoordsNM", "candDataNM", "candPolicyTargetsNM", "candFutureposTargetsNM"]:
             result[key][row, :num_cands] = batch[key][row, cp]
         perms.append((pp, cp))
@@ -123,7 +113,7 @@ def permute_row(batch, rng):
 
 
 def test_token_order_equivariance():
-    """The model has no notion of token or slot order: permuting points, areas, vertices and candidates
+    """The model has no notion of token or slot order: permuting points and candidates
     permutes the ownership and the candidate outputs the same way and keeps everything else."""
     model = make_model()
     batch = random_batch(3, n=5)
@@ -142,13 +132,13 @@ def test_symmetry_of_coordinates():
     batch = random_batch(4, n=4, x_size=8, y_size=8)
     for symmetry in range(8):
         transformed = apply_symmetry_to_batch(batch, symmetry)
-        for key in ["pointCoordsNP", "vertexCoordsNV", "candCoordsNM"]:
+        for key in ["pointCoordsNP", "candCoordsNM"]:
             coords = transformed[key]
             assert (coords >= 0).all() and (coords < 8).all()
         # All symmetries without transposition are involutions
         if symmetry < 4:
             back = apply_symmetry_to_batch(transformed, symmetry)
-            for key in ["pointCoordsNP", "vertexCoordsNV", "candCoordsNM"]:
+            for key in ["pointCoordsNP", "candCoordsNM"]:
                 assert torch.equal(back[key], batch[key])
     # Flip X on a known point
     flipped = apply_symmetry_to_batch(batch, 2)
@@ -157,40 +147,32 @@ def test_symmetry_of_coordinates():
         apply_symmetry_to_batch(random_batch(4, n=2, x_size=9, y_size=7), 4)
 
 
-def test_mean_rope_identity():
-    """The attention logit of a point query to an area key equals the mean of the logits as if the content of the
-    area stood at each vertex of its boundary: rotation is linear in the cos/sin tables."""
+def test_point_rope_tables():
+    """A point has the plain RoPE of its position, the GLOBAL token has zero tables (NoPE)."""
     torch.manual_seed(0)
     heads, pairs = 3, 4
     freqs = torch.randn(heads, pairs, 2)
-    vertices = torch.tensor([[1.0, 2.0], [2.0, 3.0], [3.0, 2.0], [2.0, 1.0], [5.0, 7.0]])
     point = torch.tensor([[4.0, 6.0]])
-    positions = SparsePositions(
-        point_xy=point.view(1, 1, 2),
-        vertex_xy=vertices.view(1, -1, 2),
-        vertex_weight=torch.full((1, vertices.shape[0]), 1.0 / vertices.shape[0]),
-        vertex_area=torch.zeros((1, vertices.shape[0]), dtype=torch.long),
-        num_areas=1,
-        cand_xy=torch.zeros((1, 0, 2)),
-        area_rope="mean",
-    )
-    cos, sin = positions.token_tables(freqs)  # [1, 3, H, P]: global, point, area
+    positions = SparsePositions(point_xy=point.view(1, 1, 2), cand_xy=torch.zeros((1, 0, 2)))
+    cos, sin = positions.token_tables(freqs)  # [1, 2, H, P]: global, point
     assert torch.equal(cos[0, 0], torch.zeros(heads, pairs)) and torch.equal(sin[0, 0], torch.zeros(heads, pairs))
-    q = torch.randn(1, 1, heads, 2 * pairs)
-    k = torch.randn(1, 1, heads, 2 * pairs)
-    q_rot, k_rot = apply_learnable_rotary_emb(q, k, cos[:, 1:2], sin[:, 1:2], cos[:, 2:3], sin[:, 2:3])
-    logit_area = (q_rot * k_rot).sum(-1)  # [1, 1, H]
-
-    logits = []
-    for v in vertices:
-        angles = v[0] * freqs[:, :, 0] + v[1] * freqs[:, :, 1]
-        _, k_v = apply_learnable_rotary_emb(q, k, cos[:, 1:2], sin[:, 1:2], torch.cos(angles).view(1, 1, heads, pairs), torch.sin(angles).view(1, 1, heads, pairs))
-        logits.append((q_rot * k_v).sum(-1))
-    assert torch.allclose(logit_area, torch.stack(logits).mean(0), atol=1e-5)
-
-    # For a point the tables are the plain RoPE of its position
     angles = point[0, 0] * freqs[:, :, 0] + point[0, 1] * freqs[:, :, 1]
     assert torch.allclose(cos[0, 1], torch.cos(angles)) and torch.allclose(sin[0, 1], torch.sin(angles))
+
+
+def test_point_area_features():
+    """The facts of the areas reach the point features: count, inside counts scaled by 1/20, moves ago one-hot."""
+    from katago.train.model_sparse_dots import NUM_POINT_FEATURES, point_features
+    coords = torch.tensor([[[3, 4], [5, 6]]], dtype=torch.int8)
+    # owner, grounded, movesAgo, areaCount, areaMovesAgo, insideMy, insideOpp
+    data = torch.tensor([[[1, 1, 2, 2, 3, 10, 40], [0, 0, 0, 0, 0, 0, 0]]], dtype=torch.int16)
+    features = point_features(coords, data, torch.tensor([[9.0, 8.0]]))
+    assert features.shape == (1, 2, NUM_POINT_FEATURES)
+    f = features[0, 0]
+    assert f[0] == 1 and f[5] == 1 and f[7] == 1  # owner, grounded, moved 2 moves ago
+    assert f[11] == 2 and abs(float(f[12]) - 0.5) < 1e-6 and abs(float(f[13]) - 2.0) < 1e-6
+    assert f[14:19].tolist() == [0, 0, 1, 0, 0]
+    assert features[0, 1, 11:].abs().sum() == 0
 
 
 def one_hot_targets(batch, seed):
@@ -245,9 +227,9 @@ def test_overfit_tiny_set():
     assert last["loss_sum"] < 0.3 * first["loss_sum"]
 
 
-@pytest.mark.parametrize("area_rope,decoder_layers", [("mean", 2), ("none", 1)])
-def test_export_round_trip(tmp_path, area_rope, decoder_layers):
-    model = make_model(seed=1, area_rope=area_rope, decoder_layers=decoder_layers)
+@pytest.mark.parametrize("decoder_layers", [2, 1])
+def test_export_round_trip(tmp_path, decoder_layers):
+    model = make_model(seed=1, decoder_layers=decoder_layers)
     checkpoint = tmp_path / "model.ckpt"
     torch.save({
         "model": model.state_dict(),
@@ -280,40 +262,3 @@ def test_export_round_trip(tmp_path, area_rope, decoder_layers):
     assert torch.allclose(moremisc[:, 0:2], moremisc_l[:, 0:2], atol=1e-5)
     point_mask = count_mask(batch["pointCountN"], batch["pointCoordsNP"].shape[1]) > 0
     assert torch.allclose(ownership[point_mask], ownership_l[point_mask], atol=1e-5)
-
-
-def test_boundary_attention_matches_naive():
-    """Every area attends exactly to the points of its boundary: vectorized code vs loops."""
-    from katago.train.model_sparse_dots import BoundaryLinks, boundary_attention, vertex_point_index
-    rng = random.Random(7)
-    torch.manual_seed(7)
-    rows = [random_row(rng, 12, 9) for _ in range(6)]
-    batch = trim_batch({k: torch.as_tensor(v) for k, v in collate(rows, pad_extra=2).items()})
-    vertex_point = vertex_point_index(batch["pointCoordsNP"], batch["pointCountN"], batch["vertexCoordsNV"], batch["vertexCountN"])
-    num_vertices = batch["vertexCoordsNV"].shape[1]
-    vertex_mask = torch.arange(num_vertices).view(1, -1) < batch["vertexCountN"].view(-1, 1)
-    # Every real vertex is a point of the position, padding has no point
-    assert bool(torch.all((vertex_point >= 0) == vertex_mask))
-    n = len(rows)
-    num_points = batch["pointCoordsNP"].shape[1]
-    num_areas = batch["areaDataNA"].shape[1]
-    seq_len = 1 + num_points + num_areas
-    heads, kv_heads, dim = 4, 2, 8
-    q = torch.randn(n, seq_len, heads, dim)
-    k = torch.randn(n, seq_len, kv_heads, dim)
-    v = torch.randn(n, seq_len, kv_heads, dim)
-    vertex_area = batch["vertexAreaNV"].long().clamp(min=0)
-    links = BoundaryLinks(vertex_area, vertex_point, num_points, num_areas)
-    out = boundary_attention(q, k, v, links, heads // kv_heads, 1.0 / math.sqrt(dim)).view(n, num_areas, heads, dim)
-    for i in range(n):
-        for a in range(num_areas):
-            members = [int(vertex_point[i, j]) for j in range(num_vertices) if bool(vertex_mask[i, j]) and int(vertex_area[i, j]) == a]
-            for h in range(heads):
-                kvh = h * kv_heads // heads
-                if not members:
-                    assert torch.all(out[i, a, h] == 0)
-                    continue
-                tokens = [1 + m for m in members]
-                scores = torch.stack([q[i, 1 + num_points + a, h] @ k[i, t, kvh] for t in tokens]) / math.sqrt(dim)
-                expected = (torch.softmax(scores, dim=0).unsqueeze(-1) * torch.stack([v[i, t, kvh] for t in tokens])).sum(0)
-                assert torch.allclose(out[i, a, h], expected, atol=1e-5)

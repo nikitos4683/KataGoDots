@@ -11,7 +11,7 @@ import torch
 
 from ..train import modelconfigs
 from ..train.model_pytorch import Game, NormMask, TransformerAttentionBlock, TransformerFFNBlock
-from ..train.model_sparse_dots import CrossAttentionBlock, SparseDotsModel
+from ..train.model_sparse_dots import NUM_POINT_FEATURES, CrossAttentionBlock, SparseDotsModel
 
 
 class BinReader:
@@ -172,24 +172,15 @@ def load_sparse_dots_bin(path: str, config: modelconfigs.ModelConfig) -> Tuple[S
     model = SparseDotsModel(config, pos_len_x, pos_len_y, [Game.DOTS])
     model.initialize()
 
-    assert reader.int() == 12 and reader.int() == 8
+    assert reader.int() == NUM_POINT_FEATURES and reader.int() == 8
     info["multipliers"] = [reader.float() for _ in range(7)]
     meta = [reader.int() for _ in range(8)]
     assert meta == [0] * 8
     reader.expect("sparse_dots_model")
-    area_rope = reader.int()
-    assert (area_rope == 1) == (model.area_rope == "mean")
-    assert [reader.int() for _ in range(4)] == [24, 10, 8, 1]
-    assert reader.int() == (1 if model.area_boundary_attention else 0)
-    assert [reader.int() for _ in range(3)] == [0, 0, 0]
+    assert [reader.int() for _ in range(2)] == [8, 1]
+    assert [reader.int() for _ in range(6)] == [0] * 6
 
     _load_linear(reader, "model.linear_point", model.linear_point)
-    _load_linear(reader, "model.linear_vertex1", model.linear_vertex1)
-    reader.activation("model.act_vertex")
-    _load_linear(reader, "model.linear_vertex2", model.linear_vertex2)
-    _load_linear(reader, "model.linear_area1", model.linear_area1)
-    reader.activation("model.act_area")
-    _load_linear(reader, "model.linear_area2", model.linear_area2)
     _set(model.global_token, reader.matbias("model.global_token"))
     _set(model.linear_global.weight, reader.matmul("model.linear_global"))
 
@@ -222,18 +213,6 @@ def load_sparse_dots_bin(path: str, config: modelconfigs.ModelConfig) -> Tuple[S
     _set(model.norm_trunkfinal.gamma, gamma)
     _set(model.norm_trunkfinal.beta, beta)
     reader.activation("model.act_trunkfinal")
-
-    if model.area_boundary_attention:
-        reader.expect("model.boundary_attention")
-        boundary_blocks = [
-            (f"model.blocks.{i}.blockstack.{j}", sub)
-            for i, block in enumerate(model.blocks)
-            for j, sub in enumerate(block.blockstack)
-            if isinstance(sub, TransformerAttentionBlock)
-        ]
-        assert reader.int() == len(boundary_blocks)
-        for name, sub in boundary_blocks:
-            _set(sub.boundary_out_proj.weight, reader.matmul(name + ".boundary_out_proj"))
 
     decoder = model.decoder
     reader.expect("model.decoder")

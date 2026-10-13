@@ -1,5 +1,5 @@
 # Loading of the sparse Dots training data (model version 18), see docs/DotsSparseNN.md 7.2.
-# Files are padded to their own maxima of points, areas, vertices and candidates; batches are cut down to the
+# Files are padded to their own maxima of points and candidates; batches are cut down to the
 # maxima of the batch. Symmetries only transform the coordinates.
 
 import logging
@@ -18,8 +18,6 @@ from ..train.model_sparse_dots import NUM_MOVES_AGO, apply_symmetry_to_batch, tr
 SPARSE_ARRAY_NAMES = [
     "boardSizeN", "globalInputNC",
     "pointCountN", "pointCoordsNP", "pointDataNP",
-    "areaCountN", "areaDataNA",
-    "vertexCountN", "vertexCoordsNV", "vertexAreaNV",
     "candCountN", "candCoordsNM", "candDataNM",
     "groundN",
     "candPolicyTargetsNM", "groundPolicyTargetsN", "candFutureposTargetsNM", "pointOwnershipTargetsNP",
@@ -27,8 +25,8 @@ SPARSE_ARRAY_NAMES = [
 ]
 
 # Torch dtype of each array in a batch
-_LONG_ARRAYS = {"pointCountN", "areaCountN", "vertexCountN", "candCountN", "vertexAreaNV"}
-_INT_ARRAYS = {"boardSizeN", "pointCoordsNP", "pointDataNP", "areaDataNA", "vertexCoordsNV", "candCoordsNM", "candDataNM"}
+_LONG_ARRAYS = {"pointCountN", "candCountN"}
+_INT_ARRAYS = {"boardSizeN", "pointCoordsNP", "pointDataNP", "candCoordsNM", "candDataNM"}
 
 
 def is_sparse_npz(npz) -> bool:
@@ -37,17 +35,15 @@ def is_sparse_npz(npz) -> bool:
 
 def drop_history(batch: Dict[str, torch.Tensor], include_history: torch.Tensor) -> Dict[str, torch.Tensor]:
     """include_history [N,5] 0/1 with the KataGo semantics (once a move is dropped, all older ones are too).
-    Removes the moves-ago marks of the points and areas older than the kept history."""
-    kept = include_history.long().cumprod(dim=1).sum(dim=1)  # [N] number of kept moves
+    Removes the moves-ago marks of the points and of their areas older than the kept history.
+    The freshest area mark of a point can't be recomputed then, a mark older than the kept history becomes 0."""
+    kept = include_history.long().cumprod(dim=1).sum(dim=1).view(-1, 1)  # [N,1] number of kept moves
     result = dict(batch)
     point_data = batch["pointDataNP"].clone()
-    moves_ago = point_data[..., 2]
-    point_data[..., 2] = torch.where(moves_ago > kept.view(-1, 1), torch.zeros_like(moves_ago), moves_ago)
+    for column in (2, 4):  # movesAgo of the dot, freshest movesAgo of its areas
+        moves_ago = point_data[..., column]
+        point_data[..., column] = torch.where(moves_ago > kept, torch.zeros_like(moves_ago), moves_ago)
     result["pointDataNP"] = point_data
-    area_data = batch["areaDataNA"].clone()
-    moves_ago = area_data[..., 2]
-    area_data[..., 2] = torch.where(moves_ago > kept.view(-1, 1), torch.zeros_like(moves_ago), moves_ago)
-    result["areaDataNA"] = area_data
     return result
 
 

@@ -13,7 +13,6 @@ void DotsSparseInput::clear() {
   points.clear();
   areas.clear();
   vertices.clear();
-  vertexPoints.clear();
   candidates.clear();
   groundAllowed = false;
   groundResult = 0.0f;
@@ -69,7 +68,9 @@ nlohmann::json DotsSparseInput::toJson() const {
   nlohmann::json pointsJson = nlohmann::json::array();
   for(const Point& point : points) {
     pointsJson.push_back({
-      {"x", point.x}, {"y", point.y}, {"owner", point.owner}, {"grounded", point.grounded}, {"movesAgo", point.movesAgo}
+      {"x", point.x}, {"y", point.y}, {"owner", point.owner}, {"grounded", point.grounded}, {"movesAgo", point.movesAgo},
+      {"areaCount", point.areaCount}, {"areaMovesAgo", point.areaMovesAgo}, {"insideMy", point.insideMy},
+      {"insideOpp", point.insideOpp}
     });
   }
   result["points"] = pointsJson;
@@ -307,11 +308,15 @@ void NNInputs::fillDotsSparseInput(
           result.vertices.push_back({
             static_cast<int8_t>(Location::getX(loc, xSize)), static_cast<int8_t>(Location::getY(loc, xSize))
           });
-          // The boundary dots are active dots of the owner outside the interiors, so they are points
+          // The facts of the area go to its boundary dots: active dots of the owner outside the interiors, so points
           const int32_t pointIdx = pointIdxOfLoc[loc];
           testAssert(pointIdx >= 0);
-          result.vertexPoints.push_back(pointIdx);
-          result.points[pointIdx].boundary = 1;
+          DotsSparseInput::Point& point = result.points[pointIdx];
+          point.areaCount = static_cast<int8_t>(point.areaCount + 1);
+          point.insideMy = static_cast<int16_t>(point.insideMy + insideMy);
+          point.insideOpp = static_cast<int16_t>(point.insideOpp + insideOpp);
+          if(movesAgo != 0 && (point.areaMovesAgo == 0 || movesAgo < point.areaMovesAgo))
+            point.areaMovesAgo = static_cast<int8_t>(movesAgo);
         }
         result.areas.push_back(area);
       }

@@ -192,16 +192,20 @@ namespace NNInputs {
 // Everything geometric (scaled coordinates, distances to the edges, Fourier features, RoPE)
 // is computed by the model itself from the coordinates and the board size.
 struct DotsSparseInput {
-  // A placed dot outside the interiors of the areas
+  // A placed dot outside the interiors of the areas. The areas are not tokens: their facts are given to the dots
+  // of their boundaries (a boundary dot always belongs to the owner of the area)
   struct Point {
     int8_t x;
     int8_t y;
     int8_t owner; // 0 - the player to move, 1 - the opponent
     int8_t grounded;
     int8_t movesAgo; // 0 - not in the history, 1..5 - placed that many moves ago
-    int8_t boundary; // on the boundary of an area (always an area of the owner of the dot)
+    int8_t areaCount; // number of areas whose boundary has the dot
+    int8_t areaMovesAgo; // the freshest movesAgo of these areas, 0 if none is in the history
+    int16_t insideMy; // sums over these areas of the dots of the player to move inside
+    int16_t insideOpp; // sums over these areas of the opponent dots inside
   };
-  // A completed enclosure, the outer contour only
+  // A completed enclosure, the outer contour only. Not an NN input: the point features are computed from the areas
   struct Area {
     int16_t owner; // 0 - the player to move, 1 - the opponent
     int16_t grounded; // at least one boundary dot is grounded
@@ -229,10 +233,6 @@ struct DotsSparseInput {
   int ySize = 0;
   float global[NNInputs::NUM_FEATURES_GLOBAL_DOTS_SPARSE] = {};
   std::vector<Point> points;
-  std::vector<Area> areas;
-  std::vector<Vertex> vertices; // grouped by area in the order of `areas`
-  // Index in `points` of the dot at each vertex: the boundary of an area is made of points
-  std::vector<int32_t> vertexPoints;
   std::vector<Candidate> candidates;
   bool groundAllowed = false;
   // Own minus opponent score plus komi if the player to move grounds now (the game ends)
@@ -241,12 +241,13 @@ struct DotsSparseInput {
   // Not NN inputs: board locations of the tokens to map the outputs back to the board
   std::vector<Loc> pointLocs;
   std::vector<Loc> candidateLocs;
+  // Not NN inputs: the areas the point features are computed from, for the tests and the dumps
+  std::vector<Area> areas;
+  std::vector<Vertex> vertices; // grouped by area in the order of `areas`
 
   void clear();
   // Max number of entries of each kind, used to size buffers
   static constexpr int MAX_POINTS = Board::MAX_PLAY_SIZE;
-  static constexpr int MAX_AREAS = Board::MAX_PLAY_SIZE / 2;
-  static constexpr int MAX_VERTICES = Board::MAX_PLAY_SIZE * 2;
   static constexpr int MAX_CANDIDATES = Board::MAX_PLAY_SIZE;
 
   // Coordinates of the point (x, y) after applying the symmetry (same convention as SymmetryHelpers::getSymLoc).

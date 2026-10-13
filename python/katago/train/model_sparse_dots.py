@@ -1,13 +1,13 @@
 # Sparse Dots model (model version 18), see docs/DotsSparseNN.md.
 #
 # A position is a set of tokens instead of a board grid:
-#   GLOBAL (one per position, no position), POINT (placed dots outside the area interiors),
-#   AREA (completed enclosures, encoded from the set of their boundary vertices).
+#   GLOBAL (one per position, no position), POINT (placed dots outside the area interiors).
+# The completed enclosures (areas) are not tokens: their facts are features of their boundary dots.
 # Action candidates (reasonable points and grounding) are queries of a decoder with cross-attention
 # to the trunk tokens. The trunk is the usual stack of nested bottleneck transformer blocks running
 # on the token sequence ("1 x S board" with a mask).
 #
-# All the geometry (scaled coordinates, distances to the edges, Fourier features, RoPE) is computed
+# All the geometry (scaled coordinates, distances to the edges, RoPE) is computed
 # here from the integer coordinates, with the same formulas as the C++ backends.
 
 import math
@@ -36,10 +36,10 @@ from ..train.model_pytorch import (
 
 NUM_GLOBAL_FEATURES = 8
 NUM_MOVES_AGO = 5
-NUM_POINT_FEATURES = 12  # owner, 4 edge distances, grounded, boundary of an area, moves ago one-hot
-FOURIER_PERIODS = (4, 8, 16, 32, 64)
-NUM_VERTEX_FEATURES = 4 + 4 * len(FOURIER_PERIODS)  # 24
-NUM_AREA_SCALAR_FEATURES = 10  # owner, insideMy, insideOpp, boundaryLen, grounded, moves ago one-hot
+# owner, 4 edge distances, grounded, moves ago one-hot, then the areas whose boundary has the dot:
+# their number, the dots inside them (mine, opponent's), the freshest moves ago one-hot
+NUM_POINT_FEATURES = 19
+NUM_POINT_DATA = 7  # pointDataNP: owner, grounded, movesAgo, areaCount, areaMovesAgo, insideMy, insideOpp
 NUM_CAND_FEATURES = 8  # 4 edge distances, gainMy, gainOpp, inMyHouse, inOppHouse
 NUM_GROUND_FEATURES = 1  # ground result
 NUM_POLICY_OUTPUTS = 6
@@ -52,22 +52,17 @@ COUNT_SCALE = 1.0 / 20.0
 INPUT_KEYS = [
     "boardSizeN", "globalInputNC",
     "pointCountN", "pointCoordsNP", "pointDataNP",
-    "areaCountN", "areaDataNA",
-    "vertexCountN", "vertexCoordsNV", "vertexAreaNV",
     "candCountN", "candCoordsNM", "candDataNM",
     "groundN",
 ]
 # Padded dimension (1-based axis) of each per-entity array
 PADDED_ARRAYS = {
     "pointCoordsNP": "P", "pointDataNP": "P", "pointOwnershipTargetsNP": "P",
-    "areaDataNA": "A",
-    "vertexCoordsNV": "V", "vertexAreaNV": "V",
     "candCoordsNM": "M", "candDataNM": "M", "candPolicyTargetsNM": "M", "candFutureposTargetsNM": "M",
 }
-COUNT_KEY_OF_DIM = {"P": "pointCountN", "A": "areaCountN", "V": "vertexCountN", "M": "candCountN"}
+COUNT_KEY_OF_DIM = {"P": "pointCountN", "M": "candCountN"}
 
 SPARSE_POSITIONS = "sparse_positions"
-SPARSE_BOUNDARY = "sparse_boundary"
 
 
 def is_sparse_dots_config(config: modelconfigs.ModelConfig) -> bool:
@@ -89,104 +84,20 @@ def moves_ago_one_hot(moves_ago: torch.Tensor) -> torch.Tensor:
     return (moves_ago.unsqueeze(-1) == values).to(torch.float32)
 
 
-def point_features(point_coords: torch.Tensor, point_data: torch.Tensor, point_boundary: torch.Tensor,
-                   board_size: torch.Tensor) -> torch.Tensor:
-    """point_coords [N,P,2], point_data [N,P,3] (owner, grounded, movesAgo), point_boundary [N,P] (the point is on
-    the boundary of an area, always an area of its owner), board_size [N,2]. Returns [N,P,12]."""
+def point_features(point_coords: torch.Tensor, point_data: torch.Tensor, board_size: torch.Tensor) -> torch.Tensor:
+    """point_coords [N,P,2], point_data [N,P,7] (owner, grounded, movesAgo, areaCount, areaMovesAgo, insideMy,
+    insideOpp), board_size [N,2]. Returns [N,P,19]."""
     coords = point_coords.to(torch.float32)
-    owner = point_data[..., 0:1].to(torch.float32)
-    grounded = point_data[..., 1:2].to(torch.float32)
-    return torch.cat([
-        owner,
-        edge_features(coords, board_size.unsqueeze(1)),
-        grounded,
-        point_boundary.to(torch.float32).unsqueeze(-1),
-        moves_ago_one_hot(point_data[..., 2].long()),
-    ], dim=-1)
-
-
-def vertex_point_index(point_coords: torch.Tensor, point_count: torch.Tensor, vertex_coords: torch.Tensor,
-                       vertex_count: torch.Tensor) -> torch.Tensor:
-    """Index of the POINT at the coordinates of each boundary vertex [N,V], -1 for padding (and for a vertex
-    without a point, which never happens: the boundary of an area is made of dots outside the area interiors)."""
-    num_points = point_coords.shape[1]
-    point_mask = count_mask(point_count, num_points) > 0
-    vertex_mask = count_mask(vertex_count, vertex_coords.shape[1]) > 0
-    point_key = point_coords[..., 1].long() * 256 + point_coords[..., 0].long()
-    point_key = torch.where(point_mask, point_key, torch.full_like(point_key, 1 << 30))
-    vertex_key = vertex_coords[..., 1].long() * 256 + vertex_coords[..., 0].long()
-    sorted_key, order = torch.sort(point_key, dim=1)
-    pos = torch.searchsorted(sorted_key, vertex_key).clamp(max=num_points - 1)
-    found = (torch.gather(sorted_key, 1, pos) == vertex_key) & vertex_mask
-    return torch.where(found, torch.gather(order, 1, pos), torch.full_like(pos, -1))
-
-
-class BoundaryLinks:
-    """For each boundary vertex: the flat token index (row * S + token) of its AREA and of its POINT.
-    Padding vertices point to the extra row num_rows and are masked."""
-
-    def __init__(self, vertex_area, vertex_point, num_points, num_areas):
-        n, v = vertex_point.shape
-        seq_len = 1 + num_points + num_areas
-        self.num_rows = n * seq_len
-        self.area_start = 1 + num_points
-        self.num_areas = num_areas
-        valid = vertex_point >= 0
-        row_start = (torch.arange(n, device=vertex_point.device) * seq_len).view(-1, 1)
-        self.valid = valid.reshape(-1)
-        self.area_flat = torch.where(valid, row_start + self.area_start + vertex_area,
-                                     torch.full_like(vertex_area, self.num_rows)).reshape(-1)
-        self.point_flat = torch.where(valid, row_start + 1 + vertex_point, torch.zeros_like(vertex_point)).reshape(-1)
-
-
-def boundary_attention(q, k, v, links: BoundaryLinks, n_rep: int, scale: float) -> torch.Tensor:
-    """Attention of each AREA to the POINTs of its boundary only. q [N,S,H,Dq], k [N,S,Hkv,Dq], v [N,S,Hkv,Dv]
-    (after RoPE). Returns [N,A,H*Dv] in float32, zeros for areas without vertices."""
-    n, seq_len, num_heads, _ = q.shape
-    v_head_dim = v.shape[-1]
-    q_area = q.reshape(n * seq_len, num_heads, -1)[links.area_flat.clamp(max=links.num_rows - 1)].to(torch.float32)
-    k_point = k.reshape(n * seq_len, k.shape[2], -1)[links.point_flat].to(torch.float32)
-    v_point = v.reshape(n * seq_len, v.shape[2], -1)[links.point_flat].to(torch.float32)
-    if n_rep > 1:
-        k_point = k_point.repeat_interleave(n_rep, dim=1)
-        v_point = v_point.repeat_interleave(n_rep, dim=1)
-    scores = (q_area * k_point).sum(dim=-1) * scale
-    scores = scores.masked_fill(~links.valid.unsqueeze(-1), float("-inf"))
-    segment = links.area_flat.unsqueeze(-1).expand(-1, num_heads)
-    seg_max = scores.new_full((links.num_rows + 1, num_heads), float("-inf")).scatter_reduce(
-        0, segment, scores, reduce="amax", include_self=True)
-    seg_max = torch.nan_to_num(seg_max.detach(), neginf=0.0)
-    weights = torch.exp(scores - seg_max[links.area_flat])
-    denom = scores.new_zeros((links.num_rows + 1, num_heads)).index_add(0, links.area_flat, weights)
-    out = scores.new_zeros((links.num_rows + 1, num_heads, v_head_dim)).index_add(
-        0, links.area_flat, weights.unsqueeze(-1) * v_point)
-    out = out / denom.clamp(min=1e-30).unsqueeze(-1)
-    out = out[:links.num_rows].view(n, seq_len, num_heads * v_head_dim)
-    return out[:, links.area_start:links.area_start + links.num_areas]
-
-
-def vertex_features(vertex_coords: torch.Tensor, board_size: torch.Tensor) -> torch.Tensor:
-    """vertex_coords [N,V,2], board_size [N,2]. Returns [N,V,24]."""
-    coords = vertex_coords.to(torch.float32)
-    features = [edge_features(coords, board_size.unsqueeze(1))]
-    x = coords[..., 0]
-    y = coords[..., 1]
-    for period in FOURIER_PERIODS:
-        k = 2.0 * math.pi / period
-        features.append(torch.stack([torch.sin(k * x), torch.cos(k * x), torch.sin(k * y), torch.cos(k * y)], dim=-1))
-    return torch.cat(features, dim=-1)
-
-
-def area_scalar_features(area_data: torch.Tensor) -> torch.Tensor:
-    """area_data [N,A,6] (owner, grounded, movesAgo, insideMy, insideOpp, boundaryLen). Returns [N,A,10]."""
-    data = area_data.to(torch.float32)
+    data = point_data.to(torch.float32)
     return torch.cat([
         data[..., 0:1],
-        data[..., 3:4] * COUNT_SCALE,
-        data[..., 4:5] * COUNT_SCALE,
-        data[..., 5:6] * COUNT_SCALE,
+        edge_features(coords, board_size.unsqueeze(1)),
         data[..., 1:2],
-        moves_ago_one_hot(area_data[..., 2].long()),
+        moves_ago_one_hot(point_data[..., 2].long()),
+        data[..., 3:4],
+        data[..., 5:6] * COUNT_SCALE,
+        data[..., 6:7] * COUNT_SCALE,
+        moves_ago_one_hot(point_data[..., 4].long()),
     ], dim=-1)
 
 
@@ -243,7 +154,7 @@ def apply_symmetry_to_batch(batch: Dict[str, torch.Tensor], symmetry: int) -> Di
     result = dict(batch)
     w = board_size[:, 0].view(-1, 1)
     h = board_size[:, 1].view(-1, 1)
-    for key in ["pointCoordsNP", "vertexCoordsNV", "candCoordsNM"]:
+    for key in ["pointCoordsNP", "candCoordsNM"]:
         coords = batch[key]
         x = coords[..., 0]
         y = coords[..., 1]
@@ -260,19 +171,13 @@ def apply_symmetry_to_batch(batch: Dict[str, torch.Tensor], symmetry: int) -> Di
 # Positions for RoPE ----------------------------------------------------------------------------------------------
 
 class SparsePositions:
-    """Weighted position sets of the tokens and of the candidates, shared by all attention layers.
-    Token order: [GLOBAL][POINT x P][AREA x A]. A point has one position, an area has its boundary vertices
-    with weights 1/|B| (area_rope == "mean") or no positions at all ("none"). The GLOBAL token and the grounding
-    candidate have no positions: their cos/sin tables are zero, so their rotated q/k vanish (NoPE)."""
+    """Positions of the tokens and of the candidates, shared by all attention layers.
+    Token order: [GLOBAL][POINT x P]. A point has its position. The GLOBAL token and the grounding candidate
+    have no positions: their cos/sin tables are zero, so their rotated q/k vanish (NoPE)."""
 
-    def __init__(self, point_xy, vertex_xy, vertex_weight, vertex_area, num_areas, cand_xy, area_rope):
+    def __init__(self, point_xy, cand_xy):
         self.point_xy = point_xy  # [N,P,2] float
-        self.vertex_xy = vertex_xy  # [N,V,2] float
-        self.vertex_weight = vertex_weight  # [N,V] float, zero for padding
-        self.vertex_area = vertex_area  # [N,V] long, clamped to valid indices
-        self.num_areas = num_areas
         self.cand_xy = cand_xy  # [N,M,2] float
-        self.area_rope = area_rope
 
     @staticmethod
     def _angles(xy, freqs):
@@ -283,22 +188,9 @@ class SparsePositions:
         """Returns cos, sin of shape [N, S, H, Pp] for the trunk tokens."""
         freqs = freqs.to(torch.float32)
         n = self.point_xy.shape[0]
-        num_heads, num_pairs = freqs.shape[0], freqs.shape[1]
         point_angles = self._angles(self.point_xy, freqs)
-        point_cos = torch.cos(point_angles)
-        point_sin = torch.sin(point_angles)
-        area_cos = point_cos.new_zeros((n, self.num_areas, num_heads, num_pairs))
-        area_sin = point_cos.new_zeros((n, self.num_areas, num_heads, num_pairs))
-        if self.area_rope == "mean" and self.vertex_xy.shape[1] > 0:
-            vertex_angles = self._angles(self.vertex_xy, freqs)
-            weight = self.vertex_weight[..., None, None]
-            index = self.vertex_area[..., None, None].expand(-1, -1, num_heads, num_pairs)
-            area_cos = area_cos.scatter_add(1, index, torch.cos(vertex_angles) * weight)
-            area_sin = area_sin.scatter_add(1, index, torch.sin(vertex_angles) * weight)
-        global_zeros = point_cos.new_zeros((n, 1, num_heads, num_pairs))
-        cos = torch.cat([global_zeros, point_cos, area_cos], dim=1)
-        sin = torch.cat([global_zeros, point_sin, area_sin], dim=1)
-        return cos, sin
+        global_zeros = point_angles.new_zeros((n, 1, freqs.shape[0], freqs.shape[1]))
+        return torch.cat([global_zeros, torch.cos(point_angles)], dim=1), torch.cat([global_zeros, torch.sin(point_angles)], dim=1)
 
     def cand_tables(self, freqs: torch.Tensor):
         """Returns cos, sin of shape [N, M+1, H, Pp] for the candidates, the last one is the grounding."""
@@ -328,9 +220,7 @@ def _key_padding_bias(mask: torch.Tensor, dtype) -> torch.Tensor:
 class SparseRoPEAttentionBlock(TransformerAttentionBlock):
     """Self-attention over the token sequence (NSC layout) with RoPE from the weighted position sets.
     Same parameters as TransformerAttentionBlock, so the export and the C++ descriptors are reused.
-    Instances are created as TransformerAttentionBlock and switched to this class.
-    With area boundary attention the AREA tokens also attend to the POINTs of their own boundary only, with the
-    same q/k/v and a separate output projection boundary_out_proj (exported after the trunk)."""
+    Instances are created as TransformerAttentionBlock and switched to this class."""
 
     def forward(self, x, mask, mask_sum_hw, mask_sum: float, extra_outputs: Optional[ExtraOutputs], block_shared_data: Optional[Dict[str, Any]] = None):
         assert x.dim() == 3
@@ -344,7 +234,6 @@ class SparseRoPEAttentionBlock(TransformerAttentionBlock):
         cos_k, sin_k = positions.token_tables(self.rope_freqs)
         cos_q, sin_q = _expand_kv_tables(cos_k, sin_k, self.n_rep, self.num_heads)
         q, k = apply_learnable_rotary_emb(q, k, cos_q, sin_q, cos_k, sin_k)
-        q_rot, k_rot, v_rot = q, k, v
 
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
@@ -358,14 +247,6 @@ class SparseRoPEAttentionBlock(TransformerAttentionBlock):
         )
         attn_output = attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_len, self.num_heads * self.v_head_dim)
         result = self.out_proj(attn_output)
-
-        # Areas also attend to the points of their own boundary only, with the same q/k/v
-        boundary_out_proj = getattr(self, "boundary_out_proj", None)
-        links: Optional[BoundaryLinks] = block_shared_data.get(SPARSE_BOUNDARY)
-        if boundary_out_proj is not None and links is not None and links.num_areas > 0:
-            area_output = boundary_attention(q_rot, k_rot, v_rot, links, self.n_rep, 1.0 / math.sqrt(self.q_head_dim))
-            area_result = boundary_out_proj(area_output.to(result.dtype))
-            result = torch.cat([result[:, :links.area_start], result[:, links.area_start:] + area_result], dim=1)
         if extra_outputs is not None:
             extra_outputs.report(self.name + ".out", result)
         return result
@@ -657,10 +538,6 @@ class SparseDotsModel(torch.nn.Module):
         self.c_sv2 = config["sbv2_num_channels"]
         self.num_scorebeliefs = config["num_scorebeliefs"]
         self.num_total_blocks = len(self.block_kind)
-        self.c_vertex = config.get("vertex_encoder_channels", 192)
-        self.area_rope = config.get("area_rope", "mean")
-        assert self.area_rope in ("mean", "none")
-        self.area_boundary_attention = config.get("area_boundary_attention", True)
         self.activation = config.get("activation", "relu")
         self.has_intermediate_head = False
         self.metadata_encoder = None
@@ -681,12 +558,6 @@ class SparseDotsModel(torch.nn.Module):
 
         # Embeddings
         self.linear_point = torch.nn.Linear(NUM_POINT_FEATURES, self.c_trunk, bias=True)
-        self.linear_vertex1 = torch.nn.Linear(NUM_VERTEX_FEATURES, self.c_vertex, bias=True)
-        self.act_vertex = act(self.activation)
-        self.linear_vertex2 = torch.nn.Linear(self.c_vertex, self.c_vertex, bias=True)
-        self.linear_area1 = torch.nn.Linear(2 * self.c_vertex + 1 + NUM_AREA_SCALAR_FEATURES, self.c_trunk, bias=True)
-        self.act_area = act(self.activation)
-        self.linear_area2 = torch.nn.Linear(self.c_trunk, self.c_trunk, bias=True)
         self.global_token = torch.nn.Parameter(torch.zeros(self.c_trunk))
         self.linear_global = torch.nn.Linear(NUM_GLOBAL_FEATURES, self.c_trunk, bias=False)
 
@@ -710,9 +581,6 @@ class SparseDotsModel(torch.nn.Module):
             for sub in block.blockstack:
                 if isinstance(sub, TransformerAttentionBlock):
                     sub.__class__ = SparseRoPEAttentionBlock
-                    if self.area_boundary_attention:
-                        sub.boundary_out_proj = torch.nn.Linear(
-                            sub.num_heads * sub.v_head_dim, sub.out_proj.out_features, bias=False)
             self.blocks.append(block)
         self.norm_trunkfinal = SparseRMSNormMask(self.c_trunk)
         self.act_trunkfinal = act(self.activation)
@@ -732,14 +600,6 @@ class SparseDotsModel(torch.nn.Module):
         with torch.no_grad():
             init_weights(self.linear_point.weight, self.activation, scale=0.8)
             torch.nn.init.zeros_(self.linear_point.bias)
-            init_weights(self.linear_vertex1.weight, self.activation, scale=1.0)
-            torch.nn.init.zeros_(self.linear_vertex1.bias)
-            init_weights(self.linear_vertex2.weight, self.activation, scale=1.0)
-            torch.nn.init.zeros_(self.linear_vertex2.bias)
-            init_weights(self.linear_area1.weight, self.activation, scale=1.0)
-            torch.nn.init.zeros_(self.linear_area1.bias)
-            init_weights(self.linear_area2.weight, self.activation, scale=0.8)
-            torch.nn.init.zeros_(self.linear_area2.bias)
             torch.nn.init.normal_(self.global_token, std=0.1)
             init_weights(self.linear_global.weight, self.activation, scale=0.6)
 
@@ -776,9 +636,8 @@ class SparseDotsModel(torch.nn.Module):
         for key in ["input", "input_noreg", "normal", "normal_attn", "normal_gab", "gab_mlp", "tab_module",
                     "normal_gamma", "noreg", "output", "output_noreg"]:
             reg_dict[key] = []
-        for linear in [self.linear_point, self.linear_vertex1, self.linear_vertex2, self.linear_area1, self.linear_area2]:
-            reg_dict["input"].append(linear.weight)
-            reg_dict["input_noreg"].append(linear.bias)
+        reg_dict["input"].append(self.linear_point.weight)
+        reg_dict["input_noreg"].append(self.linear_point.bias)
         reg_dict["input_noreg"].append(self.global_token)
         reg_dict["input"].append(self.linear_global.weight)
         for block in self.blocks:
@@ -796,73 +655,37 @@ class SparseDotsModel(torch.nn.Module):
             block.add_brenorm_clippage(upper_rclippage, lower_rclippage, dclippage)
 
     def embed(self, batch: Dict[str, torch.Tensor]):
-        """Returns tokens [N,S,C], mask [N,S,1], number of tokens [N], positions, boundary links (or None),
-        board size [N,2] float."""
+        """Returns tokens [N,S,C], mask [N,S,1], number of tokens [N], positions, board size [N,2] float."""
         board_size = batch["boardSizeN"].to(torch.float32)
         input_global = batch["globalInputNC"].to(torch.float32)
         n = board_size.shape[0]
         num_points = batch["pointCoordsNP"].shape[1]
-        num_areas = batch["areaDataNA"].shape[1]
-        num_vertices = batch["vertexCoordsNV"].shape[1]
         point_mask = count_mask(batch["pointCountN"], num_points)
-        area_mask = count_mask(batch["areaCountN"], num_areas)
-        vertex_mask = count_mask(batch["vertexCountN"], num_vertices)
 
-        vertex_point = vertex_point_index(
-            batch["pointCoordsNP"], batch["pointCountN"], batch["vertexCoordsNV"], batch["vertexCountN"])
-        point_boundary = point_mask.new_zeros(point_mask.shape).scatter_add(
-            1, vertex_point.clamp(min=0), (vertex_point >= 0).to(point_mask.dtype)).clamp(max=1.0)
-        point_tokens = self.linear_point(
-            point_features(batch["pointCoordsNP"], batch["pointDataNP"], point_boundary, board_size))
-
-        # Area encoder: vertex MLP -> mean | max | log(1+|B|) | area scalars -> area MLP
-        area_data = batch["areaDataNA"]
-        boundary_len = area_data[..., 5].to(torch.float32).clamp(min=1.0)
-        vertex_area = batch["vertexAreaNV"].long().clamp(min=0, max=max(num_areas - 1, 0))
-        h = self.linear_vertex2(self.act_vertex(self.linear_vertex1(vertex_features(batch["vertexCoordsNV"], board_size))))
-        c_vertex = h.shape[-1]
-        index = vertex_area.unsqueeze(-1).expand(-1, -1, c_vertex)
-        vertex_mask_c = vertex_mask.unsqueeze(-1)
-        h_sum = h.new_zeros((n, num_areas, c_vertex)).scatter_add(1, index, h * vertex_mask_c)
-        h_mean = h_sum / boundary_len.unsqueeze(-1)
-        h_max = h.new_zeros((n, num_areas, c_vertex)).scatter_reduce(
-            1, index, h.masked_fill(vertex_mask_c == 0, float("-inf")), reduce="amax", include_self=False,
-        )
-        # Areas without vertices are padding, keep them finite
-        h_max = torch.where(area_mask.unsqueeze(-1) > 0, h_max, torch.zeros_like(h_max))
-        area_agg = torch.cat([h_mean, h_max, torch.log1p(boundary_len).unsqueeze(-1), area_scalar_features(area_data)], dim=-1)
-        area_tokens = self.linear_area2(self.act_area(self.linear_area1(area_agg)))
-
+        point_tokens = self.linear_point(point_features(batch["pointCoordsNP"], batch["pointDataNP"], board_size))
         global_tokens = self.global_token.view(1, 1, -1).expand(n, 1, -1)
-        tokens = torch.cat([global_tokens, point_tokens, area_tokens], dim=1) + self.linear_global(input_global).unsqueeze(1)
-        mask = torch.cat([point_mask.new_ones((n, 1)), point_mask, area_mask], dim=1).unsqueeze(-1)
+        tokens = torch.cat([global_tokens, point_tokens], dim=1) + self.linear_global(input_global).unsqueeze(1)
+        mask = torch.cat([point_mask.new_ones((n, 1)), point_mask], dim=1).unsqueeze(-1)
         tokens = tokens * mask
         num_tokens = mask.sum(dim=(1, 2))
 
-        vertex_weight = vertex_mask / torch.gather(boundary_len, 1, vertex_area)
         positions = SparsePositions(
             point_xy=batch["pointCoordsNP"].to(torch.float32),
-            vertex_xy=batch["vertexCoordsNV"].to(torch.float32),
-            vertex_weight=vertex_weight,
-            vertex_area=vertex_area,
-            num_areas=num_areas,
             cand_xy=batch["candCoordsNM"].to(torch.float32),
-            area_rope=self.area_rope,
         )
-        links = BoundaryLinks(vertex_area, vertex_point, num_points, num_areas) if self.area_boundary_attention else None
-        return tokens, mask, num_tokens, positions, links, board_size
+        return tokens, mask, num_tokens, positions, board_size
 
     def forward(self, batch: Dict[str, torch.Tensor], extra_outputs: Optional[ExtraOutputs] = None):
         """Returns a tuple with one tuple of outputs (like Model.forward):
         policy logits [N,6,M+1] (the last candidate is grounding, masked ones get -5000),
         value [N,3], miscvalue [N,10], moremiscvalue [N,8], ownership logits [N,P],
         futurepos pretanh [N,2,M], scorebelief log probs [N,L]."""
-        tokens, mask, num_tokens, positions, links, board_size = self.embed(batch)
+        tokens, mask, num_tokens, positions, board_size = self.embed(batch)
         num_points = batch["pointCoordsNP"].shape[1]
         num_cands = batch["candCoordsNM"].shape[1]
         mask_sum_hw = num_tokens.view(-1, 1, 1)
         mask_sum = torch.sum(mask)
-        block_shared_data = {SPARSE_POSITIONS: positions, SPARSE_BOUNDARY: links}
+        block_shared_data = {SPARSE_POSITIONS: positions}
 
         if extra_outputs is not None:
             extra_outputs.report("trunk_after_embedding", tokens)

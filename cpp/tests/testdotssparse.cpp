@@ -113,24 +113,34 @@ void checkSparseInvariants(const Board& board, const BoardHistory& hist, const P
     }
   }
 
-  // Every vertex is the point at the same coordinates, the boundary bit marks exactly these points,
-  // and the points of a boundary belong to the owner of the area
+  // The area features of a point aggregate the areas whose boundary has the dot: their number, the sums of
+  // the dots inside, the freshest history mark. A boundary dot belongs to the owner of the area.
   {
-    testAssert(input.vertexPoints.size() == input.vertices.size());
-    vector<int8_t> isBoundary(input.points.size(), 0);
+    vector<int> areaCount(input.points.size(), 0), insideMy(input.points.size(), 0), insideOpp(input.points.size(), 0);
+    vector<int> areaMovesAgo(input.points.size(), 0);
     for(const auto& area : input.areas) {
       for(int i = 0; i < area.boundaryLen; i++) {
-        const int32_t pointIdx = input.vertexPoints[area.vertexStart + i];
-        testAssert(pointIdx >= 0 && pointIdx < (int32_t)input.points.size());
-        const auto& point = input.points[pointIdx];
         const auto& vertex = input.vertices[area.vertexStart + i];
-        testAssert(point.x == vertex.x && point.y == vertex.y);
-        testAssert(point.owner == area.owner);
-        isBoundary[pointIdx] = 1;
+        int pointIdx = -1;
+        for(size_t j = 0; j < input.points.size(); j++)
+          if(input.points[j].x == vertex.x && input.points[j].y == vertex.y)
+            pointIdx = (int)j;
+        testAssert(pointIdx >= 0);
+        testAssert(input.points[pointIdx].owner == area.owner);
+        areaCount[pointIdx]++;
+        insideMy[pointIdx] += area.insideMy;
+        insideOpp[pointIdx] += area.insideOpp;
+        if(area.movesAgo != 0 && (areaMovesAgo[pointIdx] == 0 || area.movesAgo < areaMovesAgo[pointIdx]))
+          areaMovesAgo[pointIdx] = area.movesAgo;
       }
     }
-    for(size_t i = 0; i < input.points.size(); i++)
-      testAssert(input.points[i].boundary == isBoundary[i]);
+    for(size_t j = 0; j < input.points.size(); j++) {
+      const auto& point = input.points[j];
+      testAssert(point.areaCount == areaCount[j]);
+      testAssert(point.insideMy == insideMy[j]);
+      testAssert(point.insideOpp == insideOpp[j]);
+      testAssert(point.areaMovesAgo == areaMovesAgo[j]);
+    }
   }
 
   // Sum of the opponent dots inside my areas = my captures and vice versa

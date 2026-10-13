@@ -2979,11 +2979,7 @@ Rules ModelDesc::getSupportedRules(const Rules& desiredRules, bool& supported) c
 // Sparse Dots model (version 18), see docs/DotsSparseNN.md section 9.3
 
 SparseDotsDesc::SparseDotsDesc()
-  : areaRopeMean(true),
-    areaBoundaryAttention(false),
-    numPointFeatures(0),
-    numVertexFeatures(0),
-    numAreaScalarFeatures(0),
+  : numPointFeatures(0),
     numCandFeatures(0),
     numGroundFeatures(0),
     numGlobalFeatures(0),
@@ -3013,23 +3009,11 @@ SparseDotsDesc::SparseDotsDesc(istream& in, int modelVersion, bool binaryFloats,
   in >> tag;
   if(tag != "sparse_dots_model")
     throw StringError("Expected sparse_dots_model, got " + tag);
-  int areaRopeInt = 0;
-  in >> areaRopeInt;
-  in >> numVertexFeatures;
-  in >> numAreaScalarFeatures;
   in >> numCandFeatures;
   in >> numGroundFeatures;
   if(in.fail())
     throw StringError("sparse_dots_model: failed to parse the header");
-  if(areaRopeInt != 0 && areaRopeInt != 1)
-    throw StringError("sparse_dots_model: unknown area rope mode " + Global::intToString(areaRopeInt));
-  areaRopeMean = areaRopeInt == 1;
-  int boundaryAttentionInt = 0;
-  in >> boundaryAttentionInt;
-  if(boundaryAttentionInt != 0 && boundaryAttentionInt != 1)
-    throw StringError("sparse_dots_model: unknown area boundary attention mode " + Global::intToString(boundaryAttentionInt));
-  areaBoundaryAttention = boundaryAttentionInt == 1;
-  for(int i = 0; i < 3; i++) {
+  for(int i = 0; i < 6; i++) {
     int unused = 0;
     in >> unused;
     if(unused != 0)
@@ -3038,37 +3022,17 @@ SparseDotsDesc::SparseDotsDesc(istream& in, int modelVersion, bool binaryFloats,
   numPointFeatures = nPointFeatures;
   numGlobalFeatures = nGlobalFeatures;
   // The features are computed by the engine, their layout must be exactly the known one
-  if(numPointFeatures != 12 || numVertexFeatures != 24 || numAreaScalarFeatures != 10 || numCandFeatures != 8 ||
-     numGroundFeatures != 1 || numGlobalFeatures != 8)
+  if(numPointFeatures != 19 || numCandFeatures != 8 || numGroundFeatures != 1 || numGlobalFeatures != 8)
     throw StringError("sparse_dots_model: unsupported numbers of input features");
 
   pointMul = MatMulLayerDesc(in, binaryFloats);
   pointBias = MatBiasLayerDesc(in, binaryFloats);
-  vertexMul1 = MatMulLayerDesc(in, binaryFloats);
-  vertexBias1 = MatBiasLayerDesc(in, binaryFloats);
-  vertexActivation = ActivationLayerDesc(in, modelVersion);
-  vertexMul2 = MatMulLayerDesc(in, binaryFloats);
-  vertexBias2 = MatBiasLayerDesc(in, binaryFloats);
-  areaMul1 = MatMulLayerDesc(in, binaryFloats);
-  areaBias1 = MatBiasLayerDesc(in, binaryFloats);
-  areaActivation = ActivationLayerDesc(in, modelVersion);
-  areaMul2 = MatMulLayerDesc(in, binaryFloats);
-  areaBias2 = MatBiasLayerDesc(in, binaryFloats);
   globalToken = MatBiasLayerDesc(in, binaryFloats);
   globalMul = MatMulLayerDesc(in, binaryFloats);
 
   trunkNumChannels = pointMul.outChannels;
-  const int vertexChannels = vertexMul1.outChannels;
   checkMatMul(pointMul, numPointFeatures, trunkNumChannels);
   checkMatBias(pointBias, trunkNumChannels);
-  checkMatMul(vertexMul1, numVertexFeatures, vertexChannels);
-  checkMatBias(vertexBias1, vertexChannels);
-  checkMatMul(vertexMul2, vertexChannels, vertexChannels);
-  checkMatBias(vertexBias2, vertexChannels);
-  checkMatMul(areaMul1, 2 * vertexChannels + 1 + numAreaScalarFeatures, trunkNumChannels);
-  checkMatBias(areaBias1, trunkNumChannels);
-  checkMatMul(areaMul2, trunkNumChannels, trunkNumChannels);
-  checkMatBias(areaBias2, trunkNumChannels);
   checkMatBias(globalToken, trunkNumChannels);
   checkMatMul(globalMul, numGlobalFeatures, trunkNumChannels);
 
@@ -3115,25 +3079,6 @@ SparseDotsDesc::SparseDotsDesc(istream& in, int modelVersion, bool binaryFloats,
   if(trunkTipRMSNorm.numChannels != trunkNumChannels || !trunkTipRMSNorm.spatial)
     throw StringError("sparse_dots_model: the trunk tip must be a spatial RMSNorm of the trunk channels");
   trunkTipActivation = ActivationLayerDesc(in, modelVersion);
-
-  if(areaBoundaryAttention) {
-    in >> tag;
-    if(tag != "model.boundary_attention")
-      throw StringError("sparse_dots_model: expected model.boundary_attention, got " + tag);
-    int numBoundaryOut = 0;
-    in >> numBoundaryOut;
-    vector<const TransformerAttentionDesc*> attentions;
-    for(const auto& block : blocks)
-      for(const auto& sub : static_cast<const NestedBottleneckResidualBlockDesc*>(block.second.get())->blocks)
-        if(sub.first == TRANSFORMER_ATTENTION_BLOCK_KIND)
-          attentions.push_back(static_cast<const TransformerAttentionDesc*>(sub.second.get()));
-    if(in.fail() || numBoundaryOut != (int)attentions.size())
-      throw StringError("sparse_dots_model: the boundary attention needs one projection per trunk attention block");
-    for(const TransformerAttentionDesc* attention : attentions) {
-      trunkBoundaryOut.emplace_back(in, binaryFloats);
-      checkMatMul(trunkBoundaryOut.back(), attention->numHeads * attention->vHeadDim, midNumChannels);
-    }
-  }
 
   string decoderName;
   in >> decoderName;
@@ -3217,17 +3162,15 @@ SparseDotsDesc::SparseDotsDesc(istream& in, int modelVersion, bool binaryFloats,
 
 int64_t SparseDotsDesc::getNumParameters() const {
   int64_t result = 0;
-  for(const MatMulLayerDesc* m : {&pointMul, &vertexMul1, &vertexMul2, &areaMul1, &areaMul2, &globalMul, &candMul,
+  for(const MatMulLayerDesc* m : {&pointMul, &globalMul, &candMul,
                                   &groundMul, &poolMul, &decoderOutMul, &v1Mul, &v2Mul, &v3Mul, &sv3Mul, &ownershipMul})
     result += m->getNumParameters();
-  for(const MatBiasLayerDesc* b : {&pointBias, &vertexBias1, &vertexBias2, &areaBias1, &areaBias2, &globalToken,
+  for(const MatBiasLayerDesc* b : {&pointBias, &globalToken,
                                    &candBias, &groundBias, &v1Bias, &v2Bias, &v3Bias, &sv3Bias})
     result += b->getNumParameters();
   for(const auto& block : blocks)
     result += static_cast<const NestedBottleneckResidualBlockDesc*>(block.second.get())->getNumParameters();
   result += trunkTipRMSNorm.getNumParameters();
-  for(const auto& boundaryOut : trunkBoundaryOut)
-    result += boundaryOut.getNumParameters();
   for(const auto& attention : decoderAttention)
     result += attention.getNumParameters();
   for(const auto& ffn : decoderFFN)
@@ -3237,17 +3180,15 @@ int64_t SparseDotsDesc::getNumParameters() const {
 }
 
 void SparseDotsDesc::releaseWeights() {
-  for(MatMulLayerDesc* m : {&pointMul, &vertexMul1, &vertexMul2, &areaMul1, &areaMul2, &globalMul, &candMul,
+  for(MatMulLayerDesc* m : {&pointMul, &globalMul, &candMul,
                             &groundMul, &poolMul, &decoderOutMul, &v1Mul, &v2Mul, &v3Mul, &sv3Mul, &ownershipMul})
     m->releaseWeights();
-  for(MatBiasLayerDesc* b : {&pointBias, &vertexBias1, &vertexBias2, &areaBias1, &areaBias2, &globalToken,
+  for(MatBiasLayerDesc* b : {&pointBias, &globalToken,
                              &candBias, &groundBias, &v1Bias, &v2Bias, &v3Bias, &sv3Bias})
     b->releaseWeights();
   for(auto& block : blocks)
     static_cast<NestedBottleneckResidualBlockDesc*>(block.second.get())->releaseWeights();
   trunkTipRMSNorm.releaseWeights();
-  for(auto& boundaryOut : trunkBoundaryOut)
-    boundaryOut.releaseWeights();
   for(auto& attention : decoderAttention)
     attention.releaseWeights();
   for(auto& ffn : decoderFFN)

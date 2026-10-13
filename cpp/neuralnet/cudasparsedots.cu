@@ -111,39 +111,6 @@ void sparseDotsAddRowVector(float* x, const float* v, int batchSize, int len, in
 
 //------------------------------------------------------------------------------------------------------------------
 
-__global__ void sparseDotsSegmentMeanMaxKernel(
-  const float* h, const int* segStart, int numSegments, int channels, float* out, int outStride
-) {
-  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i >= (long long)numSegments * channels)
-    return;
-  int a = (int)(i / channels);
-  int c = (int)(i % channels);
-  int start = segStart[a];
-  int end = segStart[a + 1];
-  float sum = 0.0f;
-  float maxV = -1e30f;
-  for(int e = start; e < end; e++) {
-    float v = h[(long long)e * channels + c];
-    sum += v;
-    maxV = fmaxf(maxV, v);
-  }
-  int len = end - start;
-  out[(long long)a * outStride + c] = len > 0 ? sum / (float)len : 0.0f;
-  out[(long long)a * outStride + channels + c] = len > 0 ? maxV : 0.0f;
-}
-
-void sparseDotsSegmentMeanMax(
-  const float* h, const int* segStart, int numSegments, int channels, float* out, int outStride, cudaStream_t stream
-) {
-  if(numSegments <= 0)
-    return;
-  long long n = (long long)numSegments * channels;
-  sparseDotsSegmentMeanMaxKernel<<<numBlocksFor(n, 256), 256, 0, stream>>>(h, segStart, numSegments, channels, out, outStride);
-}
-
-//------------------------------------------------------------------------------------------------------------------
-
 template <typename T>
 __global__ void sparseDotsScaleBiasActKernel(
   const T* in, T* out, const float* scale, const float* bias, const float* mask, long long rows, int channels, int activation
@@ -216,24 +183,6 @@ void sparseDotsRMSNorm(
 ) {
   if(rows > 0)
     sparseDotsRMSNormKernel<T><<<numBlocksFor(rows * 32, 128), 128, 0, stream>>>(in, out, weight, mask, rows, channels, epsilon);
-}
-
-template <typename T>
-__global__ void sparseDotsScatterAddRowsKernel(const T* src, T* dst, const int* dstRows, int numRows, int channels) {
-  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i >= (long long)numRows * channels)
-    return;
-  int r = (int)(i / channels);
-  int c = (int)(i % channels);
-  T* d = dst + (long long)dstRows[r] * channels + c;
-  *d = fromFloat<T>(toFloat(*d) + toFloat(src[i]));
-}
-
-template <typename T>
-void sparseDotsScatterAddRows(const T* src, T* dst, const int* dstRows, int numRows, int channels, cudaStream_t stream) {
-  long long n = (long long)numRows * channels;
-  if(n > 0)
-    sparseDotsScatterAddRowsKernel<T><<<numBlocksFor(n, 256), 256, 0, stream>>>(src, dst, dstRows, numRows, channels);
 }
 
 template <typename T>
@@ -504,76 +453,6 @@ void sparseDotsAttention(
 }
 
 //------------------------------------------------------------------------------------------------------------------
-// Boundary attention: one thread per (area, head), online softmax over the vertices of the area
-
-template <typename T, int qHeadDim, int vHeadDim>
-__global__ void sparseDotsBoundaryAttentionKernel(
-  const T* Q, const T* K, const T* V, const int* areaRows, const int* segStart, const int* vertexRows, T* output,
-  int numAreas, int numHeads, int numKVHeads, float scale
-) {
-  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i >= (long long)numAreas * numHeads)
-    return;
-  const int a = (int)(i / numHeads);
-  const int h = (int)(i % numHeads);
-  const int kvh = h * numKVHeads / numHeads;
-  float qReg[qHeadDim];
-  float acc[vHeadDim];
-  const T* qPtr = Q + ((long long)areaRows[a] * numHeads + h) * qHeadDim;
-  #pragma unroll
-  for(int d = 0; d < qHeadDim; d++)
-    qReg[d] = toFloat(qPtr[d]) * scale;
-  #pragma unroll
-  for(int d = 0; d < vHeadDim; d++)
-    acc[d] = 0.0f;
-  float runningMax = -1e30f;
-  float runningSum = 0.0f;
-  const int end = segStart[a + 1];
-  for(int e = segStart[a]; e < end; e++) {
-    const long long row = vertexRows[e];
-    const T* kPtr = K + (row * numKVHeads + kvh) * qHeadDim;
-    const T* vPtr = V + (row * numKVHeads + kvh) * vHeadDim;
-    float dot = 0.0f;
-    #pragma unroll
-    for(int d = 0; d < qHeadDim; d++)
-      dot += qReg[d] * toFloat(kPtr[d]);
-    const float newMax = fmaxf(runningMax, dot);
-    const float expOld = __expf(runningMax - newMax);
-    const float expCur = __expf(dot - newMax);
-    #pragma unroll
-    for(int d = 0; d < vHeadDim; d++)
-      acc[d] = acc[d] * expOld + expCur * toFloat(vPtr[d]);
-    runningSum = runningSum * expOld + expCur;
-    runningMax = newMax;
-  }
-  T* outRow = output + ((long long)a * numHeads + h) * vHeadDim;
-  const float invSum = runningSum > 0.0f ? 1.0f / runningSum : 0.0f;
-  #pragma unroll
-  for(int d = 0; d < vHeadDim; d++)
-    outRow[d] = fromFloat<T>(acc[d] * invSum);
-}
-
-template <typename T>
-void sparseDotsBoundaryAttention(
-  const T* Q, const T* K, const T* V, const int* areaRows, const int* segStart, const int* vertexRows, T* output,
-  int numAreas, int numHeads, int numKVHeads, int qHeadDim, int vHeadDim, cudaStream_t stream
-) {
-  long long n = (long long)numAreas * numHeads;
-  if(n <= 0)
-    return;
-  const float scale = 1.0f / sqrtf((float)qHeadDim);
-  const int blocks = numBlocksFor(n, 64);
-  if(qHeadDim == 32 && vHeadDim == 32)
-    sparseDotsBoundaryAttentionKernel<T, 32, 32><<<blocks, 64, 0, stream>>>(Q, K, V, areaRows, segStart, vertexRows, output, numAreas, numHeads, numKVHeads, scale);
-  else if(qHeadDim == 64 && vHeadDim == 64)
-    sparseDotsBoundaryAttentionKernel<T, 64, 64><<<blocks, 64, 0, stream>>>(Q, K, V, areaRows, segStart, vertexRows, output, numAreas, numHeads, numKVHeads, scale);
-  else if(qHeadDim == 16 && vHeadDim == 16)
-    sparseDotsBoundaryAttentionKernel<T, 16, 16><<<blocks, 64, 0, stream>>>(Q, K, V, areaRows, segStart, vertexRows, output, numAreas, numHeads, numKVHeads, scale);
-  else
-    throw std::runtime_error("sparseDotsBoundaryAttention: unsupported head dims");
-}
-
-//------------------------------------------------------------------------------------------------------------------
 
 __global__ void sparseDotsPoolKernel(
   const float* x, const float* mask, const float* numTokens, const float* boardOffset, float* out,
@@ -616,9 +495,6 @@ void sparseDotsPool(
   template void sparseDotsBiasAct<T>(T*, const float*, long long, int, int, cudaStream_t); \
   template void sparseDotsRMSNorm<T>(const T*, T*, const float*, const float*, long long, int, float, cudaStream_t); \
   template void sparseDotsResidualAdd<T>(T*, const T*, const float*, long long, int, cudaStream_t); \
-  template void sparseDotsScatterAddRows<T>(const T*, T*, const int*, int, int, cudaStream_t); \
-  template void sparseDotsBoundaryAttention<T>( \
-    const T*, const T*, const T*, const int*, const int*, const int*, T*, int, int, int, int, int, cudaStream_t); \
   template void sparseDotsSwiGLU<T>(T*, const T*, long long, cudaStream_t); \
   template void sparseDotsSpatialRMSNorm<T>( \
     const T*, T*, const float*, const float*, const float*, const float*, int, int, int, float, int, float*, cudaStream_t); \

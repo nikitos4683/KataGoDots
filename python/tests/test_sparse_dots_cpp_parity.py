@@ -33,22 +33,12 @@ def find_katago():
 def json_to_row(entry):
     """A position written by `katago dumpsparsenn` as a row for sparse_dots_testutils.collate (dummy targets)."""
     inp = entry["input"]
-    vertices = []
-    vertex_area = []
-    areas = []
-    for a, area in enumerate(inp["areas"]):
-        areas.append([area["owner"], area["grounded"], area["movesAgo"], area["insideMy"], area["insideOpp"], area["boundaryLen"]])
-        for (x, y) in area["boundary"]:
-            vertices.append((x, y))
-            vertex_area.append(a)
     cands = [(c["x"], c["y"], c["gainMy"], c["gainOpp"], c["inMyHouse"], c["inOppHouse"]) for c in inp["candidates"]]
     return {
         "boardSizeN": [inp["xSize"], inp["ySize"]],
         "globalInputNC": inp["global"],
-        "points": [(p["x"], p["y"], p["owner"], p["grounded"], p["movesAgo"]) for p in inp["points"]],
-        "areas": areas,
-        "vertices": vertices,
-        "vertexArea": vertex_area,
+        "points": [(p["x"], p["y"], p["owner"], p["grounded"], p["movesAgo"], p["areaCount"], p["areaMovesAgo"],
+                    p["insideMy"], p["insideOpp"]) for p in inp["points"]],
         "cands": cands,
         "groundN": [1.0 if inp["groundAllowed"] else 0.0, inp["groundResult"]],
         "candPolicyTargetsNM": [[0, 0] for _ in cands],
@@ -92,14 +82,13 @@ def check_parity(model, entries, atol):
     return max_diff
 
 
-@pytest.mark.parametrize("area_rope,decoder_layers,boundary_attention,x_size,y_size",
-                         [("mean", 2, True, 16, 13), ("none", 1, True, 12, 12), ("mean", 1, False, 13, 13)])
-def test_cpu_reference_matches_pytorch(tmp_path, area_rope, decoder_layers, boundary_attention, x_size, y_size):
+@pytest.mark.parametrize("decoder_layers,x_size,y_size", [(2, 16, 13), (1, 12, 12)])
+def test_cpu_reference_matches_pytorch(tmp_path, decoder_layers, x_size, y_size):
     katago = find_katago()
     if katago is None:
         pytest.skip("No built katago, set KATAGO_SPARSE_TEST_EXE")
     torch.manual_seed(3)
-    model = create_model(tiny_sparse_config(area_rope, decoder_layers, boundary_attention), x_size, y_size, [Game.DOTS])
+    model = create_model(tiny_sparse_config(decoder_layers), x_size, y_size, [Game.DOTS])
     model.initialize()
     with torch.no_grad():
         for name, param in model.named_parameters():
@@ -114,12 +103,13 @@ def test_cpu_reference_matches_pytorch(tmp_path, area_rope, decoder_layers, boun
                    check=True, cwd=PYTHON_DIR, capture_output=True)
     output = tmp_path / "positions.json"
     subprocess.run([katago, "dumpsparsenn", "-model", str(export_dir / "model.bin"), "-output", str(output),
-                    "-num-positions", "60", "-x-size", str(x_size), "-y-size", str(y_size), "-seed", area_rope],
+                    "-num-positions", "60", "-x-size", str(x_size), "-y-size", str(y_size), "-seed", str(decoder_layers)],
                    check=True, capture_output=True)
     with open(output) as f:
         entries = json.load(f)
     assert len(entries) == 60
-    assert any(len(e["input"]["areas"]) > 0 for e in entries)
+    # Positions with areas: some points carry the facts of the areas of their boundaries
+    assert any(p["areaCount"] > 0 for e in entries for p in e["input"]["points"])
     assert any(e["symmetry"] != 0 for e in entries)
     loaded, _ = load_sparse_dots_bin(str(export_dir / "model.bin"), model.config)
     loaded.eval()

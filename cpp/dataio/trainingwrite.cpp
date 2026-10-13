@@ -997,23 +997,17 @@ void TrainingWriteBuffers::writeDotsSparseArrays(ZipFile& zipFile) {
   testAssert(dotsSparseRows.size() == (size_t)curRows);
   const int64_t n = curRows;
   //Padded lengths, at least 1 to avoid empty dimensions
-  int64_t maxPoints = 1, maxAreas = 1, maxVertices = 1, maxCands = 1;
+  int64_t maxPoints = 1, maxCands = 1;
   for(const DotsSparseRow& row : dotsSparseRows) {
     maxPoints = std::max(maxPoints, (int64_t)row.input.points.size());
-    maxAreas = std::max(maxAreas, (int64_t)row.input.areas.size());
-    maxVertices = std::max(maxVertices, (int64_t)row.input.vertices.size());
     maxCands = std::max(maxCands, (int64_t)row.input.candidates.size());
   }
 
   NumpyBuffer<int8_t> boardSizeN({n, 2});
   NumpyBuffer<int16_t> pointCountN({n});
   NumpyBuffer<int8_t> pointCoordsNP({n, maxPoints, 2});
-  NumpyBuffer<int8_t> pointDataNP({n, maxPoints, 3});
-  NumpyBuffer<int16_t> areaCountN({n});
-  NumpyBuffer<int16_t> areaDataNA({n, maxAreas, 6});
-  NumpyBuffer<int16_t> vertexCountN({n});
-  NumpyBuffer<int8_t> vertexCoordsNV({n, maxVertices, 2});
-  NumpyBuffer<int16_t> vertexAreaNV({n, maxVertices});
+  //owner, grounded, movesAgo, areaCount, areaMovesAgo, insideMy, insideOpp
+  NumpyBuffer<int16_t> pointDataNP({n, maxPoints, 7});
   NumpyBuffer<int16_t> candCountN({n});
   NumpyBuffer<int8_t> candCoordsNM({n, maxCands, 2});
   NumpyBuffer<int16_t> candDataNM({n, maxCands, 4});
@@ -1024,10 +1018,7 @@ void TrainingWriteBuffers::writeDotsSparseArrays(ZipFile& zipFile) {
   NumpyBuffer<int8_t> pointOwnershipTargetsNP({n, maxPoints});
 
   std::fill(pointCoordsNP.data, pointCoordsNP.data + pointCoordsNP.dataLen, (int8_t)0);
-  std::fill(pointDataNP.data, pointDataNP.data + pointDataNP.dataLen, (int8_t)0);
-  std::fill(areaDataNA.data, areaDataNA.data + areaDataNA.dataLen, (int16_t)0);
-  std::fill(vertexCoordsNV.data, vertexCoordsNV.data + vertexCoordsNV.dataLen, (int8_t)0);
-  std::fill(vertexAreaNV.data, vertexAreaNV.data + vertexAreaNV.dataLen, (int16_t)0);
+  std::fill(pointDataNP.data, pointDataNP.data + pointDataNP.dataLen, (int16_t)0);
   std::fill(candCoordsNM.data, candCoordsNM.data + candCoordsNM.dataLen, (int8_t)0);
   std::fill(candDataNM.data, candDataNM.data + candDataNM.dataLen, (int16_t)0);
   std::fill(candPolicyTargetsNM.data, candPolicyTargetsNM.data + candPolicyTargetsNM.dataLen, (int16_t)0);
@@ -1046,31 +1037,15 @@ void TrainingWriteBuffers::writeDotsSparseArrays(ZipFile& zipFile) {
       int8_t* coords = pointCoordsNP.data + (r * maxPoints + (int64_t)i) * 2;
       coords[0] = p.x;
       coords[1] = p.y;
-      int8_t* data = pointDataNP.data + (r * maxPoints + (int64_t)i) * 3;
+      int16_t* data = pointDataNP.data + (r * maxPoints + (int64_t)i) * 7;
       data[0] = p.owner;
       data[1] = p.grounded;
       data[2] = p.movesAgo;
+      data[3] = p.areaCount;
+      data[4] = p.areaMovesAgo;
+      data[5] = p.insideMy;
+      data[6] = p.insideOpp;
       pointOwnershipTargetsNP.data[r * maxPoints + (int64_t)i] = row.pointOwnership[i];
-    }
-
-    areaCountN.data[r] = (int16_t)in.areas.size();
-    for(size_t i = 0; i < in.areas.size(); i++) {
-      const auto& a = in.areas[i];
-      int16_t* data = areaDataNA.data + (r * maxAreas + (int64_t)i) * 6;
-      data[0] = a.owner;
-      data[1] = a.grounded;
-      data[2] = a.movesAgo;
-      data[3] = a.insideMy;
-      data[4] = a.insideOpp;
-      data[5] = a.boundaryLen;
-      for(int v = 0; v < a.boundaryLen; v++)
-        vertexAreaNV.data[r * maxVertices + a.vertexStart + v] = (int16_t)i;
-    }
-    vertexCountN.data[r] = (int16_t)in.vertices.size();
-    for(size_t i = 0; i < in.vertices.size(); i++) {
-      int8_t* coords = vertexCoordsNV.data + (r * maxVertices + (int64_t)i) * 2;
-      coords[0] = in.vertices[i].x;
-      coords[1] = in.vertices[i].y;
     }
 
     candCountN.data[r] = (int16_t)in.candidates.size();
@@ -1099,11 +1074,6 @@ void TrainingWriteBuffers::writeDotsSparseArrays(ZipFile& zipFile) {
   writeNumpyToZip(zipFile, "pointCountN", pointCountN, n);
   writeNumpyToZip(zipFile, "pointCoordsNP", pointCoordsNP, n);
   writeNumpyToZip(zipFile, "pointDataNP", pointDataNP, n);
-  writeNumpyToZip(zipFile, "areaCountN", areaCountN, n);
-  writeNumpyToZip(zipFile, "areaDataNA", areaDataNA, n);
-  writeNumpyToZip(zipFile, "vertexCountN", vertexCountN, n);
-  writeNumpyToZip(zipFile, "vertexCoordsNV", vertexCoordsNV, n);
-  writeNumpyToZip(zipFile, "vertexAreaNV", vertexAreaNV, n);
   writeNumpyToZip(zipFile, "candCountN", candCountN, n);
   writeNumpyToZip(zipFile, "candCoordsNM", candCoordsNM, n);
   writeNumpyToZip(zipFile, "candDataNM", candDataNM, n);

@@ -31,7 +31,7 @@ Understanding the differences between Go and Dots is vital when editing game log
 | **Time Controls** | Byo-yomi, Canadian, Fischer | **Bronstein delay** (`time_settings <main> <per-move>`): each move uses per-move delay first; unused delay does not bank |
 | **Expected Game Length** | ~250 moves on 19x19 (~0.69 moves/point) | ~400 moves on 39x32 (~0.32 moves/point). Move temperature decay is normalized against Dots expected length |
 | **Auxiliary Heads** | Seki heads, score distribution heads | Obsolete seki/scoring heads removed. Ownership prediction is masked to placed dots only |
-| **Neural Net** | Dense board tensors (model versions up to 17) | Sparse token model, model version 18 / inputs version 8: tokens for placed dots and enclosed areas, a decoder over the move candidates (see `docs/DotsSparseNN.md`). Dense Dots models are rejected |
+| **Neural Net** | Dense board tensors (model versions up to 17) | Sparse token model, model version 18 / inputs version 8: a token per placed dot outside the enclosed areas (the facts of an area are features of its boundary dots), a decoder over the move candidates (see `docs/DotsSparseNN.md`). Dense Dots models are rejected |
 | **Suicide** | Rules dependent | Forbidden by default (`Rules::DEFAULT_DOTS`); the sparse model is trained only with this rule |
 
 ---
@@ -65,7 +65,7 @@ KataGoDots/
 │   │   ├── nneval.{h,cpp}         # Multi-threaded batched evaluation server
 │   │   ├── nninputs.{h,cpp}       # Feature interfaces, DotsSparseInput, dense feature enums
 │   │   ├── nninputsdots.cpp       # Dense Dots feature extraction (old models, to be removed)
-│   │   ├── nninputsdotssparse.cpp # Sparse Dots position extraction (points, areas, candidates)
+│   │   ├── nninputsdotssparse.cpp # Sparse Dots position extraction (points with the facts of their areas, candidates)
 │   │   ├── sparsedotsnn.{h,cpp}   # CPU reference of the sparse Dots model (used by Eigen and tests)
 │   │   ├── cudasparsedotsmodel.{h,cpp} # CUDA sparse Dots model
 │   │   ├── cudasparsedots.{h,cu}  # CUDA kernels of the sparse Dots model
@@ -267,7 +267,7 @@ The loop carries out five stages sequentially:
    - Never replace `Board` parameters by mutable reference if `hist.initialBoard` could be inadvertently mutated.
 
 3. **Neural Net Features and Heads**:
-   - Dots use the sparse token model (model version 18, inputs version 8), specified in `docs/DotsSparseNN.md` (section 9 lists the implementation decisions). The input is `DotsSparseInput` (`cpp/neuralnet/nninputs.h`, extracted in `nninputsdotssparse.cpp`): points, areas with boundary vertices, move candidates and 8 global features.
+   - Dots use the sparse token model (model version 18, inputs version 8), specified in `docs/DotsSparseNN.md` (section 9 lists the implementation decisions). The input is `DotsSparseInput` (`cpp/neuralnet/nninputs.h`, extracted in `nninputsdotssparse.cpp`): points (with the facts of the areas whose boundary they are on), move candidates and 8 global features.
    - Any model change must be made in PyTorch (`model_sparse_dots.py`), the export (`export_model_pytorch.py`), the C++ descriptor (`desc.cpp`), the CPU reference (`sparsedotsnn.cpp`) and CUDA (`cudasparsedotsmodel.cpp`), then checked with `test_sparse_dots_cpp_parity.py` and `katago testsparsenn`.
    - Only the CUDA and Eigen backends run sparse Dots models; the other backends reject them with an error.
    - The old dense Dots path (`nninputsdots.cpp`, 22 spatial and 19 global features, model versions up to 17) is still in the code but dense Dots models are rejected; it is to be removed once the sparse path is in use.

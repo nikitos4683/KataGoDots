@@ -16,7 +16,6 @@ namespace {
 constexpr float COORD_SCALE = 1.0f / 40.0f;
 constexpr float COUNT_SCALE = 1.0f / 20.0f;
 constexpr int NUM_MOVES_AGO = 5;
-constexpr int FOURIER_PERIODS[5] = {4, 8, 16, 32, 64};
 
 // out[rows x outC] = in[rows x inC] * w[inC x outC], all row-major
 void matmul(const float* in, int rows, int inC, const float* w, int outC, float* out) {
@@ -200,8 +199,6 @@ struct TrunkBlock {
   vector<Attention> attentions;
   vector<FFN> ffns;
   vector<bool> isAttention;
-  // Output projections of the area boundary attention, one per attention sub-block (empty if disabled)
-  vector<Linear> boundaryOut;
   ScaleBiasAct post;
   Linear postConv;
 };
@@ -231,33 +228,12 @@ void SparseDotsNN::pointFeatures(const DotsSparseInput& input, int i, float* out
   out[0] = p.owner;
   edgeFeatures(input, p.x, p.y, out + 1);
   out[5] = p.grounded;
-  out[6] = p.boundary;
-  movesAgoOneHot(p.movesAgo, out + 7);
-}
-
-void SparseDotsNN::vertexFeatures(const DotsSparseInput& input, int i, float* out) {
-  const float x = input.vertices[i].x;
-  const float y = input.vertices[i].y;
-  edgeFeatures(input, x, y, out);
-  for(int p = 0; p < 5; p++) {
-    const float k = (float)(2.0 * 3.14159265358979323846 / FOURIER_PERIODS[p]);
-    out[4 + 4 * p + 0] = sinf(k * x);
-    out[4 + 4 * p + 1] = cosf(k * x);
-    out[4 + 4 * p + 2] = sinf(k * y);
-    out[4 + 4 * p + 3] = cosf(k * y);
-  }
-}
-
-void SparseDotsNN::areaScalarFeatures(const DotsSparseInput& input, int a, float* out) {
-  const auto& area = input.areas[a];
-  out[0] = log1pf((float)std::max<int>(1, area.boundaryLen));
-  float* s = out + 1;
-  s[0] = area.owner;
-  s[1] = area.insideMy * COUNT_SCALE;
-  s[2] = area.insideOpp * COUNT_SCALE;
-  s[3] = area.boundaryLen * COUNT_SCALE;
-  s[4] = area.grounded;
-  movesAgoOneHot(area.movesAgo, s + 5);
+  movesAgoOneHot(p.movesAgo, out + 6);
+  // Facts of the areas whose boundary has the dot
+  out[11] = p.areaCount;
+  out[12] = p.insideMy * COUNT_SCALE;
+  out[13] = p.insideOpp * COUNT_SCALE;
+  movesAgoOneHot(p.areaMovesAgo, out + 14);
 }
 
 void SparseDotsNN::candidateFeatures(const DotsSparseInput& input, int i, float* out) {
@@ -274,19 +250,11 @@ float SparseDotsNN::groundFeature(const DotsSparseInput& input) {
 }
 
 struct SparseDotsNN::Model::Impl {
-  bool areaRopeMean;
   int trunkChannels;
   int midChannels;
-  int vertexChannels;
   int decoderChannels;
 
   Linear point;
-  Linear vertex1;
-  int vertexActivation;
-  Linear vertex2;
-  Linear area1;
-  int areaActivation;
-  Linear area2;
   vector<float> globalToken;
   Linear global;
 
@@ -313,23 +281,14 @@ struct SparseDotsNN::Model::Impl {
   Linear ownership;
 
   explicit Impl(const SparseDotsDesc& desc) {
-    areaRopeMean = desc.areaRopeMean;
     trunkChannels = desc.trunkNumChannels;
     midChannels = desc.midNumChannels;
-    vertexChannels = desc.vertexMul1.outChannels;
     decoderChannels = desc.decoderNumChannels;
 
     point.init(desc.pointMul, desc.pointBias);
-    vertex1.init(desc.vertexMul1, desc.vertexBias1);
-    vertexActivation = desc.vertexActivation.activation;
-    vertex2.init(desc.vertexMul2, desc.vertexBias2);
-    area1.init(desc.areaMul1, desc.areaBias1);
-    areaActivation = desc.areaActivation.activation;
-    area2.init(desc.areaMul2, desc.areaBias2);
     globalToken = desc.globalToken.weights;
     global.init(desc.globalMul);
 
-    size_t boundaryOutIdx = 0;
     for(const auto& blockPair : desc.blocks) {
       const auto& nested = *static_cast<const NestedBottleneckResidualBlockDesc*>(blockPair.second.get());
       TrunkBlock block;
@@ -340,10 +299,6 @@ struct SparseDotsNN::Model::Impl {
           block.attentions.emplace_back();
           block.attentions.back().init(*static_cast<const TransformerAttentionDesc*>(sub.second.get()));
           block.isAttention.push_back(true);
-          if(desc.areaBoundaryAttention) {
-            block.boundaryOut.emplace_back();
-            block.boundaryOut.back().init(desc.trunkBoundaryOut[boundaryOutIdx++]);
-          }
         }
         else {
           testAssert(sub.first == TRANSFORMER_FFN_BLOCK_KIND);
@@ -356,7 +311,6 @@ struct SparseDotsNN::Model::Impl {
       block.postConv.initConv1x1(nested.postConv);
       blocks.push_back(std::move(block));
     }
-    testAssert(boundaryOutIdx == desc.trunkBoundaryOut.size());
     tipGamma = desc.trunkTipRMSNorm.gamma;
     tipBeta = desc.trunkTipRMSNorm.beta;
     tipEpsilon = desc.trunkTipRMSNorm.epsilon;
@@ -385,14 +339,13 @@ struct SparseDotsNN::Model::Impl {
     ownership.init(desc.ownershipMul);
   }
 
-  // Tables of the trunk tokens [GLOBAL][POINT x P][AREA x A] for the frequencies of a layer
+  // Tables of the trunk tokens [GLOBAL][POINT x P] for the frequencies of a layer, GLOBAL has no position
   void tokenTables(const Attention& layer, const DotsSparseInput& input, RopeTables& tables) const {
     const int kvHeads = layer.numKVHeads;
     const int pairs = layer.numPairs();
     const int hp = kvHeads * pairs;
     const int numPoints = (int)input.points.size();
-    const int numAreas = (int)input.areas.size();
-    const int seqLen = 1 + numPoints + numAreas;
+    const int seqLen = 1 + numPoints;
     tables.cos.assign((size_t)seqLen * hp, 0.0f);
     tables.sin.assign((size_t)seqLen * hp, 0.0f);
     const float* freqs = layer.ropeFreqs.data();
@@ -403,23 +356,6 @@ struct SparseDotsNN::Model::Impl {
         const float angle = x * freqs[2 * i] + y * freqs[2 * i + 1];
         tables.cos[(size_t)(1 + t) * hp + i] = cosf(angle);
         tables.sin[(size_t)(1 + t) * hp + i] = sinf(angle);
-      }
-    }
-    if(areaRopeMean) {
-      for(int a = 0; a < numAreas; a++) {
-        const auto& area = input.areas[a];
-        const float weight = 1.0f / (float)std::max<int>(1, area.boundaryLen);
-        float* c = tables.cos.data() + (size_t)(1 + numPoints + a) * hp;
-        float* s = tables.sin.data() + (size_t)(1 + numPoints + a) * hp;
-        for(int v = 0; v < area.boundaryLen; v++) {
-          const float x = input.vertices[area.vertexStart + v].x;
-          const float y = input.vertices[area.vertexStart + v].y;
-          for(int i = 0; i < hp; i++) {
-            const float angle = x * freqs[2 * i] + y * freqs[2 * i + 1];
-            c[i] += cosf(angle) * weight;
-            s[i] += sinf(angle) * weight;
-          }
-        }
       }
     }
   }
@@ -463,13 +399,11 @@ struct SparseDotsNN::Model::Impl {
 
   // Attention of the normalized queries [numQueries x Cq] to the keys/values source [seqLen x Ckv].
   // Returns the output projection [numQueries x Cq] in result.
-  // q, k and v after RoPE are kept in qkv if it's not null
   static void attend(
     const Attention& layer,
     const float* queriesNorm, int numQueries, const RopeTables& queryTables,
     const float* source, int seqLen, const RopeTables& keyTables,
-    vector<float>& result,
-    vector<float>* qkv = nullptr
+    vector<float>& result
   ) {
     const int heads = layer.numHeads;
     const int kvHeads = layer.numKVHeads;
@@ -516,78 +450,12 @@ struct SparseDotsNN::Model::Impl {
     }
     result.resize((size_t)numQueries * layer.out.outC);
     layer.out.apply(attnOut.data(), numQueries, result.data());
-    if(qkv != nullptr) {
-      qkv[0] = std::move(q);
-      qkv[1] = std::move(k);
-      qkv[2] = std::move(v);
-    }
-  }
-
-  // Attention of every area to the points of its boundary only, with the q, k, v of the trunk attention.
-  // Adds the projected result to the area tokens of mid.
-  static void boundaryAttend(
-    const Attention& layer, const Linear& outProj, const DotsSparseInput& input, const vector<float>* qkv, float* mid
-  ) {
-    const int numPoints = (int)input.points.size();
-    const int numAreas = (int)input.areas.size();
-    if(numAreas == 0)
-      return;
-    const int heads = layer.numHeads;
-    const int kvHeads = layer.numKVHeads;
-    const int dq = layer.qHeadDim;
-    const int dv = layer.vHeadDim;
-    const float scale = 1.0f / sqrtf((float)dq);
-    const vector<float>& q = qkv[0];
-    const vector<float>& k = qkv[1];
-    const vector<float>& v = qkv[2];
-    vector<float> out((size_t)numAreas * heads * dv, 0.0f);
-    vector<float> scores;
-    for(int a = 0; a < numAreas; a++) {
-      const auto& area = input.areas[a];
-      const int areaToken = 1 + numPoints + a;
-      scores.resize(area.boundaryLen);
-      for(int h = 0; h < heads; h++) {
-        const int kvh = h * kvHeads / heads;
-        const float* qa = q.data() + (size_t)areaToken * heads * dq + (size_t)h * dq;
-        float maxScore = -1e30f;
-        for(int i = 0; i < area.boundaryLen; i++) {
-          const int pointToken = 1 + input.vertexPoints[area.vertexStart + i];
-          const float* kp = k.data() + (size_t)pointToken * kvHeads * dq + (size_t)kvh * dq;
-          float dot = 0.0f;
-          for(int d = 0; d < dq; d++)
-            dot += qa[d] * kp[d];
-          scores[i] = dot * scale;
-          maxScore = std::max(maxScore, scores[i]);
-        }
-        float sum = 0.0f;
-        for(int i = 0; i < area.boundaryLen; i++) {
-          scores[i] = expf(scores[i] - maxScore);
-          sum += scores[i];
-        }
-        float* o = out.data() + (size_t)a * heads * dv + (size_t)h * dv;
-        for(int i = 0; i < area.boundaryLen; i++) {
-          const int pointToken = 1 + input.vertexPoints[area.vertexStart + i];
-          const float* vp = v.data() + (size_t)pointToken * kvHeads * dv + (size_t)kvh * dv;
-          const float weight = scores[i] / sum;
-          for(int d = 0; d < dv; d++)
-            o[d] += weight * vp[d];
-        }
-      }
-    }
-    vector<float> projected((size_t)numAreas * outProj.outC);
-    outProj.apply(out.data(), numAreas, projected.data());
-    for(int a = 0; a < numAreas; a++) {
-      float* m = mid + (size_t)(1 + numPoints + a) * outProj.outC;
-      for(int i = 0; i < outProj.outC; i++)
-        m[i] += projected[(size_t)a * outProj.outC + i];
-    }
   }
 
   void evaluate(const DotsSparseInput& input, RawOutput& result) const {
     const int numPoints = (int)input.points.size();
-    const int numAreas = (int)input.areas.size();
     const int numCands = (int)input.candidates.size();
-    const int seqLen = 1 + numPoints + numAreas;
+    const int seqLen = 1 + numPoints;
     const int c = trunkChannels;
     const float xSize = (float)input.xSize;
     const float ySize = (float)input.ySize;
@@ -600,45 +468,6 @@ struct SparseDotsNN::Model::Impl {
       for(int i = 0; i < numPoints; i++)
         pointFeatures(input, i, features.data() + (size_t)i * NUM_POINT_FEATURES);
       point.apply(features.data(), numPoints, trunk.data() + c);
-    }
-    if(numAreas > 0) {
-      const int numVertices = (int)input.vertices.size();
-      vector<float> vf((size_t)numVertices * NUM_VERTEX_FEATURES);
-      for(int i = 0; i < numVertices; i++)
-        vertexFeatures(input, i, vf.data() + (size_t)i * NUM_VERTEX_FEATURES);
-      const int cv = vertexChannels;
-      vector<float> h1((size_t)numVertices * cv);
-      vector<float> h((size_t)numVertices * cv);
-      vertex1.apply(vf.data(), numVertices, h1.data());
-      activateAll(vertexActivation, h1.data(), h1.size());
-      vertex2.apply(h1.data(), numVertices, h.data());
-
-      const int aggC = 2 * cv + NUM_AREA_SCALAR_FEATURES;
-      vector<float> agg((size_t)numAreas * aggC, 0.0f);
-      for(int a = 0; a < numAreas; a++) {
-        const auto& area = input.areas[a];
-        float* g = agg.data() + (size_t)a * aggC;
-        const int len = std::max<int>(1, area.boundaryLen);
-        for(int i = 0; i < cv; i++)
-          g[cv + i] = -1e30f;
-        for(int vtx = 0; vtx < area.boundaryLen; vtx++) {
-          const float* hv = h.data() + (size_t)(area.vertexStart + vtx) * cv;
-          for(int i = 0; i < cv; i++) {
-            g[i] += hv[i];
-            g[cv + i] = std::max(g[cv + i], hv[i]);
-          }
-        }
-        for(int i = 0; i < cv; i++)
-          g[i] /= (float)len;
-        if(area.boundaryLen == 0)
-          for(int i = 0; i < cv; i++)
-            g[cv + i] = 0.0f;
-        areaScalarFeatures(input, a, g + 2 * cv);
-      }
-      vector<float> a1((size_t)numAreas * c);
-      area1.apply(agg.data(), numAreas, a1.data());
-      activateAll(areaActivation, a1.data(), a1.size());
-      area2.apply(a1.data(), numAreas, trunk.data() + (size_t)(1 + numPoints) * c);
     }
     {
       vector<float> g(c);
@@ -654,7 +483,6 @@ struct SparseDotsNN::Model::Impl {
     vector<float> mid((size_t)seqLen * midChannels);
     vector<float> midTmp((size_t)seqLen * midChannels);
     vector<float> attnOut;
-    vector<float> qkv[3];
     for(const TrunkBlock& block : blocks) {
       block.pre.apply(trunk.data(), seqLen, tmp.data());
       block.preConv.apply(tmp.data(), seqLen, mid.data());
@@ -662,16 +490,12 @@ struct SparseDotsNN::Model::Impl {
       size_t ffnIdx = 0;
       for(bool isAttention : block.isAttention) {
         if(isAttention) {
-          const Attention& layer = block.attentions[attentionIdx];
-          const bool boundary = !block.boundaryOut.empty();
+          const Attention& layer = block.attentions[attentionIdx++];
           layer.norm.apply(mid.data(), seqLen, midTmp.data());
           tokenTables(layer, input, tables);
-          attend(layer, midTmp.data(), seqLen, tables, midTmp.data(), seqLen, tables, attnOut, boundary ? qkv : nullptr);
+          attend(layer, midTmp.data(), seqLen, tables, midTmp.data(), seqLen, tables, attnOut);
           for(size_t i = 0; i < mid.size(); i++)
             mid[i] += attnOut[i];
-          if(boundary)
-            boundaryAttend(layer, block.boundaryOut[attentionIdx], input, qkv, mid.data());
-          attentionIdx++;
         }
         else {
           block.ffns[ffnIdx++].applyResidual(mid.data(), seqLen);
