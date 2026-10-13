@@ -495,6 +495,8 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     attn_logit_penalty_cap = args["attn_logit_penalty_cap"]
     attn_logit_penalty_coeff = args["attn_logit_penalty_coeff"]
     attn_logit_penalty_batch_frac = args["attn_logit_penalty_batch_frac"]
+    if Game.DOTS in games and attn_logit_penalty_cap is not None:
+        raise ValueError("-attn-logit-penalty-cap is not supported by the sparse Dots models")
     soft_policy_weight_scale = args["soft_policy_weight_scale"]
     disable_optimistic_policy = args["disable_optimistic_policy"]
     meta_kata_only_soft_policy = args["meta_kata_only_soft_policy"]

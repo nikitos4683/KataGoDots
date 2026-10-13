@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+from katago.train import modelconfigs
 from katago.train.metrics_sparse_dots import SparseDotsMetrics
 from katago.train.model_pytorch import Game
 from katago.train.model_sparse_dots import SparsePositions, apply_symmetry_to_batch, count_mask, create_model, trim_batch
@@ -227,9 +228,7 @@ def test_overfit_tiny_set():
     assert last["loss_sum"] < 0.3 * first["loss_sum"]
 
 
-@pytest.mark.parametrize("decoder_layers", [2, 1])
-def test_export_round_trip(tmp_path, decoder_layers):
-    model = make_model(seed=1, decoder_layers=decoder_layers)
+def export_and_load(model, tmp_path):
     checkpoint = tmp_path / "model.ckpt"
     torch.save({
         "model": model.state_dict(),
@@ -247,6 +246,13 @@ def test_export_round_trip(tmp_path, decoder_layers):
     loaded, info = load_sparse_dots_bin(str(export_dir / "model.bin"), model.config)
     assert info["name"] == "sparse-roundtrip" and info["version"] == 18
     loaded.eval()
+    return loaded
+
+
+@pytest.mark.parametrize("decoder_layers", [2, 1])
+def test_export_round_trip(tmp_path, decoder_layers):
+    model = make_model(seed=1, decoder_layers=decoder_layers)
+    loaded = export_and_load(model, tmp_path)
 
     batch = random_batch(6, n=5)
     out = run(model, batch)
@@ -262,3 +268,54 @@ def test_export_round_trip(tmp_path, decoder_layers):
     assert torch.allclose(moremisc[:, 0:2], moremisc_l[:, 0:2], atol=1e-5)
     point_mask = count_mask(batch["pointCountN"], batch["pointCoordsNP"].shape[1]) > 0
     assert torch.allclose(ownership[point_mask], ownership_l[point_mask], atol=1e-5)
+
+
+@pytest.mark.parametrize("name", ["b5c384h6nbttflrs-fson-silu-rsnh", "b5c384h6nbttflrs-fson-silu-rsnh-dec1"])
+def test_target_kind_is_sparse(name):
+    config = modelconfigs.get_config(name, dots=True)
+    assert config["sparse_dots"] and config["version"] == modelconfigs.SPARSE_DOTS_VERSION
+    assert config["candidate_decoder_layers"] == (1 if name.endswith("-dec1") else 2)
+
+
+@pytest.mark.parametrize("name, reason", [
+    ("b6c96", "block kind"),
+    ("b6c384h6nbttflrs-dwc-fson-silu-rsnh", "transformer_ffn_depthwise_conv"),
+    ("b6c384h6nbttflrs-qkn-fson-silu-rsnh", "attention_qk_norm"),
+])
+def test_unsupported_kinds_are_rejected(name, reason):
+    with pytest.raises(ValueError, match=reason):
+        modelconfigs.get_config(name, dots=True)
+
+
+@pytest.mark.parametrize("changes, reason", [
+    ({"block_kind": [["block1", "bottlenest2transformerrope"]]}, "block kind"),
+    ({"learnable_rope": False}, "RoPE"),
+    ({"trunk_rmsnorm_spatial": False}, "rsnh"),
+    ({"norm_kind": "bnorm"}, "norm kind"),
+    ({"norm_kind": "fixbrenorm"}, "norm kind"),
+    ({"activation": "gelu"}, "activation"),
+] + [({option: True}, option) for option in modelconfigs.SPARSE_DOTS_UNSUPPORTED_OPTIONS])
+def test_unsupported_options_are_rejected(changes, reason):
+    config = dict(modelconfigs.config_of_name["b5c384h6nbttflrs-fson-silu-rsnh"])
+    assert modelconfigs.sparse_dots_config_error(config) is None
+    config.update(changes)
+    error = modelconfigs.sparse_dots_config_error(config)
+    assert error is not None and reason in error
+
+
+@pytest.mark.parametrize("norm_kind, activation, kv_heads", [
+    ("fixup", "relu", 2),
+    ("fixscale", "mish", 1),
+    ("fixscaleonenorm", "silu", 1),
+])
+def test_supported_variants_export(tmp_path, norm_kind, activation, kv_heads):
+    config = tiny_sparse_config()
+    config.update({"norm_kind": norm_kind, "activation": activation, "transformer_kv_heads": kv_heads})
+    assert modelconfigs.sparse_dots_config_error(config) is None
+    torch.manual_seed(2)
+    model = create_model(config, 9, 7, [Game.DOTS])
+    model.initialize()
+    model.eval()
+    loaded = export_and_load(model, tmp_path)
+    batch = random_batch(7, n=3)
+    assert torch.allclose(run(model, batch)[1], run(loaded, batch)[1], atol=1e-5)

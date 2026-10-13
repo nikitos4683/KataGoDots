@@ -555,7 +555,7 @@ class SparseDotsModel(torch.nn.Module):
         # Trunk
         self.blocks = torch.nn.ModuleList()
         for block_name, block_kind in self.block_kind:
-            internal_length, use_swiglu = modelconfigs.SPARSE_DOTS_TRUNK_BLOCK_KINDS[block_kind]
+            internal_length = modelconfigs.SPARSE_DOTS_TRUNK_BLOCK_KINDS[block_kind]
             block = NestedBottleneckTransformerBlock(
                 name=block_name,
                 internal_length=internal_length,
@@ -565,7 +565,7 @@ class SparseDotsModel(torch.nn.Module):
                 activation=self.activation,
                 pos_len_x=pos_len_x,
                 pos_len_y=pos_len_y,
-                use_swiglu=use_swiglu,
+                use_swiglu=True,
                 use_rope=True,
             )
             for sub in block.blockstack:

@@ -82,13 +82,20 @@ def check_parity(model, entries, atol):
     return max_diff
 
 
-@pytest.mark.parametrize("decoder_layers,x_size,y_size", [(2, 16, 13), (1, 12, 12)])
-def test_cpu_reference_matches_pytorch(tmp_path, decoder_layers, x_size, y_size):
+@pytest.mark.parametrize("decoder_layers,x_size,y_size,changes", [
+    (2, 16, 13, {}),
+    (1, 12, 12, {}),
+    # Other supported options: norm kind, activation, grouped-query attention
+    (2, 12, 10, {"norm_kind": "fixup", "activation": "mish", "transformer_kv_heads": 1}),
+])
+def test_cpu_reference_matches_pytorch(tmp_path, decoder_layers, x_size, y_size, changes):
     katago = find_katago()
     if katago is None:
         pytest.skip("No built katago, set KATAGO_SPARSE_TEST_EXE")
     torch.manual_seed(3)
-    model = create_model(tiny_sparse_config(decoder_layers), x_size, y_size, [Game.DOTS])
+    config = tiny_sparse_config(decoder_layers)
+    config.update(changes)
+    model = create_model(config, x_size, y_size, [Game.DOTS])
     model.initialize()
     with torch.no_grad():
         for name, param in model.named_parameters():

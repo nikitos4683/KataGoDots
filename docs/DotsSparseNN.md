@@ -337,7 +337,11 @@ C++ записывает **целочисленные координаты и и
 
 ### 9.2. Модель (PyTorch)
 
-- **Конфиг**: при `-game dots` любое имя трансформерной модели даёт разреженную модель (`modelconfigs.get_config(name, dots=True)`, версия 18). Суффикс для сравнений: `-dec1` (один слой декодера).
+- **Конфиг**: при `-game dots` имя трансформерной модели даёт разреженную модель (`modelconfigs.get_config(name, dots=True)`, версия 18). Суффикс для сравнений: `-dec1` (один слой декодера). Принимаются только конфиги, которые разреженный путь реализует целиком (`sparse_dots_config_error`), остальные отклоняются с ошибкой:
+  - блоки `bottlenest2transformerropesg`, `bottlenest3transformerropesg` (FFN в C++ только SwiGLU), learnable RoPE, `-rsnh`;
+  - нормализация `fixup`, `fixscale`, `fixscaleonenorm` (батч-нормам нужна пространственная раскладка);
+  - активации `relu`, `mish`, `silu`;
+  - GQA (`transformer_kv_heads`) поддерживается; `qk_norm`, регистры, `dwc`, channel gate, residual backout, RepVGG, `metadata_encoder` — нет.
 - **Последовательность**: `[GLOBAL][POINT×P]`, маска `[N,S,1]`. Токен `GLOBAL` — обучаемый вектор; ко всем токенам прибавляется `linear_global(globals)`.
 - **Эмбеддинг** `POINT` — `Linear(19→C)` с bias.
 - **Признаки** (одинаково в PyTorch и C++):
@@ -350,7 +354,7 @@ C++ записывает **целочисленные координаты и и
 - **Value-голова**: как у KataGo, но `conv1` → `Linear(C→v1)` + bias; член чётности в scorebelief удалён (у Точек он всегда 0). Ownership — `Linear(v1→1)` от выхода `act1` на токенах `POINT`, логит сигмоиды.
 - **Потери**: как у KataGo с такими же весами; policy — общий softmax по M+1; цель соперника нормируется после проекции, при нулевой сумме вес выходов 1 и 3 равен 0; ownership — BCE, среднее по точкам строки; futurepos — по кандидатам-пунктам, `/ sqrt(x_size·y_size)`.
 - **Симметрии** при обучении — только преобразование координат батча (`apply_symmetry_to_batch`). Модель не зависит от порядка токенов; геометрически симметричной её делает обучение, как и свёрточную сеть KataGo.
-- **`train.py`** с `-games DOTS` создаёт разреженную модель (`create_model`), читает данные `read_npz_training_data_sparse` (`data_processing_sparse_dots.py`), считает потери `SparseDotsMetrics` и работает без `torch.compile`: число токенов меняется от батча к батчу.
+- **`train.py`** с `-games DOTS` создаёт разреженную модель (`create_model`), читает данные `read_npz_training_data_sparse` (`data_processing_sparse_dots.py`), считает потери `SparseDotsMetrics` и работает без `torch.compile`: число токенов меняется от батча к батчу. `-attn-logit-penalty-cap` не поддерживается.
 
 ### 9.3. Файл модели версии 18
 
