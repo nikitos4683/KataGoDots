@@ -419,10 +419,6 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     use_amp = use_fp16 or use_bf16
     amp_dtype = torch.bfloat16 if use_bf16 else torch.float16
     no_compile = args["no_compile"]
-    if Game.DOTS in games and not no_compile:
-        # Sparse Dots batches have a different number of tokens every time
-        logging.info("Sparse Dots models are trained without torch.compile")
-        no_compile = True
     use_tf32_matmul = args["use_tf32_matmul"]
 
     def make_metrics(raw_model):
@@ -572,6 +568,10 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
     np.set_printoptions(linewidth=150)
 
     logging.info(str(sys.argv))
+
+    if not no_compile and not trainloop_helpers.ensure_msvc_for_compile():
+        logging.warning("torch.compile needs the MSVC compiler (cl.exe) on Windows and none was found, training without it")
+        no_compile = True
 
     # FIGURE OUT MULTIGPU ------------------------------------------------------------
     if world_size > 1:
@@ -1618,7 +1618,8 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
 
     model_norms_only_at_print = trainloop_helpers.get_model_norms_only_at_print()
     logging.info(f"model_norms_only_at_print {model_norms_only_at_print}")
-    training_metrics_fn = trainloop_helpers.make_training_metrics_fn(metrics_obj, no_compile, model_norms_only_at_print)
+    training_metrics_fn = trainloop_helpers.make_training_metrics_fn(
+        metrics_obj, no_compile, model_norms_only_at_print, dynamic=isinstance(raw_model, SparseDotsModel))
     step_norm_tracker = trainloop_helpers.StepNormTracker(optimizer)
     gnorm_watcher = trainloop_helpers.GnormWatcher()
 
