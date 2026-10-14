@@ -9,7 +9,7 @@ import torch
 from katago.train import modelconfigs
 
 
-def tiny_sparse_config(decoder_layers=2):
+def tiny_sparse_config(decoder_layers=1):
     config = dict(modelconfigs.config_of_name["b5c384h6nbttflrs-fson-silu-rsnh"])
     config.update({
         "trunk_num_channels": 64,
