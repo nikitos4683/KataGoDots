@@ -1002,3 +1002,192 @@ int MainCmds::testsparsenn(const vector<string>& args) {
   NeuralNet::globalCleanup();
   return ok ? 0 : 1;
 }
+
+// Positions of the games of sgfs files, each kept with the given probability
+static vector<DotsSparseInput> sgfsSparseDotsPositions(Rand& rand, const vector<string>& sgfsFiles, double keepProb, int& numGames) {
+  vector<DotsSparseInput> result;
+  numGames = 0;
+  for(std::unique_ptr<Sgf>& sgfPtr : Sgf::loadSgfsFiles(sgfsFiles)) {
+    const CompactSgf sgf(std::move(*sgfPtr));
+    if(!sgf.isDots)
+      continue;
+    Rules rules = sgf.getRulesOrFail();
+    // Tolerate moves into the opponent's houses that real games may contain (5.14)
+    rules.multiStoneSuicideLegal = true;
+    Player pla;
+    BoardHistory hist = sgf.setupInitialBoardAndHist(rules, pla, BoardHistoryModes());
+    Board board = hist.initialBoard;
+    numGames++;
+    for(const Move& move : sgf.moves) {
+      if(hist.isGameFinished)
+        break;
+      if(rand.nextBool(keepProb)) {
+        MiscNNInputParams params;
+        DotsSparseInput input;
+        NNInputs::fillDotsSparseInput(board, hist, pla, params, input, false);
+        result.push_back(input);
+      }
+      if(!hist.isLegal(board, move.loc, move.pla))
+        break;
+      hist.makeBoardMoveAssumeLegal(board, move.loc, move.pla, nullptr);
+      pla = getOpp(move.pla);
+    }
+  }
+  return result;
+}
+
+int MainCmds::benchsparsenn(const vector<string>& args) {
+  Board::initHash();
+  ScoreValue::initTables();
+
+  string modelFile;
+  vector<string> sgfsFiles;
+  int numPositions;
+  int batchSize;
+  int numBatches;
+  int numThreads;
+  string useFP16Str;
+  try {
+    KataGoCommandLine cmd(
+      "Measure the speed of the neural net backend of this build on a sparse Dots model (version 18). The batches mix "
+      "positions of different games and stages, as in selfplay.");
+    TCLAP::ValueArg<string> modelArg("","model","Sparse Dots model file",true,string(),"FILE");
+    TCLAP::MultiArg<string> sgfsArg("","sgfs","Sgfs files with the games to take the positions from (random games if none)",false,"FILE");
+    TCLAP::ValueArg<int> numPositionsArg("","num-positions","Number of distinct positions",false,4096,"N");
+    TCLAP::ValueArg<int> batchSizeArg("","batch-size","Batch size",false,64,"N");
+    TCLAP::ValueArg<int> numBatchesArg("","num-batches","Number of timed batches per thread",false,100,"N");
+    TCLAP::ValueArg<int> numThreadsArg("","threads","Number of threads, each with its own compute handle",false,1,"N");
+    TCLAP::ValueArg<string> useFP16Arg("","use-fp16","true, false or auto",false,"auto","BOOL");
+    cmd.add(modelArg);
+    cmd.add(sgfsArg);
+    cmd.add(numPositionsArg);
+    cmd.add(batchSizeArg);
+    cmd.add(numBatchesArg);
+    cmd.add(numThreadsArg);
+    cmd.add(useFP16Arg);
+    cmd.parseArgs(args);
+    modelFile = modelArg.getValue();
+    sgfsFiles = sgfsArg.getValue();
+    numPositions = numPositionsArg.getValue();
+    batchSize = batchSizeArg.getValue();
+    numBatches = numBatchesArg.getValue();
+    numThreads = numThreadsArg.getValue();
+    useFP16Str = useFP16Arg.getValue();
+  }
+  catch (TCLAP::ArgException &e) {
+    cerr << "Error: " << e.error() << " for argument " << e.argId() << endl;
+    return 1;
+  }
+  enabled_t useFP16;
+  if(!enabled_t::tryParse(useFP16Str, useFP16))
+    throw StringError("benchsparsenn: bad use-fp16 value " + useFP16Str);
+  if(batchSize < 1 || numBatches < 1 || numPositions < 1 || numThreads < 1)
+    throw StringError("benchsparsenn: batch-size, num-batches, num-positions and threads must be positive");
+
+  Rand rand("benchsparsenn");
+  int numGames = 0;
+  vector<DotsSparseInput> positions;
+  if(sgfsFiles.empty()) {
+    positions = randomSparseDotsPositions(rand, Board::DEFAULT_LEN_X_DOTS, Board::DEFAULT_LEN_Y_DOTS, numPositions, numGames);
+  }
+  else {
+    // Keep about numPositions positions of all the games
+    int numAll = 0;
+    positions = sgfsSparseDotsPositions(rand, sgfsFiles, 1.0, numGames);
+    numAll = (int)positions.size();
+    if(numAll > numPositions) {
+      for(int i = numAll - 1; i > 0; i--)
+        std::swap(positions[i], positions[rand.nextUInt((uint32_t)(i + 1))]);
+      positions.resize(numPositions);
+    }
+  }
+  if(positions.empty())
+    throw StringError("benchsparsenn: no positions");
+  for(int i = (int)positions.size() - 1; i > 0; i--)
+    std::swap(positions[i], positions[rand.nextUInt((uint32_t)(i + 1))]);
+  const int xSize = positions[0].xSize;
+  const int ySize = positions[0].ySize;
+  double sumPoints = 0.0, sumCands = 0.0;
+  for(const DotsSparseInput& input : positions) {
+    if(input.xSize != xSize || input.ySize != ySize)
+      throw StringError("benchsparsenn: all the games must have the same board size");
+    sumPoints += (double)input.points.size();
+    sumCands += (double)input.candidates.size();
+  }
+
+  Logger logger(nullptr, true);
+  NeuralNet::globalInitialize();
+  LoadedModel* loadedModel = NeuralNet::loadModelFile(modelFile, "");
+  if(!NeuralNet::getModelDesc(loadedModel).isSparseDots())
+    throw StringError("benchsparsenn: not a sparse Dots model");
+  ConfigParser cfg(std::map<string, string>{});
+  ComputeContext* context = NeuralNet::createComputeContext({0}, &logger, xSize, ySize, "", useFP16, loadedModel, cfg);
+  cout << "Positions: " << positions.size() << " from " << numGames << " games, " << xSize << "x" << ySize
+       << ", mean points " << sumPoints / positions.size() << ", mean candidates " << sumCands / positions.size()
+       << ", batch size " << batchSize << ", threads " << numThreads << endl;
+
+  // Every thread has its own compute handle (and CUDA stream), like the NN server threads of an NNEvaluator
+  std::atomic<int> numReady(0);
+  std::atomic<bool> go(false);
+  std::atomic<bool> usingFP16(false);
+  auto worker = [&](int threadIdx) {
+    ComputeHandle* handle = NeuralNet::createComputeHandle(context, loadedModel, &logger, batchSize, false, true, 0, threadIdx);
+    InputBuffers* inputBuffers = NeuralNet::createInputBuffers(loadedModel, batchSize, xSize, ySize);
+    usingFP16 = NeuralNet::isUsingFP16(handle);
+    Rand threadRand("benchsparsenn" + Global::intToString(threadIdx));
+    vector<NNResultBuf> bufs(batchSize);
+    vector<NNResultBuf*> bufPtrs;
+    vector<NNOutput> outputs(batchSize);
+    vector<NNOutput*> outputPtrs;
+    vector<vector<float>> ownerMaps(batchSize, vector<float>((size_t)xSize * ySize));
+    for(int i = 0; i < batchSize; i++) {
+      bufPtrs.push_back(&bufs[i]);
+      outputs[i].nnXLen = xSize;
+      outputs[i].nnYLen = ySize;
+      outputs[i].whiteOwnerMap = ownerMaps[i].data();
+      outputs[i].noisedPolicyProbs = nullptr;
+      outputPtrs.push_back(&outputs[i]);
+    }
+    size_t next = (positions.size() * threadIdx) / numThreads;
+    auto runBatch = [&]() {
+      for(int i = 0; i < batchSize; i++) {
+        bufs[i].dotsSparseInput = positions[next];
+        bufs[i].symmetry = (int)threadRand.nextUInt(SymmetryHelpers::NUM_SYMMETRIES);
+        bufs[i].policyOptimism = 0.0;
+        next = (next + 1) % positions.size();
+      }
+      NeuralNet::getOutput(handle, inputBuffers, batchSize, bufPtrs.data(), outputPtrs, true);
+    };
+    const int numWarmup = std::max(5, numBatches / 10);
+    for(int i = 0; i < numWarmup; i++)
+      runBatch();
+    numReady++;
+    while(!go)
+      std::this_thread::yield();
+    for(int i = 0; i < numBatches; i++)
+      runBatch();
+    for(NNOutput& output : outputs)
+      output.whiteOwnerMap = nullptr;
+    NeuralNet::freeInputBuffers(inputBuffers);
+    NeuralNet::freeComputeHandle(handle);
+  };
+  vector<std::thread> threads;
+  for(int t = 0; t < numThreads; t++)
+    threads.emplace_back(worker, t);
+  while(numReady < numThreads)
+    std::this_thread::yield();
+  ClockTimer timer;
+  go = true;
+  for(std::thread& thread : threads)
+    thread.join();
+  const double seconds = timer.getSeconds();
+  const double totalBatches = (double)numBatches * numThreads;
+  cout << "FP16 " << Global::boolToString(usingFP16) << ", batches: " << (int64_t)totalBatches << ", "
+       << (seconds * 1000.0 / numBatches) << " ms per batch of a thread, " << (totalBatches * batchSize / seconds)
+       << " positions per second" << endl;
+
+  NeuralNet::freeComputeContext(context);
+  NeuralNet::freeLoadedModel(loadedModel);
+  NeuralNet::globalCleanup();
+  return 0;
+}
