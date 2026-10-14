@@ -10,6 +10,9 @@
 //     keys are all masked, outputs zeros.
 //   - The cross attention variant (launchFlashAttentionMmaCross) has qLen queries per batch
 //     element and kvLen keys, a key mask [batchSize, kvLen] and no query mask.
+//   - The varlen variant (launchFlashAttentionMmaVarlen) has no padding and no masks: batch
+//     element n owns the query rows [qStarts[n], qStarts[n+1]) and the key rows
+//     [kvStarts[n], kvStarts[n+1]) of Q/K/V/output packed one after another.
 //
 // FlashAttention-2 style: online softmax in FP32, K/V tiled through shared memory,
 // Q fragments held in registers, one warp per 16 query rows. FP32 accumulation for both
@@ -131,13 +134,15 @@ __device__ __forceinline__ void fmmaCpAsyncWaitAll() {
 // (sum > 0 ? 1/sum : 0) yields all-zero output, matching the scalar kernel.
 #define FMMA_NEG_BIG (-1e30f)
 
-// D = qHeadDim = vHeadDim; 32 or 64.
-template<int D>
+// D = qHeadDim = vHeadDim; 32 or 64. With VARLEN, qLen and kvLen are ignored and the rows of
+// batch element n are given by qStarts and kvStarts.
+template<int D, bool VARLEN>
 __global__ void __launch_bounds__(FMMA_NWARPS * 32)
 flashAttentionMmaKernel(
   const half* __restrict__ Q, const half* __restrict__ K, const half* __restrict__ V,
   const half* __restrict__ qMask, const half* __restrict__ kvMask, half* __restrict__ out,
-  int qLen, int kvLen, int numHeads, int numKVHeads, float scale, int qStride, int kvStride
+  int qLen, int kvLen, int numHeads, int numKVHeads, float scale, int qStride, int kvStride,
+  const int* __restrict__ qStarts, const int* __restrict__ kvStarts
 ) {
 #if __CUDA_ARCH__ >= 750
   constexpr int BQ = FMMA_BLOCK_Q;
@@ -162,6 +167,19 @@ flashAttentionMmaKernel(
   const int n = blockIdx.z;
   const int kvh = h * numKVHeads / numHeads;
 
+  // First query and key rows of this batch element
+  size_t qRowBase = (size_t)n * qLen;
+  size_t kvRowBase = (size_t)n * kvLen;
+  if(VARLEN) {
+    qRowBase = (size_t)qStarts[n];
+    kvRowBase = (size_t)kvStarts[n];
+    qLen = qStarts[n + 1] - qStarts[n];
+    kvLen = kvStarts[n + 1] - kvStarts[n];
+    // The grid covers the longest element, the whole block exits before any barrier
+    if(qBlockStart >= qLen)
+      return;
+  }
+
   // Per-token row strides of Q and of K/V are launch parameters so that Q/K/V may be
   // interior slices of a combined [tokens, q+k+v] projection output. K and V share a stride
   // (they always come from the same buffer and Dq == Dv). The output is always packed.
@@ -180,9 +198,9 @@ flashAttentionMmaKernel(
   static_assert(BKV % 32 == 0 && NTHREADS >= BKV, "mask ballot layout");
   static_assert(BQ <= BKV, "Q staging reuses buffer 1's K tile and must fit in it");
 
-  const half* Kbase = K + (size_t)n * kvLen * kvStride + kvh * D;
-  const half* Vbase = V + (size_t)n * kvLen * kvStride + kvh * D;
-  const half* maskBase = (kvMask != NULL) ? kvMask + (size_t)n * kvLen : NULL;
+  const half* Kbase = K + kvRowBase * kvStride + kvh * D;
+  const half* Vbase = V + kvRowBase * kvStride + kvh * D;
+  const half* maskBase = (kvMask != NULL) ? kvMask + kvRowBase : NULL;
 
   constexpr int KVVECS = BKV * (D / VEC);
   const int numKvTiles = (kvLen + BKV - 1) / BKV;
@@ -230,7 +248,7 @@ flashAttentionMmaKernel(
       int qPos = qBlockStart + row;
       uint4 val = make_uint4(0, 0, 0, 0);
       if(qPos < qLen)
-        val = *reinterpret_cast<const uint4*>(Q + ((size_t)n * qLen + qPos) * qStride + h * D + d0);
+        val = *reinterpret_cast<const uint4*>(Q + (qRowBase + qPos) * qStride + h * D + d0);
       *reinterpret_cast<uint4*>(&qTile[row * ST + d0]) = val;
     }
   }
@@ -420,9 +438,9 @@ flashAttentionMmaKernel(
     const int r0 = qBlockStart + warp * 16 + gr;
     const int r1 = r0 + 8;
     if(r0 < qLen) {
-      float qm = (qMask != NULL) ? (float)qMask[(size_t)n * qLen + r0] : 1.0f;
+      float qm = (qMask != NULL) ? (float)qMask[qRowBase + r0] : 1.0f;
       float f = (qm != 0.0f) ? inv0 : 0.0f;
-      half* o = out + ((size_t)n * qLen + r0) * oTotalDim + h * D;
+      half* o = out + (qRowBase + r0) * oTotalDim + h * D;
       #pragma unroll
       for(int nt = 0; nt < NT_O; nt++) {
         int d0 = nt * 8 + q4 * 2;
@@ -430,9 +448,9 @@ flashAttentionMmaKernel(
       }
     }
     if(r1 < qLen) {
-      float qm = (qMask != NULL) ? (float)qMask[(size_t)n * qLen + r1] : 1.0f;
+      float qm = (qMask != NULL) ? (float)qMask[qRowBase + r1] : 1.0f;
       float f = (qm != 0.0f) ? inv1 : 0.0f;
-      half* o = out + ((size_t)n * qLen + r1) * oTotalDim + h * D;
+      half* o = out + (qRowBase + r1) * oTotalDim + h * D;
       #pragma unroll
       for(int nt = 0; nt < NT_O; nt++) {
         int d0 = nt * 8 + q4 * 2;
@@ -488,8 +506,19 @@ inline void launchFlashAttentionMmaForDim(
 ) {
   dim3 grid((qLen + FMMA_BLOCK_Q - 1) / FMMA_BLOCK_Q, numHeads, batchSize);
   dim3 block(FMMA_NWARPS * 32);
-  flashAttentionMmaKernel<D><<<grid, block, 0, stream>>>(
-    Q, K, V, qMask, kvMask, out, qLen, kvLen, numHeads, numKVHeads, scale, qStride, kvStride);
+  flashAttentionMmaKernel<D, false><<<grid, block, 0, stream>>>(
+    Q, K, V, qMask, kvMask, out, qLen, kvLen, numHeads, numKVHeads, scale, qStride, kvStride, NULL, NULL);
+}
+
+template<int D>
+inline void launchFlashAttentionMmaVarlenForDim(
+  const half* Q, const half* K, const half* V, half* out, const int* qStarts, const int* kvStarts,
+  int batchSize, int maxQLen, int numHeads, int numKVHeads, float scale, int qStride, int kvStride, cudaStream_t stream
+) {
+  dim3 grid((maxQLen + FMMA_BLOCK_Q - 1) / FMMA_BLOCK_Q, numHeads, batchSize);
+  dim3 block(FMMA_NWARPS * 32);
+  flashAttentionMmaKernel<D, true><<<grid, block, 0, stream>>>(
+    Q, K, V, NULL, NULL, out, 0, 0, numHeads, numKVHeads, scale, qStride, kvStride, qStarts, kvStarts);
 }
 }  // namespace flashmma
 
@@ -565,4 +594,34 @@ inline bool launchFlashAttentionMmaCross(
 ) {
   return launchFlashAttentionMmaGeneral(
     Q, K, V, NULL, kvMask, out, batchSize, qLen, kvLen, numHeads, numKVHeads, qHeadDim, vHeadDim, qStride, kvStride, stream);
+}
+
+// Packed attention without padding and masks: batch element n has the query rows [qStarts[n], qStarts[n+1])
+// and the key/value rows [kvStarts[n], kvStarts[n+1]) (device arrays), maxQLen is the max number of query rows
+// of an element. Returns false like launchFlashAttentionMmaGeneral.
+inline bool launchFlashAttentionMmaVarlen(
+  const half* Q, const half* K, const half* V, half* out, const int* qStarts, const int* kvStarts,
+  int batchSize, int maxQLen, int numHeads, int numKVHeads, int qHeadDim, int vHeadDim,
+  int qStride, int kvStride, cudaStream_t stream
+) {
+  using namespace flashmma;
+  if(!flashAttentionMmaSupportsShape(numHeads, numKVHeads, qHeadDim, vHeadDim))
+    return false;
+  if(batchSize <= 0 || maxQLen <= 0 || batchSize > 65535)
+    return false;
+  if(qStride < numHeads * qHeadDim || kvStride < numKVHeads * qHeadDim)
+    return false;
+  if((((uintptr_t)Q) | ((uintptr_t)K) | ((uintptr_t)V) | ((uintptr_t)out)) & 15)
+    return false;
+  if(qStride % 8 != 0 || kvStride % 8 != 0)
+    return false;
+
+  float scale = 1.0f / sqrtf((float)qHeadDim);
+  if(qHeadDim == 32)
+    launchFlashAttentionMmaVarlenForDim<32>(
+      Q, K, V, out, qStarts, kvStarts, batchSize, maxQLen, numHeads, numKVHeads, scale, qStride, kvStride, stream);
+  else
+    launchFlashAttentionMmaVarlenForDim<64>(
+      Q, K, V, out, qStarts, kvStarts, batchSize, maxQLen, numHeads, numKVHeads, scale, qStride, kvStride, stream);
+  return true;
 }

@@ -5,6 +5,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <type_traits>
@@ -21,8 +22,6 @@ using namespace std;
 
 namespace {
 
-constexpr int SEQ_LEN_ALIGN = 8;
-
 // A device buffer that only grows
 struct DeviceBuf {
   void* ptr = nullptr;
@@ -36,11 +35,11 @@ struct DeviceBuf {
   DeviceBuf(const DeviceBuf&) = delete;
   DeviceBuf& operator=(const DeviceBuf&) = delete;
 
-  // Grows the buffer to at least the given size, dropping the content
+  // Grows the buffer to at least the given size, dropping the content. Grows with a margin, the batches vary.
   void ensure(size_t need) {
     if(need <= bytes)
       return;
-    const size_t newBytes = std::max(need, bytes + bytes / 2);
+    const size_t newBytes = std::max(need, bytes + bytes / 4);
     if(ptr != nullptr)
       (void)cudaFree(ptr);
     ptr = nullptr;
@@ -57,6 +56,32 @@ struct DeviceBuf {
   }
   float* f() const { return (float*)ptr; }
   int* i() const { return (int*)ptr; }
+};
+
+// A pinned host buffer that only grows, for asynchronous copies
+struct PinnedBuf {
+  char* ptr = nullptr;
+  size_t bytes = 0;
+
+  PinnedBuf() {}
+  ~PinnedBuf() {
+    if(ptr != nullptr)
+      (void)cudaFreeHost(ptr);
+  }
+  PinnedBuf(const PinnedBuf&) = delete;
+  PinnedBuf& operator=(const PinnedBuf&) = delete;
+
+  void ensure(size_t need) {
+    if(need <= bytes)
+      return;
+    const size_t newBytes = std::max(need, bytes + bytes / 4);
+    if(ptr != nullptr)
+      (void)cudaFreeHost(ptr);
+    ptr = nullptr;
+    bytes = 0;
+    CUDA_ERR("SparseDotsCudaModel", cudaHostAlloc((void**)&ptr, newBytes, cudaHostAllocDefault));
+    bytes = newBytes;
+  }
 };
 
 // Weights [in x out] row-major, an optional FP32 bias
@@ -80,6 +105,29 @@ struct Linear {
       b.upload(bias->name, bias->weights, false);
     }
   }
+  // Several layers with the same input as one: their outputs are concatenated in each row
+  void initConcat(const vector<const MatMulLayerDesc*>& descs, bool fp16) {
+    testAssert(!descs.empty());
+    name = descs[0]->name;
+    inC = descs[0]->inChannels;
+    outC = 0;
+    useFP16 = fp16;
+    for(const MatMulLayerDesc* desc : descs) {
+      testAssert(desc->inChannels == inC);
+      testAssert(desc->weights.size() == (size_t)inC * desc->outChannels);
+      outC += desc->outChannels;
+    }
+    vector<float> weights((size_t)inC * outC);
+    int offset = 0;
+    for(const MatMulLayerDesc* desc : descs) {
+      const int oc = desc->outChannels;
+      for(int ic = 0; ic < inC; ic++)
+        for(int o = 0; o < oc; o++)
+          weights[(size_t)ic * outC + offset + o] = desc->weights[(size_t)ic * oc + o];
+      offset += oc;
+    }
+    w.upload(name, weights, useFP16);
+  }
   void initConv1x1(const ConvLayerDesc& desc, bool fp16) {
     testAssert(desc.convXSize == 1 && desc.convYSize == 1);
     name = desc.name;
@@ -95,6 +143,8 @@ struct Linear {
   }
 };
 
+// Self-attention (selfAttention) projects q, k and v of the same rows with one GEMM into rows [q | k | v].
+// Cross-attention projects q of the queries, and k and v of the keys with one GEMM into rows [k | v].
 struct Attention {
   int numHeads = 0;
   int numKVHeads = 0;
@@ -102,10 +152,12 @@ struct Attention {
   int vHeadDim = 0;
   float epsilon = 0.0f;
   DeviceBuf normWeight;
-  Linear q, k, v, out;
+  Linear qkv;
+  Linear q, kv;
+  Linear out;
   DeviceBuf ropeFreqs;
 
-  void init(const TransformerAttentionDesc& desc, bool fp16) {
+  void init(const TransformerAttentionDesc& desc, bool selfAttention, bool fp16) {
     testAssert(desc.useRope && desc.learnableRope);
     numHeads = desc.numHeads;
     numKVHeads = desc.numKVHeads;
@@ -115,27 +167,38 @@ struct Attention {
     testAssert(qHeadDim % 2 == 0);
     testAssert(desc.ropeFreqs.size() == (size_t)numKVHeads * (qHeadDim / 2) * 2);
     normWeight.upload(desc.preLN.name, desc.preLN.weight, false);
-    q.init(desc.qProj, nullptr, fp16);
-    k.init(desc.kProj, nullptr, fp16);
-    v.init(desc.vProj, nullptr, fp16);
+    if(selfAttention) {
+      qkv.initConcat({&desc.qProj, &desc.kProj, &desc.vProj}, fp16);
+    }
+    else {
+      q.init(desc.qProj, nullptr, fp16);
+      kv.initConcat({&desc.kProj, &desc.vProj}, fp16);
+    }
     out.init(desc.outProj, nullptr, fp16);
     ropeFreqs.upload(desc.name + "/ropeFreqs", desc.ropeFreqs, false);
   }
-  int numKVHeadPairs() const { return numKVHeads * (qHeadDim / 2); }
+  int qDim() const { return numHeads * qHeadDim; }
+  int kDim() const { return numKVHeads * qHeadDim; }
+  int vDim() const { return numKVHeads * vHeadDim; }
+  int attDim() const { return numHeads * vHeadDim; }
 };
 
+// SwiGLU FFN, linear1 and the gate as one GEMM into rows [a | g]
 struct FFN {
   float epsilon = 0.0f;
+  int channels = 0;
   DeviceBuf normWeight;
-  Linear linear1, gate, linear2;
+  Linear linear1Gate, linear2;
 
   void init(const TransformerFFNDesc& desc, bool fp16) {
     testAssert(desc.useSwiGLU);
     epsilon = desc.preLN.epsilon;
     normWeight.upload(desc.preLN.name, desc.preLN.weight, false);
-    linear1.init(desc.linear1, nullptr, fp16);
-    gate.init(desc.linearGate, nullptr, fp16);
+    testAssert(desc.linear1.outChannels == desc.linearGate.outChannels);
+    channels = desc.linear1.outChannels;
+    linear1Gate.initConcat({&desc.linear1, &desc.linearGate}, fp16);
     linear2.init(desc.linear2, nullptr, fp16);
+    testAssert(linear2.inC == channels);
   }
 };
 
@@ -152,9 +215,8 @@ struct TrunkBlock {
   Linear postConv;
 };
 
-// Host staging of all the inputs of a batch, uploaded with a single copy
-struct HostPack {
-  vector<char> data;
+// Offsets of the parts of a staging buffer, the same for the host and the device copies
+struct Layout {
   size_t size = 0;
   size_t reserve(size_t bytes) {
     const size_t offset = (size + 255) & ~(size_t)255;
@@ -244,15 +306,16 @@ struct SparseDotsCudaModel::Impl {
   Linear ownership;
 
   // Max widths over the layers, to size the work buffers
-  int maxQDim = 0, maxKDim = 0, maxVDim = 0, maxAttDim = 0, maxFFN = 0, maxHP = 0;
-  int maxDecQDim = 0, maxDecKDim = 0, maxDecVDim = 0, maxDecAttDim = 0, maxDecFFN = 0, maxDecHP = 0;
+  int maxQKVDim = 0, maxAttDim = 0, maxFFN = 0;
+  int maxDecQDim = 0, maxDecKVDim = 0, maxDecAttDim = 0, maxDecFFN = 0;
 
-  // Work buffers
+  // Staging of the inputs and the outputs
+  PinnedBuf hostIn, hostOut;
   DeviceBuf inputDev;
-  DeviceBuf seqF, trunkH, tmp, mid, midN, q, k, v, att, ffA, ffG, delta, cosT, sinT, maskH, sumSq;
+  // Work buffers. qkv, att and ffn are shared by the trunk and the decoder, which run one after another.
+  DeviceBuf seqF, trunkH, tmp, mid, midN, qkv, att, ffn, sumSq;
   DeviceBuf pointEmb, globalProj;
-  DeviceBuf pooled, poolProj, queries, queriesNorm, candEmb, groundEmb, dq, dk, dv, datt, dffA, dffG;
-  DeviceBuf queriesF, cosQ, sinQ, policyH, policy;
+  DeviceBuf pooled, poolProj, queriesF, queriesH, queriesNorm, candEmb, groundEmb, dq, policyH, policy;
   DeviceBuf outV1, pooledV, outV2, value, scoreValue, ownershipOut;
 
   Impl(const SparseDotsDesc& desc, bool fp16, bool mma, cudaStream_t stream_, cublasHandle_t cublas_, Logger* logger_)
@@ -280,21 +343,18 @@ struct SparseDotsCudaModel::Impl {
       for(const auto& sub : nested.blocks) {
         if(sub.first == TRANSFORMER_ATTENTION_BLOCK_KIND) {
           auto attention = std::make_unique<Attention>();
-          attention->init(*static_cast<const TransformerAttentionDesc*>(sub.second.get()), useFP16);
-          maxQDim = std::max(maxQDim, attention->numHeads * attention->qHeadDim);
-          maxKDim = std::max(maxKDim, attention->numKVHeads * attention->qHeadDim);
-          maxVDim = std::max(maxVDim, attention->numKVHeads * attention->vHeadDim);
-          maxAttDim = std::max(maxAttDim, attention->numHeads * attention->vHeadDim);
-          maxHP = std::max(maxHP, attention->numKVHeadPairs());
+          attention->init(*static_cast<const TransformerAttentionDesc*>(sub.second.get()), true, useFP16);
+          maxQKVDim = std::max(maxQKVDim, attention->qkv.outC);
+          maxAttDim = std::max(maxAttDim, attention->attDim());
           block->attentions.push_back(std::move(attention));
           block->isAttention.push_back(true);
         }
         else {
           testAssert(sub.first == TRANSFORMER_FFN_BLOCK_KIND);
-          auto ffn = std::make_unique<FFN>();
-          ffn->init(*static_cast<const TransformerFFNDesc*>(sub.second.get()), useFP16);
-          maxFFN = std::max(maxFFN, ffn->linear1.outC);
-          block->ffns.push_back(std::move(ffn));
+          auto ffnLayer = std::make_unique<FFN>();
+          ffnLayer->init(*static_cast<const TransformerFFNDesc*>(sub.second.get()), useFP16);
+          maxFFN = std::max(maxFFN, ffnLayer->channels);
+          block->ffns.push_back(std::move(ffnLayer));
           block->isAttention.push_back(false);
         }
       }
@@ -316,17 +376,15 @@ struct SparseDotsCudaModel::Impl {
     testAssert(desc.decoderAttention.size() == desc.decoderFFN.size());
     for(size_t l = 0; l < desc.decoderAttention.size(); l++) {
       auto attention = std::make_unique<Attention>();
-      attention->init(desc.decoderAttention[l], useFP16);
-      maxDecQDim = std::max(maxDecQDim, attention->numHeads * attention->qHeadDim);
-      maxDecKDim = std::max(maxDecKDim, attention->numKVHeads * attention->qHeadDim);
-      maxDecVDim = std::max(maxDecVDim, attention->numKVHeads * attention->vHeadDim);
-      maxDecAttDim = std::max(maxDecAttDim, attention->numHeads * attention->vHeadDim);
-      maxDecHP = std::max(maxDecHP, attention->numKVHeadPairs());
+      attention->init(desc.decoderAttention[l], false, useFP16);
+      maxDecQDim = std::max(maxDecQDim, attention->qDim());
+      maxDecKVDim = std::max(maxDecKVDim, attention->kv.outC);
+      maxDecAttDim = std::max(maxDecAttDim, attention->attDim());
       decoderAttentions.push_back(std::move(attention));
-      auto ffn = std::make_unique<FFN>();
-      ffn->init(desc.decoderFFN[l], useFP16);
-      maxDecFFN = std::max(maxDecFFN, ffn->linear1.outC);
-      decoderFFNs.push_back(std::move(ffn));
+      auto ffnLayer = std::make_unique<FFN>();
+      ffnLayer->init(desc.decoderFFN[l], useFP16);
+      maxDecFFN = std::max(maxDecFFN, ffnLayer->channels);
+      decoderFFNs.push_back(std::move(ffnLayer));
     }
     decoderNormWeight.upload(desc.decoderFinalNorm.name, desc.decoderFinalNorm.weight, false);
     decoderNormEpsilon = desc.decoderFinalNorm.epsilon;
@@ -345,9 +403,9 @@ struct SparseDotsCudaModel::Impl {
     testAssert(ownership.outC == 1);
   }
 
-  // out[rows x outC] (+)= in[rows x inC] * w, then bias and activation
+  // out[rows x outC] (+)= in[rows x inC] * w, then bias and activation. inLd is the row stride of in (inC if 0).
   void gemm(const Linear& layer, const void* in, long long rows, void* out, bool accumulate = false,
-            int activation = ACTIVATION_IDENTITY) {
+            int activation = ACTIVATION_IDENTITY, int inLd = 0) {
     if(rows <= 0)
       return;
     testAssert(rows <= INT_MAX);
@@ -359,7 +417,7 @@ struct SparseDotsCudaModel::Impl {
       layer.outC, (int)rows, layer.inC,
       &alpha,
       layer.w.ptr, type, layer.outC,
-      in, type, layer.inC,
+      in, type, inLd > 0 ? inLd : layer.inC,
       &beta,
       out, type, layer.outC,
       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
@@ -369,64 +427,64 @@ struct SparseDotsCudaModel::Impl {
       sparseDotsBiasAct<float>((float*)out, layer.b.f(), rows, layer.outC, activation, stream);
   }
 
-  // Positions of the batch (fixed for one evaluate call)
+  // The rows of the batch (fixed for one evaluate call)
   struct Batch {
-    int n = 0;    // number of positions
-    int s = 0;    // padded trunk tokens per position
-    int qLen = 0; // padded candidate queries per position
+    int n = 0;          // number of positions
+    int tokens = 0;     // trunk rows: 1 + points of every position
+    int queries = 0;    // decoder rows: candidates + grounding of every position
+    int maxTokens = 0;  // max trunk rows of a position
+    int maxQueries = 0; // max decoder rows of a position
     int totalPoints = 0, totalCands = 0, totalGrounds = 0;
-    int totalTokPos = 0, totalCandPos = 0;
+    vector<int> tokStartHost, qStartHost;
     // Device pointers into inputDev
     float* pointFeat; int* pointDst;
-    float* global;
-    float* mask; float* numTokens; float* boardOffset;
-    int* tokSeg; float* tokPos;
+    float* global; float* boardOffset;
+    int* tokStart; int* tokSeg; float* tokPos;
     float* candFeat; int* candDst;
     float* groundFeat; int* groundDst;
-    int* candSeg; float* candPos;
+    int* qStart; int* qSeg; float* qPos;
   };
 
-  void pack(const vector<const DotsSparseInput*>& inputs, Batch& b, HostPack& host) {
+  void pack(const vector<const DotsSparseInput*>& inputs, const vector<int>& symmetries, Batch& b) {
     b.n = (int)inputs.size();
-    int maxTokens = 1;
-    int maxQueries = 1;
-    for(const DotsSparseInput* in : inputs) {
-      const int numPoints = (int)in->points.size();
-      maxTokens = std::max(maxTokens, 1 + numPoints);
-      maxQueries = std::max(maxQueries, (int)in->candidates.size() + (in->groundAllowed ? 1 : 0));
-      b.totalPoints += numPoints;
+    b.tokStartHost.assign(b.n + 1, 0);
+    b.qStartHost.assign(b.n + 1, 0);
+    for(int n = 0; n < b.n; n++) {
+      const DotsSparseInput* in = inputs[n];
+      const int numTokens = 1 + (int)in->points.size();
+      const int numQueries = (int)in->candidates.size() + (in->groundAllowed ? 1 : 0);
+      b.tokStartHost[n + 1] = b.tokStartHost[n] + numTokens;
+      b.qStartHost[n + 1] = b.qStartHost[n] + numQueries;
+      b.maxTokens = std::max(b.maxTokens, numTokens);
+      b.maxQueries = std::max(b.maxQueries, numQueries);
+      b.totalPoints += (int)in->points.size();
       b.totalCands += (int)in->candidates.size();
       b.totalGrounds += in->groundAllowed ? 1 : 0;
-      b.totalTokPos += numPoints;
-      b.totalCandPos += (int)in->candidates.size();
     }
-    b.s = (maxTokens + SEQ_LEN_ALIGN - 1) / SEQ_LEN_ALIGN * SEQ_LEN_ALIGN;
-    b.qLen = maxQueries;
-    const int numTokens = b.n * b.s;
-    const int numQueries = b.n * b.qLen;
-    host.size = 0;
-    const size_t oPointFeat = host.reserve(sizeof(float) * b.totalPoints * SparseDotsNN::NUM_POINT_FEATURES);
-    const size_t oPointDst = host.reserve(sizeof(int) * b.totalPoints);
-    const size_t oGlobal = host.reserve(sizeof(float) * b.n * NNInputs::NUM_FEATURES_GLOBAL_DOTS_SPARSE);
-    const size_t oMask = host.reserve(sizeof(float) * numTokens);
-    const size_t oNumTokens = host.reserve(sizeof(float) * b.n);
-    const size_t oBoardOffset = host.reserve(sizeof(float) * b.n);
-    const size_t oTokSeg = host.reserve(sizeof(int) * (numTokens + 1));
-    const size_t oTokPos = host.reserve(sizeof(float) * 3 * b.totalTokPos);
-    const size_t oCandFeat = host.reserve(sizeof(float) * b.totalCands * SparseDotsNN::NUM_CAND_FEATURES);
-    const size_t oCandDst = host.reserve(sizeof(int) * b.totalCands);
-    const size_t oGroundFeat = host.reserve(sizeof(float) * b.totalGrounds);
-    const size_t oGroundDst = host.reserve(sizeof(int) * b.totalGrounds);
-    const size_t oCandSeg = host.reserve(sizeof(int) * (numQueries + 1));
-    const size_t oCandPos = host.reserve(sizeof(float) * 3 * b.totalCandPos);
-    host.data.assign(host.size, 0);
+    b.tokens = b.tokStartHost[b.n];
+    b.queries = b.qStartHost[b.n];
 
-    char* h = host.data.data();
+    Layout layout;
+    const size_t oPointFeat = layout.reserve(sizeof(float) * b.totalPoints * SparseDotsNN::NUM_POINT_FEATURES);
+    const size_t oPointDst = layout.reserve(sizeof(int) * b.totalPoints);
+    const size_t oGlobal = layout.reserve(sizeof(float) * b.n * NNInputs::NUM_FEATURES_GLOBAL_DOTS_SPARSE);
+    const size_t oBoardOffset = layout.reserve(sizeof(float) * b.n);
+    const size_t oTokStart = layout.reserve(sizeof(int) * (b.n + 1));
+    const size_t oTokSeg = layout.reserve(sizeof(int) * b.tokens);
+    const size_t oTokPos = layout.reserve(sizeof(float) * 3 * b.tokens);
+    const size_t oCandFeat = layout.reserve(sizeof(float) * b.totalCands * SparseDotsNN::NUM_CAND_FEATURES);
+    const size_t oCandDst = layout.reserve(sizeof(int) * b.totalCands);
+    const size_t oGroundFeat = layout.reserve(sizeof(float) * b.totalGrounds);
+    const size_t oGroundDst = layout.reserve(sizeof(int) * b.totalGrounds);
+    const size_t oQStart = layout.reserve(sizeof(int) * (b.n + 1));
+    const size_t oQSeg = layout.reserve(sizeof(int) * b.queries);
+    const size_t oQPos = layout.reserve(sizeof(float) * 3 * b.queries);
+    hostIn.ensure(layout.size);
+
+    char* h = hostIn.ptr;
     float* pointFeat = (float*)(h + oPointFeat);
     int* pointDst = (int*)(h + oPointDst);
     float* global = (float*)(h + oGlobal);
-    float* mask = (float*)(h + oMask);
-    float* numTokensHost = (float*)(h + oNumTokens);
     float* boardOffset = (float*)(h + oBoardOffset);
     int* tokSeg = (int*)(h + oTokSeg);
     float* tokPos = (float*)(h + oTokPos);
@@ -434,89 +492,101 @@ struct SparseDotsCudaModel::Impl {
     int* candDst = (int*)(h + oCandDst);
     float* groundFeat = (float*)(h + oGroundFeat);
     int* groundDst = (int*)(h + oGroundDst);
-    int* candSeg = (int*)(h + oCandSeg);
-    float* candPos = (float*)(h + oCandPos);
+    int* qSeg = (int*)(h + oQSeg);
+    float* qPos = (float*)(h + oQPos);
+    std::memcpy(h + oTokStart, b.tokStartHost.data(), sizeof(int) * (b.n + 1));
+    std::memcpy(h + oQStart, b.qStartHost.data(), sizeof(int) * (b.n + 1));
 
-    int pointRow = 0, candRow = 0, groundRow = 0, tokPosRow = 0, candPosRow = 0;
+    int pointRow = 0, candRow = 0, groundRow = 0;
     for(int n = 0; n < b.n; n++) {
       const DotsSparseInput& in = *inputs[n];
+      const int symmetry = symmetries[n];
+      const bool transpose = SymmetryHelpers::isTranspose(symmetry);
+      const int xSize = transpose ? in.ySize : in.xSize;
+      const int ySize = transpose ? in.xSize : in.ySize;
       const int numPoints = (int)in.points.size();
       const int numCands = (int)in.candidates.size();
-      const int tokenBase = n * b.s;
-      std::copy(in.global, in.global + NNInputs::NUM_FEATURES_GLOBAL_DOTS_SPARSE,
-                global + (size_t)n * NNInputs::NUM_FEATURES_GLOBAL_DOTS_SPARSE);
-      for(int t = 0; t < 1 + numPoints; t++)
-        mask[tokenBase + t] = 1.0f;
-      numTokensHost[n] = (float)(1 + numPoints);
+      const int tokenBase = b.tokStartHost[n];
+      const int queryBase = b.qStartHost[n];
+
+      float* g = global + (size_t)n * NNInputs::NUM_FEATURES_GLOBAL_DOTS_SPARSE;
+      std::copy(in.global, in.global + NNInputs::NUM_FEATURES_GLOBAL_DOTS_SPARSE, g);
+      if(transpose) {
+        std::swap(
+          g[static_cast<int>(NNInputs::DotsSparseGlobalFeature::XSize_6)],
+          g[static_cast<int>(NNInputs::DotsSparseGlobalFeature::YSize_7)]);
+      }
       boardOffset[n] = sqrtf((float)in.xSize * (float)in.ySize) - 14.0f;
 
+      // Trunk rows: GLOBAL (no position) then the points
+      tokSeg[tokenBase] = n;
+      tokPos[3 * tokenBase] = 0.0f;
+      tokPos[3 * tokenBase + 1] = 0.0f;
+      tokPos[3 * tokenBase + 2] = 0.0f;
       for(int i = 0; i < numPoints; i++) {
-        SparseDotsNN::pointFeatures(in, i, pointFeat + (size_t)(pointRow + i) * SparseDotsNN::NUM_POINT_FEATURES);
-        pointDst[pointRow + i] = tokenBase + 1 + i;
-      }
-      // RoPE positions of the trunk tokens: GLOBAL and padding have none
-      tokSeg[tokenBase] = tokPosRow;
-      for(int t = 1; t < b.s; t++) {
-        tokSeg[tokenBase + t] = tokPosRow;
-        if(t <= numPoints) {
-          const auto& p = in.points[t - 1];
-          tokPos[3 * tokPosRow] = p.x;
-          tokPos[3 * tokPosRow + 1] = p.y;
-          tokPos[3 * tokPosRow + 2] = 1.0f;
-          tokPosRow++;
-        }
+        const auto& p = in.points[i];
+        int x, y;
+        DotsSparseInput::applySymmetry(p.x, p.y, in.xSize, in.ySize, symmetry, x, y);
+        SparseDotsNN::pointFeaturesAt(p, x, y, xSize, ySize, pointFeat + (size_t)(pointRow + i) * SparseDotsNN::NUM_POINT_FEATURES);
+        const int row = tokenBase + 1 + i;
+        pointDst[pointRow + i] = row;
+        tokSeg[row] = n;
+        tokPos[3 * row] = (float)x;
+        tokPos[3 * row + 1] = (float)y;
+        tokPos[3 * row + 2] = 1.0f;
       }
 
-      // Candidate queries: point candidates then grounding (no position), then padding
-      const int queryBase = n * b.qLen;
+      // Decoder rows: the point candidates then the grounding (no position)
       for(int i = 0; i < numCands; i++) {
-        SparseDotsNN::candidateFeatures(in, i, candFeat + (size_t)(candRow + i) * SparseDotsNN::NUM_CAND_FEATURES);
-        candDst[candRow + i] = queryBase + i;
+        const auto& cnd = in.candidates[i];
+        int x, y;
+        DotsSparseInput::applySymmetry(cnd.x, cnd.y, in.xSize, in.ySize, symmetry, x, y);
+        SparseDotsNN::candidateFeaturesAt(cnd, x, y, xSize, ySize, candFeat + (size_t)(candRow + i) * SparseDotsNN::NUM_CAND_FEATURES);
+        const int row = queryBase + i;
+        candDst[candRow + i] = row;
+        qSeg[row] = n;
+        qPos[3 * row] = (float)x;
+        qPos[3 * row + 1] = (float)y;
+        qPos[3 * row + 2] = 1.0f;
       }
       if(in.groundAllowed) {
+        const int row = queryBase + numCands;
         groundFeat[groundRow] = SparseDotsNN::groundFeature(in);
-        groundDst[groundRow] = queryBase + numCands;
+        groundDst[groundRow] = row;
         groundRow++;
-      }
-      for(int i = 0; i < b.qLen; i++) {
-        candSeg[queryBase + i] = candPosRow;
-        if(i < numCands) {
-          candPos[3 * candPosRow] = in.candidates[i].x;
-          candPos[3 * candPosRow + 1] = in.candidates[i].y;
-          candPos[3 * candPosRow + 2] = 1.0f;
-          candPosRow++;
-        }
+        qSeg[row] = n;
+        qPos[3 * row] = 0.0f;
+        qPos[3 * row + 1] = 0.0f;
+        qPos[3 * row + 2] = 0.0f;
       }
 
       pointRow += numPoints;
       candRow += numCands;
     }
-    tokSeg[numTokens] = tokPosRow;
-    candSeg[numQueries] = candPosRow;
-    testAssert(tokPosRow == b.totalTokPos && candPosRow == b.totalCandPos && groundRow == b.totalGrounds);
+    testAssert(pointRow == b.totalPoints && candRow == b.totalCands && groundRow == b.totalGrounds);
 
-    inputDev.ensure(host.size);
+    inputDev.ensure(layout.size);
     char* d = (char*)inputDev.ptr;
-    CUDA_ERR("SparseDotsCudaModel", cudaMemcpyAsync(d, h, host.size, cudaMemcpyHostToDevice, stream));
+    CUDA_ERR("SparseDotsCudaModel", cudaMemcpyAsync(d, h, layout.size, cudaMemcpyHostToDevice, stream));
     b.pointFeat = (float*)(d + oPointFeat);
     b.pointDst = (int*)(d + oPointDst);
     b.global = (float*)(d + oGlobal);
-    b.mask = (float*)(d + oMask);
-    b.numTokens = (float*)(d + oNumTokens);
     b.boardOffset = (float*)(d + oBoardOffset);
+    b.tokStart = (int*)(d + oTokStart);
     b.tokSeg = (int*)(d + oTokSeg);
     b.tokPos = (float*)(d + oTokPos);
     b.candFeat = (float*)(d + oCandFeat);
     b.candDst = (int*)(d + oCandDst);
     b.groundFeat = (float*)(d + oGroundFeat);
     b.groundDst = (int*)(d + oGroundDst);
-    b.candSeg = (int*)(d + oCandSeg);
-    b.candPos = (float*)(d + oCandPos);
+    b.qStart = (int*)(d + oQStart);
+    b.qSeg = (int*)(d + oQSeg);
+    b.qPos = (float*)(d + oQPos);
   }
 
   void ensureBuffers(const Batch& b) {
-    const size_t tokens = (size_t)b.n * b.s;
-    const size_t queries = (size_t)b.n * b.qLen;
+    const size_t tokens = (size_t)b.tokens;
+    const size_t queries = (size_t)b.queries;
     const size_t actBytes = useFP16 ? sizeof(half) : sizeof(float);
     const size_t fb = sizeof(float);
     const int c = trunkChannels;
@@ -524,45 +594,30 @@ struct SparseDotsCudaModel::Impl {
     const int cd = decoderChannels;
 
     seqF.ensure(tokens * c * fb);
-    if(useFP16) {
+    if(useFP16)
       trunkH.ensure(tokens * c * actBytes);
-      maskH.ensure(tokens * sizeof(half));
-    }
     tmp.ensure(tokens * c * actBytes);
     mid.ensure(tokens * m * actBytes);
     midN.ensure(tokens * m * actBytes);
-    q.ensure(tokens * maxQDim * actBytes);
-    k.ensure(tokens * maxKDim * actBytes);
-    v.ensure(tokens * maxVDim * actBytes);
-    att.ensure(tokens * maxAttDim * actBytes);
-    ffA.ensure(tokens * maxFFN * actBytes);
-    ffG.ensure(tokens * maxFFN * actBytes);
-    delta.ensure(tokens * m * actBytes);
-    cosT.ensure(tokens * std::max(maxHP, maxDecHP) * fb);
-    sinT.ensure(tokens * std::max(maxHP, maxDecHP) * fb);
-    sumSq.ensure(b.n * fb);
+    qkv.ensure(std::max(tokens * maxQKVDim, tokens * maxDecKVDim) * actBytes);
+    att.ensure(std::max(tokens * maxAttDim, queries * maxDecAttDim) * actBytes);
+    ffn.ensure(std::max(tokens * 2 * maxFFN, queries * 2 * maxDecFFN) * actBytes);
+    sumSq.ensure((size_t)b.n * fb);
 
     pointEmb.ensure((size_t)b.totalPoints * c * fb);
     globalProj.ensure((size_t)b.n * c * fb);
 
     pooled.ensure((size_t)b.n * 3 * c * fb);
     poolProj.ensure((size_t)b.n * cd * fb);
-    this->queries.ensure(queries * cd * actBytes);
-    queriesNorm.ensure(queries * cd * actBytes);
+    queriesF.ensure(queries * cd * fb);
     if(useFP16) {
-      queriesF.ensure(queries * cd * fb);
+      queriesH.ensure(queries * cd * actBytes);
       policyH.ensure(queries * decoderOut.outC * actBytes);
     }
+    queriesNorm.ensure(queries * cd * actBytes);
     candEmb.ensure((size_t)b.totalCands * cd * fb);
     groundEmb.ensure((size_t)b.totalGrounds * cd * fb);
     dq.ensure(queries * maxDecQDim * actBytes);
-    dk.ensure(tokens * maxDecKDim * actBytes);
-    dv.ensure(tokens * maxDecVDim * actBytes);
-    datt.ensure(queries * maxDecAttDim * actBytes);
-    dffA.ensure(queries * maxDecFFN * actBytes);
-    dffG.ensure(queries * maxDecFFN * actBytes);
-    cosQ.ensure(queries * maxDecHP * fb);
-    sinQ.ensure(queries * maxDecHP * fb);
     policy.ensure(queries * decoderOut.outC * fb);
 
     outV1.ensure(tokens * v1.outC * fb);
@@ -573,30 +628,16 @@ struct SparseDotsCudaModel::Impl {
     ownershipOut.ensure(tokens * fb);
   }
 
+  // Attention of the rows of every position (Q with qStride) to the keys of the same position (K and V with kvStride)
   template <typename T>
-  void trunkAttention(const Attention& layer, const Batch& b) {
-    const long long rows = (long long)b.n * b.s;
-    T* midT = (T*)mid.ptr;
-    T* midNT = (T*)midN.ptr;
-    T* qT = (T*)q.ptr;
-    T* kT = (T*)k.ptr;
-    T* vT = (T*)v.ptr;
-    T* attT = (T*)att.ptr;
-    sparseDotsRMSNorm<T>(midT, midNT, layer.normWeight.f(), b.mask, rows, midChannels, layer.epsilon, stream);
-    gemm(layer.q, midNT, rows, qT);
-    gemm(layer.k, midNT, rows, kT);
-    gemm(layer.v, midNT, rows, vT);
-    sparseDotsRopeTables(layer.ropeFreqs.f(), b.tokSeg, b.tokPos, (int)rows, layer.numKVHeadPairs(), cosT.f(), sinT.f(), stream);
-    sparseDotsApplyRope<T>(qT, cosT.f(), sinT.f(), (int)rows, layer.numHeads, layer.numKVHeads, layer.qHeadDim,
-                           layer.numHeads * layer.qHeadDim, stream);
-    sparseDotsApplyRope<T>(kT, cosT.f(), sinT.f(), (int)rows, layer.numKVHeads, layer.numKVHeads, layer.qHeadDim,
-                           layer.numKVHeads * layer.qHeadDim, stream);
+  void attention(const Attention& layer, const T* Q, const T* K, const T* V, T* out, const int* qStart, const int* kvStart,
+                 int numSegs, int maxQLen, int qStride, int kvStride) {
     bool done = false;
     if constexpr(std::is_same<T, half>::value) {
       if(useMmaAttention && layer.qHeadDim == layer.vHeadDim) {
-        done = customCudaFlashAttentionMma(
-          qT, kT, vT, (const half*)maskH.ptr, attT, b.n, b.s, layer.numHeads, layer.numKVHeads, layer.qHeadDim,
-          layer.vHeadDim, layer.numHeads * layer.qHeadDim, layer.numKVHeads * layer.qHeadDim, stream);
+        done = customCudaFlashAttentionMmaVarlen(
+          Q, K, V, out, qStart, kvStart, numSegs, maxQLen, layer.numHeads, layer.numKVHeads, layer.qHeadDim,
+          layer.vHeadDim, qStride, kvStride, stream);
         if(done && !loggedMma) {
           loggedMma = true;
           if(logger != nullptr)
@@ -605,36 +646,48 @@ struct SparseDotsCudaModel::Impl {
       }
     }
     if(!done)
-      sparseDotsAttention<T>(qT, kT, vT, b.mask, attT, b.n, b.s, b.s, layer.numHeads, layer.numKVHeads, layer.qHeadDim,
-                             layer.vHeadDim, stream);
-    gemm(layer.out, attT, rows, delta.ptr);
-    sparseDotsResidualAdd<T>(midT, (const T*)delta.ptr, b.mask, rows, midChannels, stream);
+      sparseDotsAttention<T>(Q, K, V, out, qStart, kvStart, numSegs, maxQLen, layer.numHeads, layer.numKVHeads,
+                             layer.qHeadDim, layer.vHeadDim, qStride, kvStride, stream);
   }
 
   template <typename T>
-  void ffnResidual(const FFN& ffn, T* x, T* xNorm, T* a, T* g, const float* mask, long long rows) {
-    sparseDotsRMSNorm<T>(x, xNorm, ffn.normWeight.f(), mask, rows, ffn.linear1.inC, ffn.epsilon, stream);
-    gemm(ffn.linear1, xNorm, rows, a);
-    gemm(ffn.gate, xNorm, rows, g);
-    sparseDotsSwiGLU<T>(a, g, rows * ffn.linear1.outC, stream);
-    if(mask == nullptr) {
-      gemm(ffn.linear2, a, rows, x, true);
-    }
-    else {
-      gemm(ffn.linear2, a, rows, delta.ptr);
-      sparseDotsResidualAdd<T>(x, (const T*)delta.ptr, mask, rows, ffn.linear2.outC, stream);
-    }
+  void trunkAttention(const Attention& layer, const Batch& b) {
+    const long long rows = b.tokens;
+    T* midT = (T*)mid.ptr;
+    T* midNT = (T*)midN.ptr;
+    T* qkvT = (T*)qkv.ptr;
+    T* attT = (T*)att.ptr;
+    const int stride = layer.qkv.outC;
+    sparseDotsRMSNorm<T>(midT, midNT, layer.normWeight.f(), rows, midChannels, layer.epsilon, stream);
+    gemm(layer.qkv, midNT, rows, qkvT);
+    T* qT = qkvT;
+    T* kT = qkvT + layer.qDim();
+    T* vT = kT + layer.kDim();
+    sparseDotsApplyRopeQK<T>(qT, kT, layer.ropeFreqs.f(), b.tokPos, (int)rows, layer.numHeads, layer.numKVHeads, layer.qHeadDim,
+                             stride, stride, stream);
+    attention<T>(layer, qT, kT, vT, attT, b.tokStart, b.tokStart, b.n, b.maxTokens, stride, stride);
+    gemm(layer.out, attT, rows, midT, true);
   }
 
-  // Runs the trunk on trunkBuf in place, ends with the tip norm
+  // x += FFN(x)
+  template <typename T>
+  void ffnResidual(const FFN& layer, T* x, T* xNorm, long long rows) {
+    T* ab = (T*)ffn.ptr;
+    sparseDotsRMSNorm<T>(x, xNorm, layer.normWeight.f(), rows, layer.linear1Gate.inC, layer.epsilon, stream);
+    gemm(layer.linear1Gate, xNorm, rows, ab);
+    sparseDotsSwiGLU<T>(ab, rows, layer.channels, stream);
+    gemm(layer.linear2, ab, rows, x, true, ACTIVATION_IDENTITY, 2 * layer.channels);
+  }
+
+  // Runs the trunk in place, ends with the tip norm
   template <typename T>
   void runTrunk(T* trunk, const Batch& b) {
-    const long long rows = (long long)b.n * b.s;
+    const long long rows = b.tokens;
     T* tmpT = (T*)tmp.ptr;
     T* midT = (T*)mid.ptr;
     T* midNT = (T*)midN.ptr;
     for(const auto& block : blocks) {
-      sparseDotsScaleBiasAct<T>(trunk, tmpT, block->preScale.f(), block->preBias.f(), b.mask, rows, trunkChannels,
+      sparseDotsScaleBiasAct<T>(trunk, tmpT, block->preScale.f(), block->preBias.f(), rows, trunkChannels,
                                 block->preActivation, stream);
       gemm(block->preConv, tmpT, rows, midT);
       size_t attentionIdx = 0;
@@ -643,86 +696,70 @@ struct SparseDotsCudaModel::Impl {
         if(isAttention)
           trunkAttention<T>(*block->attentions[attentionIdx++], b);
         else
-          ffnResidual<T>(*block->ffns[ffnIdx++], midT, midNT, (T*)ffA.ptr, (T*)ffG.ptr, b.mask, rows);
+          ffnResidual<T>(*block->ffns[ffnIdx++], midT, midNT, rows);
       }
-      sparseDotsScaleBiasAct<T>(midT, midNT, block->postScale.f(), block->postBias.f(), b.mask, rows, midChannels,
+      sparseDotsScaleBiasAct<T>(midT, midNT, block->postScale.f(), block->postBias.f(), rows, midChannels,
                                 block->postActivation, stream);
-      // Masked rows of midN are zero and the conv has no bias, so the residual add folds into the GEMM
       gemm(block->postConv, midNT, rows, trunk, true);
     }
-    sparseDotsSpatialRMSNorm<T>(trunk, trunk, tipGamma.f(), tipBeta.f(), b.mask, b.numTokens, b.n, b.s, trunkChannels,
+    sparseDotsSpatialRMSNorm<T>(trunk, trunk, tipGamma.f(), tipBeta.f(), b.tokSeg, b.tokStart, b.n, b.tokens, trunkChannels,
                                 tipEpsilon, tipActivation, sumSq.f(), stream);
   }
 
   // Runs the decoder layers on the embedded queries, writes the logits to policy (FP32) or policyH (FP16)
   template <typename T>
-  void runDecoder(const T* trunk, const Batch& b) {
-    const long long tokens = (long long)b.n * b.s;
-    const long long numQueries = (long long)b.n * b.qLen;
+  void runDecoder(const T* trunk, T* query, const Batch& b) {
+    const long long tokens = b.tokens;
+    const long long numQueries = b.queries;
     const int cd = decoderChannels;
-    T* query = (T*)queries.ptr;
     T* queryNorm = (T*)queriesNorm.ptr;
     T* dqT = (T*)dq.ptr;
-    T* dkT = (T*)dk.ptr;
-    T* dvT = (T*)dv.ptr;
-    T* dattT = (T*)datt.ptr;
+    T* kvT = (T*)qkv.ptr;
+    T* attT = (T*)att.ptr;
     for(size_t l = 0; l < decoderAttentions.size(); l++) {
       const Attention& layer = *decoderAttentions[l];
-      sparseDotsRMSNorm<T>(query, queryNorm, layer.normWeight.f(), nullptr, numQueries, cd, layer.epsilon, stream);
+      const int kvStride = layer.kv.outC;
+      sparseDotsRMSNorm<T>(query, queryNorm, layer.normWeight.f(), numQueries, cd, layer.epsilon, stream);
       gemm(layer.q, queryNorm, numQueries, dqT);
-      gemm(layer.k, trunk, tokens, dkT);
-      gemm(layer.v, trunk, tokens, dvT);
-      const int hp = layer.numKVHeadPairs();
-      sparseDotsRopeTables(layer.ropeFreqs.f(), b.candSeg, b.candPos, (int)numQueries, hp, cosQ.f(), sinQ.f(), stream);
-      sparseDotsRopeTables(layer.ropeFreqs.f(), b.tokSeg, b.tokPos, (int)tokens, hp, cosT.f(), sinT.f(), stream);
-      sparseDotsApplyRope<T>(dqT, cosQ.f(), sinQ.f(), (int)numQueries, layer.numHeads, layer.numKVHeads, layer.qHeadDim,
-                             layer.numHeads * layer.qHeadDim, stream);
-      sparseDotsApplyRope<T>(dkT, cosT.f(), sinT.f(), (int)tokens, layer.numKVHeads, layer.numKVHeads, layer.qHeadDim,
-                             layer.numKVHeads * layer.qHeadDim, stream);
-      bool done = false;
-      if constexpr(std::is_same<T, half>::value) {
-        if(useMmaAttention && layer.qHeadDim == layer.vHeadDim)
-          done = customCudaFlashAttentionMmaCross(
-            dqT, dkT, dvT, (const half*)maskH.ptr, dattT, b.n, b.qLen, b.s, layer.numHeads, layer.numKVHeads,
-            layer.qHeadDim, layer.vHeadDim, layer.numHeads * layer.qHeadDim, layer.numKVHeads * layer.qHeadDim, stream);
-      }
-      if(!done)
-        sparseDotsAttention<T>(dqT, dkT, dvT, b.mask, dattT, b.n, b.qLen, b.s, layer.numHeads, layer.numKVHeads,
-                               layer.qHeadDim, layer.vHeadDim, stream);
-      gemm(layer.out, dattT, numQueries, query, true);
-      ffnResidual<T>(*decoderFFNs[l], query, queryNorm, (T*)dffA.ptr, (T*)dffG.ptr, nullptr, numQueries);
+      gemm(layer.kv, trunk, tokens, kvT);
+      sparseDotsApplyRope<T>(dqT, layer.ropeFreqs.f(), b.qPos, (int)numQueries, layer.numHeads, layer.numKVHeads,
+                             layer.qHeadDim, layer.qDim(), stream);
+      sparseDotsApplyRope<T>(kvT, layer.ropeFreqs.f(), b.tokPos, (int)tokens, layer.numKVHeads, layer.numKVHeads,
+                             layer.qHeadDim, kvStride, stream);
+      attention<T>(layer, dqT, kvT, kvT + layer.kDim(), attT, b.qStart, b.tokStart, b.n, b.maxQueries, layer.qDim(), kvStride);
+      gemm(layer.out, attT, numQueries, query, true);
+      ffnResidual<T>(*decoderFFNs[l], query, queryNorm, numQueries);
     }
-    sparseDotsRMSNorm<T>(query, queryNorm, decoderNormWeight.f(), nullptr, numQueries, cd, decoderNormEpsilon, stream);
+    sparseDotsRMSNorm<T>(query, queryNorm, decoderNormWeight.f(), numQueries, cd, decoderNormEpsilon, stream);
     gemm(decoderOut, queryNorm, numQueries, std::is_same<T, half>::value ? policyH.ptr : policy.ptr);
   }
 
-  void evaluate(const vector<const DotsSparseInput*>& inputs, vector<SparseDotsNN::RawOutput>& outputs) {
+  void evaluate(
+    const vector<const DotsSparseInput*>& inputs, const vector<int>& symmetries, vector<SparseDotsNN::RawOutput>& outputs
+  ) {
     testAssert(!inputs.empty());
+    testAssert(inputs.size() == symmetries.size());
     Batch b;
-    HostPack host;
     const auto hostStart = std::chrono::steady_clock::now();
-    pack(inputs, b, host);
+    pack(inputs, symmetries, b);
     ensureBuffers(b);
     const double hostMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - hostStart).count();
     mark("start");
-    const long long tokens = (long long)b.n * b.s;
-    const long long queries = (long long)b.n * b.qLen;
+    const long long tokens = b.tokens;
+    const long long queries = b.queries;
     const int c = trunkChannels;
     const int cd = decoderChannels;
 
     // Embeddings in FP32 --------------------------------------------------------------------------------------------
     float* seq = seqF.f();
-    CUDA_ERR("SparseDotsCudaModel", cudaMemsetAsync(seq, 0, sizeof(float) * tokens * c, stream));
     gemm(point, b.pointFeat, b.totalPoints, pointEmb.ptr);
     sparseDotsScatterRows(pointEmb.f(), seq, b.pointDst, b.totalPoints, c, stream);
     gemm(global, b.global, b.n, globalProj.ptr);
-    sparseDotsAddGlobal(seq, globalToken.f(), globalProj.f(), b.mask, b.n, b.s, c, stream);
-
+    sparseDotsAddGlobal(seq, globalToken.f(), globalProj.f(), b.tokSeg, b.tokStart, b.tokens, c, stream);
     mark("embeddings");
 
     // Trunk -----------------------------------------------------------------------------------------------------------
     if(useFP16) {
-      sparseDotsCopyToHalf(b.mask, (half*)maskH.ptr, tokens, stream);
       sparseDotsCopyToHalf(seq, (half*)trunkH.ptr, tokens * c, stream);
       runTrunk<half>((half*)trunkH.ptr, b);
       sparseDotsCopyFromHalf((const half*)trunkH.ptr, seq, tokens * c, stream);
@@ -734,28 +771,30 @@ struct SparseDotsCudaModel::Impl {
     mark("trunk");
 
     // Candidate decoder ---------------------------------------------------------------------------------------------
-    sparseDotsPool(trunk, b.mask, b.numTokens, b.boardOffset, pooled.f(), b.n, b.s, c, false, stream);
-    gemm(pool, pooled.ptr, b.n, poolProj.ptr);
-    float* queryF = useFP16 ? queriesF.f() : (float*)this->queries.ptr;
-    CUDA_ERR("SparseDotsCudaModel", cudaMemsetAsync(queryF, 0, sizeof(float) * queries * cd, stream));
-    gemm(cand, b.candFeat, b.totalCands, candEmb.ptr);
-    sparseDotsScatterRows(candEmb.f(), queryF, b.candDst, b.totalCands, cd, stream);
-    gemm(ground, b.groundFeat, b.totalGrounds, groundEmb.ptr);
-    sparseDotsScatterRows(groundEmb.f(), queryF, b.groundDst, b.totalGrounds, cd, stream);
-    sparseDotsAddRowVector(queryF, poolProj.f(), b.n, b.qLen, cd, stream);
-    if(useFP16) {
-      sparseDotsCopyToHalf(queryF, (half*)this->queries.ptr, queries * cd, stream);
-      runDecoder<half>((const half*)trunkH.ptr, b);
-      sparseDotsCopyFromHalf((const half*)policyH.ptr, policy.f(), queries * decoderOut.outC, stream);
-    }
-    else {
-      runDecoder<float>(trunk, b);
+    if(queries > 0) {
+      sparseDotsPool(trunk, b.tokStart, b.boardOffset, pooled.f(), b.n, c, false, stream);
+      gemm(pool, pooled.ptr, b.n, poolProj.ptr);
+      // Every query row is a candidate or a grounding row, so the scatters fill all of them
+      float* queryF = queriesF.f();
+      gemm(cand, b.candFeat, b.totalCands, candEmb.ptr);
+      sparseDotsScatterRows(candEmb.f(), queryF, b.candDst, b.totalCands, cd, stream);
+      gemm(ground, b.groundFeat, b.totalGrounds, groundEmb.ptr);
+      sparseDotsScatterRows(groundEmb.f(), queryF, b.groundDst, b.totalGrounds, cd, stream);
+      sparseDotsAddRowVector(queryF, poolProj.f(), b.qSeg, b.queries, cd, stream);
+      if(useFP16) {
+        sparseDotsCopyToHalf(queryF, (half*)queriesH.ptr, queries * cd, stream);
+        runDecoder<half>((const half*)trunkH.ptr, (half*)queriesH.ptr, b);
+        sparseDotsCopyFromHalf((const half*)policyH.ptr, policy.f(), queries * decoderOut.outC, stream);
+      }
+      else {
+        runDecoder<float>(trunk, queryF, b);
+      }
     }
     mark("decoder");
 
     // Value head in FP32 ----------------------------------------------------------------------------------------------
     gemm(v1, trunk, tokens, outV1.ptr, false, v1Activation);
-    sparseDotsPool(outV1.f(), b.mask, b.numTokens, b.boardOffset, pooledV.f(), b.n, b.s, v1.outC, true, stream);
+    sparseDotsPool(outV1.f(), b.tokStart, b.boardOffset, pooledV.f(), b.n, v1.outC, true, stream);
     gemm(v2, pooledV.ptr, b.n, outV2.ptr, false, v2Activation);
     gemm(v3, outV2.ptr, b.n, value.ptr);
     gemm(sv3, outV2.ptr, b.n, scoreValue.ptr);
@@ -765,14 +804,21 @@ struct SparseDotsCudaModel::Impl {
 
     // Outputs ---------------------------------------------------------------------------------------------------------
     const int policyC = decoderOut.outC;
-    vector<float> policyHost((size_t)queries * policyC);
-    vector<float> valueHost((size_t)b.n * 3);
-    vector<float> scoreHost((size_t)b.n * 6);
-    vector<float> ownershipHost((size_t)tokens);
-    CUDA_ERR("SparseDotsCudaModel", cudaMemcpyAsync(policyHost.data(), policy.ptr, sizeof(float) * policyHost.size(), cudaMemcpyDeviceToHost, stream));
-    CUDA_ERR("SparseDotsCudaModel", cudaMemcpyAsync(valueHost.data(), value.ptr, sizeof(float) * valueHost.size(), cudaMemcpyDeviceToHost, stream));
-    CUDA_ERR("SparseDotsCudaModel", cudaMemcpyAsync(scoreHost.data(), scoreValue.ptr, sizeof(float) * scoreHost.size(), cudaMemcpyDeviceToHost, stream));
-    CUDA_ERR("SparseDotsCudaModel", cudaMemcpyAsync(ownershipHost.data(), ownershipOut.ptr, sizeof(float) * ownershipHost.size(), cudaMemcpyDeviceToHost, stream));
+    Layout layout;
+    const size_t oPolicy = layout.reserve(sizeof(float) * queries * policyC);
+    const size_t oValue = layout.reserve(sizeof(float) * b.n * 3);
+    const size_t oScore = layout.reserve(sizeof(float) * b.n * 6);
+    const size_t oOwnership = layout.reserve(sizeof(float) * tokens);
+    hostOut.ensure(layout.size);
+    const float* policyHost = (const float*)(hostOut.ptr + oPolicy);
+    const float* valueHost = (const float*)(hostOut.ptr + oValue);
+    const float* scoreHost = (const float*)(hostOut.ptr + oScore);
+    const float* ownershipHost = (const float*)(hostOut.ptr + oOwnership);
+    if(queries > 0)
+      CUDA_ERR("SparseDotsCudaModel", cudaMemcpyAsync(hostOut.ptr + oPolicy, policy.ptr, sizeof(float) * queries * policyC, cudaMemcpyDeviceToHost, stream));
+    CUDA_ERR("SparseDotsCudaModel", cudaMemcpyAsync(hostOut.ptr + oValue, value.ptr, sizeof(float) * b.n * 3, cudaMemcpyDeviceToHost, stream));
+    CUDA_ERR("SparseDotsCudaModel", cudaMemcpyAsync(hostOut.ptr + oScore, scoreValue.ptr, sizeof(float) * b.n * 6, cudaMemcpyDeviceToHost, stream));
+    CUDA_ERR("SparseDotsCudaModel", cudaMemcpyAsync(hostOut.ptr + oOwnership, ownershipOut.ptr, sizeof(float) * tokens, cudaMemcpyDeviceToHost, stream));
     mark("download");
     CUDA_ERR("SparseDotsCudaModel", cudaStreamSynchronize(stream));
     finishProfile(hostMs, b.n);
@@ -784,18 +830,18 @@ struct SparseDotsCudaModel::Impl {
       out.numCandidates = (int)in.candidates.size();
       out.hasGround = in.groundAllowed;
       const int numQueries = out.numCandidates + (out.hasGround ? 1 : 0);
+      const size_t queryBase = (size_t)b.qStartHost[n];
       out.policy.resize((size_t)numQueries * 2);
       for(int i = 0; i < numQueries; i++) {
-        out.policy[(size_t)i * 2] = policyHost[((size_t)n * b.qLen + i) * policyC];
-        out.policy[(size_t)i * 2 + 1] = policyHost[((size_t)n * b.qLen + i) * policyC + 1];
+        out.policy[(size_t)i * 2] = policyHost[(queryBase + i) * policyC];
+        out.policy[(size_t)i * 2 + 1] = policyHost[(queryBase + i) * policyC + 1];
       }
       for(int i = 0; i < 3; i++)
         out.value[i] = valueHost[(size_t)n * 3 + i];
       for(int i = 0; i < 6; i++)
         out.scoreValue[i] = scoreHost[(size_t)n * 6 + i];
-      out.ownership.resize(in.points.size());
-      for(size_t i = 0; i < in.points.size(); i++)
-        out.ownership[i] = ownershipHost[(size_t)n * b.s + 1 + i];
+      const size_t pointBase = (size_t)b.tokStartHost[n] + 1;
+      out.ownership.assign(ownershipHost + pointBase, ownershipHost + pointBase + in.points.size());
     }
   }
 };
@@ -806,6 +852,8 @@ SparseDotsCudaModel::SparseDotsCudaModel(
 
 SparseDotsCudaModel::~SparseDotsCudaModel() = default;
 
-void SparseDotsCudaModel::evaluate(const vector<const DotsSparseInput*>& inputs, vector<SparseDotsNN::RawOutput>& outputs) {
-  impl->evaluate(inputs, outputs);
+void SparseDotsCudaModel::evaluate(
+  const vector<const DotsSparseInput*>& inputs, const vector<int>& symmetries, vector<SparseDotsNN::RawOutput>& outputs
+) {
+  impl->evaluate(inputs, symmetries, outputs);
 }

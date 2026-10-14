@@ -2771,6 +2771,23 @@ bool customCudaFlashAttentionMmaCross(
 #endif
 }
 
+bool customCudaFlashAttentionMmaVarlen(
+  const half* Q, const half* K, const half* V, half* output, const int* qStarts, const int* kvStarts,
+  int batchSize, int maxQLen, int numHeads, int numKVHeads, int qHeadDim, int vHeadDim,
+  int qStride, int kvStride, cudaStream_t stream
+) {
+#ifdef KATAGO_HAS_FLASH_MMA
+  return launchFlashAttentionMmaVarlen(
+    Q, K, V, output, qStarts, kvStarts, batchSize, maxQLen, numHeads, numKVHeads, qHeadDim, vHeadDim,
+    qStride, kvStride, stream);
+#else
+  (void)Q; (void)K; (void)V; (void)output; (void)qStarts; (void)kvStarts;
+  (void)batchSize; (void)maxQLen; (void)numHeads; (void)numKVHeads; (void)qHeadDim; (void)vHeadDim;
+  (void)qStride; (void)kvStride; (void)stream;
+  return false;
+#endif
+}
+
 bool customCudaFlashAttentionMmaSupportsShape(int numHeads, int numKVHeads, int qHeadDim, int vHeadDim) {
 #ifdef KATAGO_HAS_FLASH_MMA
   return flashAttentionMmaSupportsShape(numHeads, numKVHeads, qHeadDim, vHeadDim);

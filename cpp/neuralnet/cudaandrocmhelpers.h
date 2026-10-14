@@ -148,6 +148,13 @@ bool customCudaFlashAttentionMmaCross(
   int batchSize, int qLen, int kvLen, int numHeads, int numKVHeads, int qHeadDim, int vHeadDim,
   int qStride, int kvStride, cudaStream_t stream
 );
+//Packed (varlen) variant without padding and masks: batch element n has the query rows
+//[qStarts[n], qStarts[n+1]) and the key/value rows [kvStarts[n], kvStarts[n+1]) (device arrays).
+bool customCudaFlashAttentionMmaVarlen(
+  const half* Q, const half* K, const half* V, half* output, const int* qStarts, const int* kvStarts,
+  int batchSize, int maxQLen, int numHeads, int numKVHeads, int qHeadDim, int vHeadDim,
+  int qStride, int kvStride, cudaStream_t stream
+);
 //Whether the mma kernels support this attention shape at all (head dims, GQA divisibility).
 //Static shape check only - the device probe below is a separate condition.
 bool customCudaFlashAttentionMmaSupportsShape(int numHeads, int numKVHeads, int qHeadDim, int vHeadDim);
