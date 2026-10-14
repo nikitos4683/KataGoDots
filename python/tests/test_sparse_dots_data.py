@@ -4,6 +4,7 @@ import os
 import random
 
 import numpy as np
+import pytest
 import torch
 
 import shuffle
@@ -101,13 +102,14 @@ def test_group_by_length():
         assert all(ranges[i][1] <= ranges[i + 1][0] for i in range(7))
 
 
-def test_loader_yields_every_row_once(tmp_path):
+@pytest.mark.parametrize("num_workers", [0, 2])
+def test_loader_yields_every_row_once(tmp_path, num_workers):
     rows = make_rows(4, 70)
     filename = str(tmp_path / "data.npz")
     sparse_dots_npz.save_sparse_npz(filename, file_arrays(rows))
     batches = list(read_npz_training_data_sparse(
         [filename], batch_size=8, world_size=1, rank=0, device="cpu",
-        randomize_symmetries=False, randomize_history=False, length_grouping_batches=4,
+        randomize_symmetries=False, randomize_history=False, length_grouping_batches=4, num_workers=num_workers,
     ))
     assert len(batches) == 8
     seen = []
