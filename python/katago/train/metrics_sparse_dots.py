@@ -20,6 +20,14 @@ def sparse_policy_targets(batch: Dict[str, torch.Tensor]):
     return player, opponent
 
 
+def score_distribution(batch: Dict[str, torch.Tensor], length: int) -> torch.Tensor:
+    """The score distribution target [N, length] (weights summing to 100) from its two bins: their scores (bin minus
+    the middle bin length / 2) and their weights. Scores beyond the ends go to the end bins."""
+    bins = (batch["scoreDistrScoresN"].long() + length // 2).clamp(0, length - 1)
+    weights = batch["scoreDistrWeightsN"].to(torch.float32)
+    return torch.zeros((bins.shape[0], length), dtype=torch.float32, device=bins.device).scatter_add_(1, bins, weights)
+
+
 def sparse_cand_mask(batch: Dict[str, torch.Tensor]) -> torch.Tensor:
     num_cands = batch["candCoordsNM"].shape[1]
     return torch.cat([count_mask(batch["candCountN"], num_cands), batch["groundN"][:, 0:1].to(torch.float32)], dim=1)
@@ -86,7 +94,7 @@ class SparseDotsMetrics(Metrics):
         ) = model_output_postprocessed
 
         target_global_nc = batch["globalTargetsNC"]
-        score_distribution_ns = batch["scoreDistrN"]
+        score_distribution_ns = score_distribution(batch, scorebelief_logits.shape[1])
         board_size = batch["boardSizeN"].to(torch.float32)
         board_area = board_size[:, 0] * board_size[:, 1]
 

@@ -16,7 +16,7 @@ from ..train import sparse_dots_npz
 from ..train.model_sparse_dots import NUM_MOVES_AGO, apply_symmetry_to_batch
 
 # Torch dtype of each array in a batch
-_LONG_ARRAYS = {"pointCountN", "candCountN"}
+_LONG_ARRAYS = {"pointCountN", "candCountN", "policyTargetCountN", "futureposTargetCountN", "scoreDistrScoresN"}
 _INT_ARRAYS = {"boardSizeN", "pointCoordsNP", "pointDataNP", "candCoordsNM", "candDataNM"}
 
 # Rows are sorted by length within chunks of this many batches. The longer the chunk, the less padding and the more
@@ -78,8 +78,7 @@ def _load_file_batches(npz_file: str, batch_size: int, world_size: int, rank: in
     # The rows of this rank, the same split as the dense data
     rows = np.arange(used).reshape(num_whole_steps, world_size, batch_size)[:, rank].reshape(-1)
     batches = group_by_length(rows, arrays["pointCountN"], arrays["candCountN"], batch_size, length_grouping_batches, rand)
-    starts = {name: sparse_dots_npz.offsets(arrays[name]) for name in ("pointCountN", "candCountN")}
-    return npz_file, num_whole_steps, arrays, starts, batches
+    return npz_file, num_whole_steps, arrays, sparse_dots_npz.all_offsets(arrays), batches
 
 
 def _make_batch(arrays, starts, batch_rows, randomize_history: bool, randomize_symmetries: bool,

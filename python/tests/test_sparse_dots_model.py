@@ -208,7 +208,7 @@ def test_overfit_tiny_set():
     model = create_model(tiny_sparse_config(), 9, 7, [Game.DOTS])
     model.initialize()
     model.train()
-    batch = one_hot_targets(random_batch(5, n=8, score_len=model.value_head.scorebelief_len), 5)
+    batch = one_hot_targets(random_batch(5, n=8), 5)
     metrics = SparseDotsMetrics(1, model)
     optimizer = torch.optim.Adam(model.parameters(), lr=2e-3)
     first = None

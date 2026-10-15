@@ -996,29 +996,48 @@ static void writeNumpyToZip(ZipFile& zipFile, const char* name, NumpyBuffer<T>& 
 void TrainingWriteBuffers::writeDotsSparseArrays(ZipFile& zipFile) {
   testAssert(dotsSparseRows.size() == (size_t)curRows);
   const int64_t n = curRows;
-  //The per-entity arrays are not padded: the points (candidates) of all the rows are concatenated
-  //in row order, the counts give the number of each row
-  int64_t totalPoints = 0, totalCands = 0;
+  //Only facts, no padding (docs/DotsSparseNN.md 7.2): the per-entity arrays (points, candidates, and the candidates
+  //with a nonzero policy or futurepos target) of all the rows are concatenated in row order, the counts give the
+  //number of each row; the score distribution is its two bins; small values are int8
+  int64_t totalPoints = 0, totalCands = 0, totalPolicy = 0, totalFuturepos = 0;
   for(const DotsSparseRow& row : dotsSparseRows) {
     totalPoints += (int64_t)row.input.points.size();
     totalCands += (int64_t)row.input.candidates.size();
+    for(size_t i = 0; i < row.candPolicy.size(); i++) {
+      if(row.candPolicy[i][0] != 0 || row.candPolicy[i][1] != 0)
+        totalPolicy++;
+      if(row.candFuturepos[i][0] != 0 || row.candFuturepos[i][1] != 0)
+        totalFuturepos++;
+    }
   }
 
   NumpyBuffer<int8_t> boardSizeN({n, 2});
   NumpyBuffer<int16_t> pointCountN({n});
   NumpyBuffer<int8_t> pointCoordsP({totalPoints, 2});
-  //owner, grounded, movesAgo, areaCount, areaMovesAgo, insideMy, insideOpp
-  NumpyBuffer<int16_t> pointDataP({totalPoints, 7});
+  //owner, grounded, movesAgo, areaCount, areaMovesAgo
+  NumpyBuffer<int8_t> pointStateP({totalPoints, 5});
+  //insideMy, insideOpp
+  NumpyBuffer<int16_t> pointInsideP({totalPoints, 2});
+  NumpyBuffer<int8_t> pointOwnershipTargetsP({totalPoints});
   NumpyBuffer<int16_t> candCountN({n});
   NumpyBuffer<int8_t> candCoordsM({totalCands, 2});
-  NumpyBuffer<int16_t> candDataM({totalCands, 4});
+  //gainMy, gainOpp
+  NumpyBuffer<int16_t> candGainM({totalCands, 2});
+  //inMyHouse, inOppHouse
+  NumpyBuffer<int8_t> candHouseM({totalCands, 2});
+  NumpyBuffer<int16_t> policyTargetCountN({n});
+  NumpyBuffer<int16_t> policyTargetCandT({totalPolicy});
+  NumpyBuffer<int16_t> policyTargetsT({totalPolicy, 2});
+  NumpyBuffer<int16_t> futureposTargetCountN({n});
+  NumpyBuffer<int16_t> futureposTargetCandF({totalFuturepos});
+  NumpyBuffer<int8_t> futureposTargetsF({totalFuturepos, 2});
   NumpyBuffer<float> groundN({n, 2});
-  NumpyBuffer<int16_t> candPolicyTargetsM({totalCands, 2});
   NumpyBuffer<int16_t> groundPolicyTargetsN({n, 2});
-  NumpyBuffer<int8_t> candFutureposTargetsM({totalCands, 2});
-  NumpyBuffer<int8_t> pointOwnershipTargetsP({totalPoints});
+  NumpyBuffer<int16_t> scoreDistrScoresN({n, 2});
+  NumpyBuffer<int8_t> scoreDistrWeightsN({n, 2});
 
-  int64_t pointIdx = 0, candIdx = 0;
+  const int64_t scoreDistrLen = scoreDistrN.shape[1];
+  int64_t pointIdx = 0, candIdx = 0, policyIdx = 0, futureposIdx = 0;
   for(int64_t r = 0; r < n; r++) {
     const DotsSparseRow& row = dotsSparseRows[r];
     const DotsSparseInput& in = row.input;
@@ -1028,55 +1047,105 @@ void TrainingWriteBuffers::writeDotsSparseArrays(ZipFile& zipFile) {
     pointCountN.data[r] = (int16_t)in.points.size();
     for(size_t i = 0; i < in.points.size(); i++, pointIdx++) {
       const auto& p = in.points[i];
+      testAssert(p.areaCount >= 0 && p.areaCount <= 127);
       pointCoordsP.data[pointIdx * 2 + 0] = p.x;
       pointCoordsP.data[pointIdx * 2 + 1] = p.y;
-      int16_t* data = pointDataP.data + pointIdx * 7;
-      data[0] = p.owner;
-      data[1] = p.grounded;
-      data[2] = p.movesAgo;
-      data[3] = p.areaCount;
-      data[4] = p.areaMovesAgo;
-      data[5] = p.insideMy;
-      data[6] = p.insideOpp;
+      int8_t* state = pointStateP.data + pointIdx * 5;
+      state[0] = p.owner;
+      state[1] = p.grounded;
+      state[2] = p.movesAgo;
+      state[3] = p.areaCount;
+      state[4] = p.areaMovesAgo;
+      pointInsideP.data[pointIdx * 2 + 0] = p.insideMy;
+      pointInsideP.data[pointIdx * 2 + 1] = p.insideOpp;
       pointOwnershipTargetsP.data[pointIdx] = row.pointOwnership[i];
     }
 
     candCountN.data[r] = (int16_t)in.candidates.size();
+    int16_t numPolicy = 0, numFuturepos = 0;
     for(size_t i = 0; i < in.candidates.size(); i++, candIdx++) {
       const auto& c = in.candidates[i];
       candCoordsM.data[candIdx * 2 + 0] = c.x;
       candCoordsM.data[candIdx * 2 + 1] = c.y;
-      candDataM.data[candIdx * 4 + 0] = c.gainMy;
-      candDataM.data[candIdx * 4 + 1] = c.gainOpp;
-      candDataM.data[candIdx * 4 + 2] = c.inMyHouse;
-      candDataM.data[candIdx * 4 + 3] = c.inOppHouse;
-      candPolicyTargetsM.data[candIdx * 2 + 0] = row.candPolicy[i][0];
-      candPolicyTargetsM.data[candIdx * 2 + 1] = row.candPolicy[i][1];
-      candFutureposTargetsM.data[candIdx * 2 + 0] = row.candFuturepos[i][0];
-      candFutureposTargetsM.data[candIdx * 2 + 1] = row.candFuturepos[i][1];
+      candGainM.data[candIdx * 2 + 0] = c.gainMy;
+      candGainM.data[candIdx * 2 + 1] = c.gainOpp;
+      candHouseM.data[candIdx * 2 + 0] = (int8_t)c.inMyHouse;
+      candHouseM.data[candIdx * 2 + 1] = (int8_t)c.inOppHouse;
+      if(row.candPolicy[i][0] != 0 || row.candPolicy[i][1] != 0) {
+        policyTargetCandT.data[policyIdx] = (int16_t)i;
+        policyTargetsT.data[policyIdx * 2 + 0] = row.candPolicy[i][0];
+        policyTargetsT.data[policyIdx * 2 + 1] = row.candPolicy[i][1];
+        policyIdx++;
+        numPolicy++;
+      }
+      if(row.candFuturepos[i][0] != 0 || row.candFuturepos[i][1] != 0) {
+        futureposTargetCandF.data[futureposIdx] = (int16_t)i;
+        futureposTargetsF.data[futureposIdx * 2 + 0] = row.candFuturepos[i][0];
+        futureposTargetsF.data[futureposIdx * 2 + 1] = row.candFuturepos[i][1];
+        futureposIdx++;
+        numFuturepos++;
+      }
     }
+    policyTargetCountN.data[r] = numPolicy;
+    futureposTargetCountN.data[r] = numFuturepos;
     groundN.data[r * 2 + 0] = in.groundAllowed ? 1.0f : 0.0f;
     groundN.data[r * 2 + 1] = in.groundResult;
     groundPolicyTargetsN.data[r * 2 + 0] = row.groundPolicy[0];
     groundPolicyTargetsN.data[r * 2 + 1] = row.groundPolicy[1];
+
+    //The one or two adjacent nonzero bins of the score distribution, ascending; a single one is paired with the next
+    //bin (the previous one at the end) with weight 0. Scores are relative to the middle bin.
+    const int8_t* distr = scoreDistrN.data + r * scoreDistrLen;
+    int64_t lo = -1, hi = -1;
+    int numNonzero = 0;
+    for(int64_t i = 0; i < scoreDistrLen; i++) {
+      if(distr[i] != 0) {
+        if(numNonzero == 0)
+          lo = i;
+        else
+          hi = i;
+        numNonzero++;
+      }
+    }
+    testAssert(numNonzero == 1 || (numNonzero == 2 && hi == lo + 1));
+    if(numNonzero == 1) {
+      if(lo == scoreDistrLen - 1) {
+        hi = lo;
+        lo = lo - 1;
+      }
+      else
+        hi = lo + 1;
+    }
+    const int64_t mid = scoreDistrLen / 2;
+    scoreDistrScoresN.data[r * 2 + 0] = (int16_t)(lo - mid);
+    scoreDistrScoresN.data[r * 2 + 1] = (int16_t)(hi - mid);
+    scoreDistrWeightsN.data[r * 2 + 0] = distr[lo];
+    scoreDistrWeightsN.data[r * 2 + 1] = distr[hi];
   }
-  testAssert(pointIdx == totalPoints && candIdx == totalCands);
+  testAssert(pointIdx == totalPoints && candIdx == totalCands && policyIdx == totalPolicy && futureposIdx == totalFuturepos);
 
   writeNumpyToZip(zipFile, "boardSizeN", boardSizeN, n);
   writeNumpyToZip(zipFile, "globalInputNC", globalInputNC, n);
   writeNumpyToZip(zipFile, "pointCountN", pointCountN, n);
-  writeNumpyToZip(zipFile, "pointCoordsP", pointCoordsP, totalPoints);
-  writeNumpyToZip(zipFile, "pointDataP", pointDataP, totalPoints);
   writeNumpyToZip(zipFile, "candCountN", candCountN, n);
-  writeNumpyToZip(zipFile, "candCoordsM", candCoordsM, totalCands);
-  writeNumpyToZip(zipFile, "candDataM", candDataM, totalCands);
+  writeNumpyToZip(zipFile, "policyTargetCountN", policyTargetCountN, n);
+  writeNumpyToZip(zipFile, "futureposTargetCountN", futureposTargetCountN, n);
   writeNumpyToZip(zipFile, "groundN", groundN, n);
-  writeNumpyToZip(zipFile, "candPolicyTargetsM", candPolicyTargetsM, totalCands);
   writeNumpyToZip(zipFile, "groundPolicyTargetsN", groundPolicyTargetsN, n);
-  writeNumpyToZip(zipFile, "candFutureposTargetsM", candFutureposTargetsM, totalCands);
-  writeNumpyToZip(zipFile, "pointOwnershipTargetsP", pointOwnershipTargetsP, totalPoints);
   writeNumpyToZip(zipFile, "globalTargetsNC", globalTargetsNC, n);
-  writeNumpyToZip(zipFile, "scoreDistrN", scoreDistrN, n);
+  writeNumpyToZip(zipFile, "scoreDistrScoresN", scoreDistrScoresN, n);
+  writeNumpyToZip(zipFile, "scoreDistrWeightsN", scoreDistrWeightsN, n);
+  writeNumpyToZip(zipFile, "pointCoordsP", pointCoordsP, totalPoints);
+  writeNumpyToZip(zipFile, "pointStateP", pointStateP, totalPoints);
+  writeNumpyToZip(zipFile, "pointInsideP", pointInsideP, totalPoints);
+  writeNumpyToZip(zipFile, "pointOwnershipTargetsP", pointOwnershipTargetsP, totalPoints);
+  writeNumpyToZip(zipFile, "candCoordsM", candCoordsM, totalCands);
+  writeNumpyToZip(zipFile, "candGainM", candGainM, totalCands);
+  writeNumpyToZip(zipFile, "candHouseM", candHouseM, totalCands);
+  writeNumpyToZip(zipFile, "policyTargetCandT", policyTargetCandT, totalPolicy);
+  writeNumpyToZip(zipFile, "policyTargetsT", policyTargetsT, totalPolicy);
+  writeNumpyToZip(zipFile, "futureposTargetCandF", futureposTargetCandF, totalFuturepos);
+  writeNumpyToZip(zipFile, "futureposTargetsF", futureposTargetsF, totalFuturepos);
   //libzip reads the buffers only when closing, so close while the local buffers are alive
   zipFile.close();
 }
