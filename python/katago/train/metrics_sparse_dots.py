@@ -7,7 +7,7 @@ from typing import Dict
 import torch
 import torch.nn.functional
 
-from ..train.metrics_pytorch import Metrics, constant_like, cross_entropy
+from ..train.metrics_pytorch import Metrics, cross_entropy
 from ..train.model_sparse_dots import count_mask
 
 
@@ -57,8 +57,10 @@ class SparseDotsMetrics(Metrics):
     def loss_futurepos_sparse_samplewise(self, pred_pretanh, target, weight, cand_mask, board_area, global_weight):
         # pred_pretanh, target [N,2,M]. Normalized by sqrt of the real board area like the dense model.
         loss = torch.square(torch.tanh(pred_pretanh) - target) * cand_mask.unsqueeze(1)
-        loss = loss * constant_like([1.0, 0.25], loss).view(1, 2, 1)
-        loss = torch.sum(loss, dim=(1, 2)) / torch.sqrt(board_area)
+        # Horizon weights 1 and 0.25 as scalars: a constant tensor would keep the compiled loss out of the
+        # AOTAutograd cache
+        loss = torch.sum(loss[:, 0], dim=1) + 0.25 * torch.sum(loss[:, 1], dim=1)
+        loss = loss / torch.sqrt(board_area)
         return 0.25 * global_weight * weight * loss
 
     def metrics_dict_batchwise_single_heads_output(

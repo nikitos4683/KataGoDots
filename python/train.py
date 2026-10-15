@@ -584,6 +584,7 @@ def _main_impl(rank: int, world_size: int, args, multi_gpu_device_ids, readpipes
         torch.cuda.set_device(my_gpu_id)
         logging.info("Using GPU device: " + torch.cuda.get_device_name())
         device = torch.device("cuda", my_gpu_id)
+        trainloop_helpers.limit_cuda_memory(device)
     elif torch.backends.mps.is_available(): # Check for Apple Metal Performance Shaders
         my_gpu_id = multi_gpu_device_ids[rank]
         logging.info("Using MPS device")

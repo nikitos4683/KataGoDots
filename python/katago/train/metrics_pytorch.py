@@ -232,7 +232,9 @@ class Metrics:
         return torch.sum(global_weight * weight * -torch.sum(target_probs * torch.log(target_probs + 1e-30), dim=-1))
 
     def square_value(self, value_logits, global_weight):
-        return torch.sum(global_weight * torch.square(torch.sum(torch.softmax(value_logits,dim=1) * constant_like([1,-1,0],global_weight), dim=1)))
+        # win - loss, without a constant tensor that would keep a compiled loss out of the AOTAutograd cache
+        value_probs = torch.softmax(value_logits,dim=1)
+        return torch.sum(global_weight * torch.square(value_probs[:,0] - value_probs[:,1]))
 
     @staticmethod
     def get_model_norms(raw_model):

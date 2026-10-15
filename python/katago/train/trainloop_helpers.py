@@ -150,6 +150,19 @@ def align_conv1x1_weight_strides_for_ddp(raw_model) -> int:
     return aligned_count
 
 
+def limit_cuda_memory(device) -> None:
+    """On Windows the driver doesn't fail an allocation beyond the GPU memory but silently moves it to system
+    memory, which is many times slower. The caching allocator reserves far more than it uses when the shapes change
+    from batch to batch (sparse Dots: 11 GiB used, 20 GiB reserved on a 16 GiB GPU at batch 128), so training
+    stalls for seconds at random steps. Capping the process makes the allocator free its cache instead.
+    KATAGO_CUDA_MEMORY_FRACTION overrides the cap (0 disables it), the default is 0.9 on Windows and none elsewhere."""
+    default = "0.9" if os.name == "nt" else "0"
+    fraction = float(os.environ.get("KATAGO_CUDA_MEMORY_FRACTION", default))
+    if fraction > 0.0:
+        torch.cuda.set_per_process_memory_fraction(fraction, device)
+        logging.info(f"Capping the CUDA memory of this process to {fraction:.2f} of the device (KATAGO_CUDA_MEMORY_FRACTION)")
+
+
 def ensure_msvc_for_compile() -> bool:
     """torch.compile (inductor) on Windows needs the MSVC compiler cl.exe. If it isn't on PATH, takes the environment
     of the latest Visual Studio with the C++ tools (vcvars64.bat), so training also works from a plain shell.
