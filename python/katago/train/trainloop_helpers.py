@@ -298,7 +298,18 @@ def configure_model_for_compile(raw_model, per_block=None):
     6-head model: every gradient nonfinite at batch sizes of 128 or more). Disabling that inductor
     optimization instead costs several percent of throughput on these models. So when the model is
     compiled as a single graph, the fused Q/K/V projection and RoPE path is turned off here.
+
+    The same layout optimization also breaks the gradients of the plain flex attention path, with or without the
+    fused kernels and per-block compilation (torch 2.11, triton 3.6): the q/k projection gradients come out 8-35%
+    off on every attention layer (b5c384h6 at 39x32 and 19x19), while the forward is right and eager or SDPA
+    gradients match FP32 to ~0.1%. Such training can diverge (exploding gradients were seen in Dots training
+    without KATAGO_FLEX_ATTENTION=0). So the optimization is
+    turned off whenever flex attention is used; it is also faster then (b5c384h6, 39x32, batch 64 on an RTX
+    5060 Ti: 300 rows/s, against 207 with it and 160 with SDPA attention).
     """
+    if getattr(raw_model, "use_flex_attention", False):
+        torch._inductor.config.layout_optimization = False
+        logging.info("Disabled inductor layout optimization: it breaks the flex attention gradients")
     if per_block is None:
         per_block = env_flag("KATAGO_COMPILE_PER_BLOCK", default=True)
     if per_block and not raw_model.supports_per_block_compile():
