@@ -491,8 +491,12 @@ struct ValueHeadDesc {
 };
 
 // Sparse Dots model (model version 18), see docs/DotsSparseNN.md section 9 for the file layout.
-// Tokens: [GLOBAL][POINT x P][AREA x A], action candidates are decoder queries.
+// Tokens: [GLOBAL][POINT x P], action candidates are decoder queries.
 struct SparseDotsDesc {
+  // Categories of a pair of trunk tokens for the chain attention bias: the same chain, the same owner but another
+  // chain, different owners (a pair with the GLOBAL token gets no bias)
+  static constexpr int NUM_CHAIN_CATEGORIES = 3;
+
   int numPointFeatures;
   int numCandFeatures;
   int numGroundFeatures;
@@ -511,6 +515,8 @@ struct SparseDotsDesc {
   std::vector<std::pair<int, unique_ptr_void>> blocks;
   RMSNormLayerDesc trunkTipRMSNorm;
   ActivationLayerDesc trunkTipActivation;
+  // Chain attention bias of each trunk attention layer in order: [numHeads x NUM_CHAIN_CATEGORIES]
+  std::vector<std::vector<float>> chainBias;
 
   // Candidate decoder
   int decoderNumChannels;

@@ -204,6 +204,9 @@ struct DotsSparseInput {
     int8_t areaMovesAgo; // the freshest movesAgo of these areas, 0 if none is in the history
     int16_t insideMy; // sums over these areas of the dots of the player to move inside
     int16_t insideOpp; // sums over these areas of the opponent dots inside
+    // Index of the chain of the dot: the 8-connected component of the points of its owner (numbered in the order
+    // of the points). The trunk attention gets a learned bias by the chains of the pairs of points
+    int16_t chain;
   };
   // A completed enclosure, the outer contour only. Not an NN input: the point features are computed from the areas
   struct Area {

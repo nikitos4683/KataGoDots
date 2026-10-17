@@ -1,4 +1,4 @@
-"""Files of the sparse Dots training data: the unpadded format, older padded files, shuffling and batching."""
+"""Files of the sparse Dots training data: the unpadded format, shuffling and batching."""
 
 import os
 import random
@@ -27,37 +27,6 @@ def loaded_batch_arrays(rows):
     return batch
 
 
-def dense_score_distribution(rows):
-    dense = np.zeros((len(rows), SCORE_LEN), np.int8)
-    for i, row in enumerate(rows):
-        for score, weight in zip(*row["scoreDistr"]):
-            dense[i, score + SCORE_LEN // 2] += weight
-    return dense
-
-
-def oldest_padded_arrays(rows):
-    """The rows in the oldest file format: the per-entity arrays padded to the maxima, dense targets."""
-    batch = batch_arrays(rows)
-    del batch["scoreDistrScoresN"], batch["scoreDistrWeightsN"]
-    batch["scoreDistrN"] = dense_score_distribution(rows)
-    return batch
-
-
-def v1_arrays(rows):
-    """The rows in the unpadded file format with dense candidate targets and a full score distribution."""
-    padded = oldest_padded_arrays(rows)
-    arrays = {name: padded[name] for name in ["boardSizeN", "globalInputNC", "pointCountN", "candCountN", "groundN",
-                                              "groundPolicyTargetsN", "globalTargetsNC", "scoreDistrN"]}
-    for name, count_name in [("pointCoordsP", "pointCountN"), ("pointDataP", "pointCountN"),
-                             ("pointOwnershipTargetsP", "pointCountN"), ("candCoordsM", "candCountN"),
-                             ("candDataM", "candCountN"), ("candPolicyTargetsM", "candCountN"),
-                             ("candFutureposTargetsM", "candCountN")]:
-        padded_name = name[:-1] + ("NP" if count_name == "pointCountN" else "NM")
-        counts = padded[count_name]
-        arrays[name] = np.concatenate([padded[padded_name][i, :counts[i]] for i in range(len(rows))], axis=0)
-    return arrays
-
-
 def file_arrays(rows):
     """The rows in the current file format, built directly from the rows."""
     def stack(values, dtype, width):
@@ -76,6 +45,7 @@ def file_arrays(rows):
         "pointCoordsP": stack([p[0:2] for r in rows for p in r["points"]], np.int8, 2),
         "pointStateP": stack([p[2:7] for r in rows for p in r["points"]], np.int8, 5),
         "pointInsideP": stack([p[7:9] for r in rows for p in r["points"]], np.int16, 2),
+        "pointChainP": np.array([p[9] for r in rows for p in r["points"]], np.int16),
         "pointOwnershipTargetsP": np.array([t for r in rows for t in r["pointOwnershipTargetsNP"]], np.int8),
         "candCoordsM": stack([c[0:2] for r in rows for c in r["cands"]], np.int8, 2),
         "candGainM": stack([c[2:4] for r in rows for c in r["cands"]], np.int16, 2),
@@ -113,7 +83,7 @@ def test_current_format_has_no_zero_runs():
     assert (arrays["futureposTargetsF"] != 0).any(axis=1).all()
 
 
-def test_load_current_and_older_files(tmp_path):
+def test_load_current_and_reject_older_files(tmp_path):
     rows = make_rows(1, 13)
     expected = file_arrays(rows)
 
@@ -121,28 +91,12 @@ def test_load_current_and_older_files(tmp_path):
     sparse_dots_npz.save_sparse_npz(current, file_arrays(rows))
     assert_arrays_equal(sparse_dots_npz.load_sparse_npz(current), expected, sparse_dots_npz.ARRAY_NAMES)
 
-    v1 = str(tmp_path / "v1.npz")
-    v1_rows = v1_arrays(rows)
-    v1_rows["globalTargetsNC"] = v1_rows["globalTargetsNC"][:, :64]
-    np.savez_compressed(v1, **v1_rows)
-    assert_arrays_equal(sparse_dots_npz.load_sparse_npz(v1), expected, sparse_dots_npz.ARRAY_NAMES)
-
-    oldest = str(tmp_path / "oldest.npz")
-    np.savez_compressed(oldest, **oldest_padded_arrays(rows))
-    loaded = sparse_dots_npz.load_sparse_npz(oldest)
-    assert_arrays_equal(loaded, expected, sparse_dots_npz.ARRAY_NAMES)
-
-
-def test_score_distribution_bins():
-    rows = make_rows(5, 9)
-    rows[0]["scoreDistr"] = ([2, 3], [100, 0])
-    scores, weights = sparse_dots_npz.score_distribution_bins(dense_score_distribution(rows))
-    expected = dense_score_distribution(rows)
-    rebuilt = np.zeros_like(expected)
-    for i in range(len(rows)):
-        for s, w in zip(scores[i], weights[i]):
-            rebuilt[i, s + SCORE_LEN // 2] += w
-    np.testing.assert_array_equal(rebuilt, expected)
+    older = str(tmp_path / "older.npz")
+    arrays = file_arrays(rows)
+    del arrays["pointChainP"]
+    np.savez_compressed(older, **arrays)
+    with pytest.raises(ValueError, match="older format"):
+        sparse_dots_npz.load_sparse_npz(older)
 
 
 def test_select_rows_and_collate():
@@ -202,7 +156,7 @@ def test_loader_yields_every_row_once(tmp_path, num_workers):
         ids = batch["globalInputNC"][:, 0].long().tolist()
         seen.extend(ids)
         expected = loaded_batch_arrays([rows[i] for i in ids])
-        for name in ["pointCountN", "pointCoordsNP", "pointDataNP", "candCountN", "candCoordsNM", "candDataNM",
+        for name in ["pointCountN", "pointCoordsNP", "pointDataNP", "pointChainNP", "candCountN", "candCoordsNM", "candDataNM",
                      "candPolicyTargetsNM", "candFutureposTargetsNM", "pointOwnershipTargetsNP", "groundN"]:
             np.testing.assert_array_equal(batch[name].numpy(), expected[name], err_msg=name)
         assert batch["pointDataNP"].dtype == torch.int32
@@ -216,10 +170,7 @@ def test_shuffle_keeps_every_row(tmp_path):
     for i in range(2):
         filename = str(tmp_path / f"in{i}.npz")
         inputs.append(filename)
-        if i == 0:
-            sparse_dots_npz.save_sparse_npz(filename, file_arrays(rows[:25]))
-        else:
-            np.savez_compressed(filename, **oldest_padded_arrays(rows[25:]))  # an oldest format file
+        sparse_dots_npz.save_sparse_npz(filename, file_arrays(rows[:25] if i == 0 else rows[25:]))
     assert shuffle.is_sparse_npz_file(inputs[0]) and shuffle.is_sparse_npz_file(inputs[1])
 
     tmp_dirs = [str(tmp_path / f"tmp{j}") for j in range(2)]

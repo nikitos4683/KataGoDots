@@ -363,7 +363,7 @@ void sparseDotsApplyRopeQK(
 template <typename T, int qHeadDim, int vHeadDim, int BLOCK_Q, int BLOCK_KV>
 __global__ void sparseDotsAttentionKernel(
   const T* Q, const T* K, const T* V, T* output, const int* qStart, const int* kvStart, int numHeads, int numKVHeads,
-  int qStride, int kvStride, float scale
+  int qStride, int kvStride, float scale, const int* chainCodes, const float* chainBias
 ) {
   const int tid = threadIdx.x;
   const int bh = blockIdx.y;
@@ -382,6 +382,7 @@ __global__ void sparseDotsAttentionKernel(
 
   __shared__ float kTile[BLOCK_KV * qHeadDim];
   __shared__ float vTile[BLOCK_KV * vHeadDim];
+  __shared__ int codeTile[BLOCK_KV];
 
   float qReg[qHeadDim];
   float acc[vHeadDim];
@@ -397,6 +398,15 @@ __global__ void sparseDotsAttentionKernel(
   #pragma unroll
   for(int d = 0; d < vHeadDim; d++)
     acc[d] = 0.0f;
+  int rowCode = -1;
+  float bias0 = 0.0f, bias1 = 0.0f, bias2 = 0.0f;
+  if(chainCodes != nullptr) {
+    if(active)
+      rowCode = chainCodes[qBase + qPos];
+    bias0 = chainBias[h * 3 + 0];
+    bias1 = chainBias[h * 3 + 1];
+    bias2 = chainBias[h * 3 + 2];
+  }
 
   for(int kvTileStart = 0; kvTileStart < kvLen; kvTileStart += BLOCK_KV) {
     for(int t = tid; t < BLOCK_KV * qHeadDim; t += BLOCK_Q) {
@@ -407,6 +417,12 @@ __global__ void sparseDotsAttentionKernel(
       int p = kvTileStart + t / vHeadDim;
       vTile[t] = p < kvLen ? toFloat(V[(long long)(kvBase + p) * kvStride + kvh * vHeadDim + t % vHeadDim]) : 0.0f;
     }
+    if(chainCodes != nullptr) {
+      for(int t = tid; t < BLOCK_KV; t += BLOCK_Q) {
+        int p = kvTileStart + t;
+        codeTile[t] = p < kvLen ? chainCodes[kvBase + p] : -1;
+      }
+    }
     __syncthreads();
     if(active) {
       int kvEnd = min(BLOCK_KV, kvLen - kvTileStart);
@@ -415,6 +431,11 @@ __global__ void sparseDotsAttentionKernel(
         #pragma unroll
         for(int d = 0; d < qHeadDim; d++)
           dot += qReg[d] * kTile[tk * qHeadDim + d];
+        if(rowCode >= 0) {
+          const int keyCode = codeTile[tk];
+          if(keyCode >= 0)
+            dot += keyCode == rowCode ? bias0 : (((keyCode ^ rowCode) & 1) ? bias2 : bias1);
+        }
         float newMax = fmaxf(runningMax, dot);
         float expOld = __expf(runningMax - newMax);
         float expCur = __expf(dot - newMax);
@@ -440,7 +461,8 @@ __global__ void sparseDotsAttentionKernel(
 template <typename T>
 void sparseDotsAttention(
   const T* Q, const T* K, const T* V, T* output, const int* qStart, const int* kvStart, int numSegs, int maxQLen,
-  int numHeads, int numKVHeads, int qHeadDim, int vHeadDim, int qStride, int kvStride, cudaStream_t stream
+  int numHeads, int numKVHeads, int qHeadDim, int vHeadDim, int qStride, int kvStride, const int* chainCodes,
+  const float* chainBias, cudaStream_t stream
 ) {
   if((long long)numSegs * numHeads > 65535)
     throw std::runtime_error("sparseDotsAttention: too many positions * heads");
@@ -452,13 +474,13 @@ void sparseDotsAttention(
   dim3 grid((maxQLen + BLOCK_Q - 1) / BLOCK_Q, numSegs * numHeads);
   if(qHeadDim == 32 && vHeadDim == 32)
     sparseDotsAttentionKernel<T, 32, 32, BLOCK_Q, BLOCK_KV><<<grid, BLOCK_Q, 0, stream>>>(
-      Q, K, V, output, qStart, kvStart, numHeads, numKVHeads, qStride, kvStride, scale);
+      Q, K, V, output, qStart, kvStart, numHeads, numKVHeads, qStride, kvStride, scale, chainCodes, chainBias);
   else if(qHeadDim == 64 && vHeadDim == 64)
     sparseDotsAttentionKernel<T, 64, 64, BLOCK_Q, BLOCK_KV><<<grid, BLOCK_Q, 0, stream>>>(
-      Q, K, V, output, qStart, kvStart, numHeads, numKVHeads, qStride, kvStride, scale);
+      Q, K, V, output, qStart, kvStart, numHeads, numKVHeads, qStride, kvStride, scale, chainCodes, chainBias);
   else if(qHeadDim == 16 && vHeadDim == 16)
     sparseDotsAttentionKernel<T, 16, 16, BLOCK_Q, BLOCK_KV><<<grid, BLOCK_Q, 0, stream>>>(
-      Q, K, V, output, qStart, kvStart, numHeads, numKVHeads, qStride, kvStride, scale);
+      Q, K, V, output, qStart, kvStart, numHeads, numKVHeads, qStride, kvStride, scale, chainCodes, chainBias);
   else
     throw std::runtime_error("sparseDotsAttention: unsupported head dims");
 }
@@ -512,7 +534,8 @@ void sparseDotsPool(
   template void sparseDotsApplyRope<T>(T*, const float*, const float*, int, int, int, int, int, cudaStream_t); \
   template void sparseDotsApplyRopeQK<T>(T*, T*, const float*, const float*, int, int, int, int, int, int, cudaStream_t); \
   template void sparseDotsAttention<T>( \
-    const T*, const T*, const T*, T*, const int*, const int*, int, int, int, int, int, int, int, int, cudaStream_t);
+    const T*, const T*, const T*, T*, const int*, const int*, int, int, int, int, int, int, int, int, const int*, \
+    const float*, cudaStream_t);
 
 SPARSE_DOTS_INSTANTIATE(float)
 SPARSE_DOTS_INSTANTIATE(half)

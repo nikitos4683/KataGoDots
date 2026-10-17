@@ -1018,6 +1018,8 @@ void TrainingWriteBuffers::writeDotsSparseArrays(ZipFile& zipFile) {
   NumpyBuffer<int8_t> pointStateP({totalPoints, 5});
   //insideMy, insideOpp
   NumpyBuffer<int16_t> pointInsideP({totalPoints, 2});
+  //index of the 8-connected chain of the dots of the same owner within the row
+  NumpyBuffer<int16_t> pointChainP({totalPoints});
   NumpyBuffer<int8_t> pointOwnershipTargetsP({totalPoints});
   NumpyBuffer<int16_t> candCountN({n});
   NumpyBuffer<int8_t> candCoordsM({totalCands, 2});
@@ -1058,6 +1060,7 @@ void TrainingWriteBuffers::writeDotsSparseArrays(ZipFile& zipFile) {
       state[4] = p.areaMovesAgo;
       pointInsideP.data[pointIdx * 2 + 0] = p.insideMy;
       pointInsideP.data[pointIdx * 2 + 1] = p.insideOpp;
+      pointChainP.data[pointIdx] = p.chain;
       pointOwnershipTargetsP.data[pointIdx] = row.pointOwnership[i];
     }
 
@@ -1138,6 +1141,7 @@ void TrainingWriteBuffers::writeDotsSparseArrays(ZipFile& zipFile) {
   writeNumpyToZip(zipFile, "pointCoordsP", pointCoordsP, totalPoints);
   writeNumpyToZip(zipFile, "pointStateP", pointStateP, totalPoints);
   writeNumpyToZip(zipFile, "pointInsideP", pointInsideP, totalPoints);
+  writeNumpyToZip(zipFile, "pointChainP", pointChainP, totalPoints);
   writeNumpyToZip(zipFile, "pointOwnershipTargetsP", pointOwnershipTargetsP, totalPoints);
   writeNumpyToZip(zipFile, "candCoordsM", candCoordsM, totalCands);
   writeNumpyToZip(zipFile, "candGainM", candGainM, totalCands);

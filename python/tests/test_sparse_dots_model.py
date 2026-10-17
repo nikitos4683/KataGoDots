@@ -106,6 +106,7 @@ def permute_row(batch, rng):
         cp = torch.from_numpy(rng.permutation(num_cands))
         result["pointCoordsNP"][row, :num_points] = batch["pointCoordsNP"][row, pp]
         result["pointDataNP"][row, :num_points] = batch["pointDataNP"][row, pp]
+        result["pointChainNP"][row, :num_points] = batch["pointChainNP"][row, pp]
         result["pointOwnershipTargetsNP"][row, :num_points] = batch["pointOwnershipTargetsNP"][row, pp]
         for key in ["candCoordsNM", "candDataNM", "candPolicyTargetsNM", "candFutureposTargetsNM"]:
             result[key][row, :num_cands] = batch[key][row, cp]
@@ -127,6 +128,34 @@ def test_token_order_equivariance():
         expected["policy_cands"] = expected["policy_cands"][:, cp]
         expected["futurepos"] = expected["futurepos"][:, cp]
         assert_close(valid_outputs(permuted, out_permuted, row), expected)
+
+
+def test_chain_bias_depends_only_on_chain_equality():
+    """Renumbering the chains keeps the outputs; merging two chains of the same owner changes them."""
+    model = make_model()
+    batch = random_batch(7, n=4)
+    out = run(model, batch)
+    renumbered = dict(batch)
+    renumbered["pointChainNP"] = torch.where(batch["pointChainNP"] >= 0, 100 - batch["pointChainNP"], batch["pointChainNP"])
+    out_renumbered = run(model, renumbered)
+    for row in range(4):
+        assert_close(valid_outputs(batch, out, row), valid_outputs(renumbered, out_renumbered, row))
+    merged = dict(batch)
+    chains = batch["pointChainNP"].clone()
+    owners = batch["pointDataNP"][..., 0]
+    changed = False
+    for row in range(4):
+        count = int(batch["pointCountN"][row])
+        for owner in (0, 1):
+            own_chains = sorted({int(c) for c, o in zip(chains[row, :count], owners[row, :count]) if int(o) == owner})
+            if len(own_chains) >= 2:
+                chains[row, :count] = torch.where(chains[row, :count] == own_chains[1], own_chains[0], chains[row, :count])
+                changed = True
+    assert changed
+    merged["pointChainNP"] = chains
+    policy, value = run(model, batch)[0][:2]
+    policy_m, value_m = run(model, merged)[0][:2]
+    assert not torch.allclose(value, value_m, atol=1e-6)
 
 
 def test_symmetry_of_coordinates():

@@ -17,7 +17,7 @@ from ..train.model_sparse_dots import NUM_MOVES_AGO, apply_symmetry_to_batch
 
 # Torch dtype of each array in a batch
 _LONG_ARRAYS = {"pointCountN", "candCountN", "policyTargetCountN", "futureposTargetCountN", "scoreDistrScoresN"}
-_INT_ARRAYS = {"boardSizeN", "pointCoordsNP", "pointDataNP", "candCoordsNM", "candDataNM"}
+_INT_ARRAYS = {"boardSizeN", "pointCoordsNP", "pointDataNP", "pointChainNP", "candCoordsNM", "candDataNM"}
 
 # Rows are sorted by length within chunks of this many batches. The longer the chunk, the less padding and the more
 # alike the positions of a batch are (the same stage of the game): 32 batches leave ~5% padding of the tokens.

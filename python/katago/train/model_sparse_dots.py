@@ -17,6 +17,7 @@ import torch
 import torch.nn
 import torch.nn.functional
 from torch.amp import autocast
+from torch.nn.attention.flex_attention import flex_attention
 
 from ..train import modelconfigs
 from ..train.model_pytorch import (
@@ -31,6 +32,7 @@ from ..train.model_pytorch import (
     apply_learnable_rotary_emb,
     init_weights,
 )
+from ..train.trainloop_helpers import env_flag
 
 # Input feature layout -------------------------------------------------------------------------------------------
 
@@ -62,6 +64,7 @@ def init_rope_freqs(num_heads: int, num_pairs: int) -> torch.Tensor:
     signs = (torch.randint(0, 2, (num_heads, num_pairs, 2)) * 2 - 1).float()
     return magnitudes * signs
 
+
 # Keys of the batch dict (training data arrays, docs/DotsSparseNN.md 7.2)
 INPUT_KEYS = [
     "boardSizeN", "globalInputNC",
@@ -69,14 +72,43 @@ INPUT_KEYS = [
     "candCountN", "candCoordsNM", "candDataNM",
     "groundN",
 ]
+# Chain of each point (the 8-connected component of the points of its owner, from the engine), -1 at padding
+POINT_CHAINS_KEY = "pointChainNP"
 # Padded dimension (1-based axis) of each per-entity array
 PADDED_ARRAYS = {
-    "pointCoordsNP": "P", "pointDataNP": "P", "pointOwnershipTargetsNP": "P",
+    "pointCoordsNP": "P", "pointDataNP": "P", "pointOwnershipTargetsNP": "P", POINT_CHAINS_KEY: "P",
     "candCoordsNM": "M", "candDataNM": "M", "candPolicyTargetsNM": "M", "candFutureposTargetsNM": "M",
 }
 COUNT_KEY_OF_DIM = {"P": "pointCountN", "M": "candCountN"}
 
 SPARSE_POSITIONS = "sparse_positions"
+# Chain codes of the trunk tokens [N,S] (see token_chain_codes) and whether to use flex attention, for the blocks
+SPARSE_CHAIN_CODES = "sparse_chain_codes"
+SPARSE_USE_FLEX = "sparse_use_flex"
+
+# Categories of a pair of trunk tokens for the chain attention bias: the same chain, the same owner but another
+# chain, different owners. A pair with the GLOBAL token gets no bias.
+NUM_CHAIN_CATEGORIES = 3
+# Copies of the chain bias table per position for the flex attention backward, see SparseRoPEAttentionBlock
+CHAIN_BIAS_GRAD_SLOTS = 16
+
+
+def token_chain_codes(point_chains_np: torch.Tensor, owners: torch.Tensor, point_mask: torch.Tensor) -> torch.Tensor:
+    """Codes of the trunk tokens [GLOBAL][POINT x P] for the chain bias: 2 * chain + owner for the points,
+    -1 for GLOBAL, -2 for padding. Equal codes = the same chain, equal parities = the same owner. Returns [N,S] int32."""
+    codes = torch.where(point_mask > 0, 2 * point_chains_np.to(torch.int32) + owners.to(torch.int32), -2)
+    return torch.cat([codes.new_full((codes.shape[0], 1), -1), codes], dim=1)
+
+
+def chain_attention_mask(codes: torch.Tensor, table: torch.Tensor, key_valid: torch.Tensor, dtype) -> torch.Tensor:
+    """Additive attention mask [N,H,S,S] of the pairs of tokens with codes [N,S]: the chain bias from the per head
+    table [H, NUM_CHAIN_CATEGORIES], and -inf for the keys that are not valid (key_valid [N,S])."""
+    a = codes.unsqueeze(2).unsqueeze(1)  # [N,1,S,1]
+    b = codes.unsqueeze(1).unsqueeze(1)  # [N,1,1,S]
+    t = table.to(dtype).view(1, -1, NUM_CHAIN_CATEGORIES, 1, 1)
+    bias = torch.where(a == b, t[:, :, 0], torch.where(torch.remainder(a - b, 2) == 0, t[:, :, 1], t[:, :, 2]))
+    bias = bias.masked_fill((a < 0) | (b < 0), 0.0)
+    return bias.masked_fill(~key_valid.view(key_valid.shape[0], 1, 1, -1), float("-inf"))
 
 
 def is_sparse_dots_config(config: modelconfigs.ModelConfig) -> bool:
@@ -252,13 +284,43 @@ class SparseRoPEAttentionBlock(TransformerAttentionBlock):
         q = q.permute(0, 2, 1, 3)
         k = k.permute(0, 2, 1, 3)
         v = v.permute(0, 2, 1, 3)
-        if self.n_rep > 1:
-            k = k.repeat_interleave(self.n_rep, dim=1)
-            v = v.repeat_interleave(self.n_rep, dim=1)
+        scale = 1.0 / math.sqrt(self.q_head_dim)
+        codes = block_shared_data[SPARSE_CHAIN_CODES]
+        chain_bias = self.chain_bias
 
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=_key_padding_bias(mask, q.dtype), dropout_p=0.0, scale=1.0 / math.sqrt(self.q_head_dim),
-        )
+        # Flex attention only for training: inductor fails to lower its inference kernel with this score_mod
+        # (torch 2.11), so validation and inference use SDPA with the materialized mask (no grad, one layer at a time)
+        if block_shared_data[SPARSE_USE_FLEX] and q.is_cuda and torch.is_grad_enabled():
+            # The bias of a pair is computed in the kernel, never materialized, as
+            #   t2 + (t1 - t2) * [same owner] + (t0 - t1) * [same chain]
+            # for two points (t = the table of the head). The backward kernel accumulates the gradients of the tables
+            # with atomic adds from every pair; into the few values of a head they contend and make the attention ~8x
+            # slower, so the kernel reads copies of the tables, one per position and query slot.
+            def copies(values):
+                return values.view(self.num_heads, 1, 1).expand(self.num_heads, batch_size, CHAIN_BIAS_GRAD_SLOTS).contiguous()
+
+            base = copies(chain_bias[:, 2])
+            owner_term = copies(chain_bias[:, 1] - chain_bias[:, 2])
+            chain_term = copies(chain_bias[:, 0] - chain_bias[:, 1])
+
+            def score_mod(score, b, h, q_idx, kv_idx):
+                code_q = codes[b, q_idx]
+                code_k = codes[b, kv_idx]
+                slot = q_idx % CHAIN_BIAS_GRAD_SLOTS
+                bias = (base[h, b, slot] + torch.where(((code_q ^ code_k) & 1) == 0, owner_term[h, b, slot], 0.0)
+                        + torch.where(code_q == code_k, chain_term[h, b, slot], 0.0))
+                bias = torch.where((code_q >= 0) & (code_k >= 0), bias, 0.0)
+                return torch.where(code_k == -2, -float("inf"), score + bias)
+
+            attn_output = flex_attention(q, k, v, score_mod=score_mod, scale=scale, enable_gqa=self.n_rep > 1)
+        else:
+            if self.n_rep > 1:
+                k = k.repeat_interleave(self.n_rep, dim=1)
+                v = v.repeat_interleave(self.n_rep, dim=1)
+            key_valid = mask.reshape(batch_size, seq_len) > 0
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=chain_attention_mask(codes, chain_bias, key_valid, q.dtype), dropout_p=0.0, scale=scale,
+            )
         attn_output = attn_output.permute(0, 2, 1, 3).reshape(batch_size, seq_len, self.num_heads * self.v_head_dim)
         result = self.out_proj(attn_output)
         if extra_outputs is not None:
@@ -525,8 +587,10 @@ class SparseDotsModel(torch.nn.Module):
         self.katago_backend = katago_backend
         self.pos_len_x = pos_len_x
         self.pos_len_y = pos_len_y
-        # Read by train.py around validation, flex attention is never used here
-        self.use_flex_attention = False
+        # Flex attention computes the chain bias of the trunk attention in the kernel on CUDA. Without it (or with
+        # the flag turned off, as train.py does around validation) the bias is materialized for SDPA. Also read by
+        # the compile setup.
+        self.use_flex_attention = env_flag("KATAGO_FLEX_ATTENTION", default=True)
         self.norm_kind = config["norm_kind"]
         self.block_kind = config["block_kind"]
         self.c_trunk = config["trunk_num_channels"]
@@ -578,6 +642,8 @@ class SparseDotsModel(torch.nn.Module):
                 if isinstance(sub, TransformerAttentionBlock):
                     sub.__class__ = SparseRoPEAttentionBlock
                     sub.rope_freqs = torch.nn.Parameter(init_rope_freqs(*sub.rope_freqs.shape[:2]))
+                    # Starts at zero: the model starts as without the bias
+                    sub.chain_bias = torch.nn.Parameter(torch.zeros(sub.num_heads, NUM_CHAIN_CATEGORIES))
             self.blocks.append(block)
         self.norm_trunkfinal = SparseRMSNormMask(self.c_trunk)
         self.act_trunkfinal = act(self.activation)
@@ -592,6 +658,10 @@ class SparseDotsModel(torch.nn.Module):
     @property
     def device(self):
         return self.linear_global.weight.device
+
+    def trunk_attention_blocks(self) -> List[SparseRoPEAttentionBlock]:
+        """The attention sub-blocks of the trunk in order (the order of the chain bias tables in the model file)."""
+        return [sub for block in self.blocks for sub in block.blockstack if isinstance(sub, SparseRoPEAttentionBlock)]
 
     def initialize(self):
         with torch.no_grad():
@@ -687,6 +757,9 @@ class SparseDotsModel(torch.nn.Module):
         mask_sum_hw = num_tokens.view(-1, 1, 1)
         mask_sum = torch.sum(mask)
         block_shared_data = {SPARSE_POSITIONS: positions}
+        point_mask = mask[:, 1:, 0]
+        block_shared_data[SPARSE_CHAIN_CODES] = token_chain_codes(batch[POINT_CHAINS_KEY], batch["pointDataNP"][..., 0], point_mask)
+        block_shared_data[SPARSE_USE_FLEX] = self.use_flex_attention
 
         if extra_outputs is not None:
             extra_outputs.report("trunk_after_embedding", tokens)

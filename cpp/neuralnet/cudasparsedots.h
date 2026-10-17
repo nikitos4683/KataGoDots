@@ -74,10 +74,13 @@ void sparseDotsApplyRopeQK(
 // at the start of the row), keys K and values V [kvRows, kvStride], output [qRows, numHeads * vHeadDim].
 // Position n has the queries [qStart[n], qStart[n+1]) and the keys [kvStart[n], kvStart[n+1]); maxQLen is the
 // max number of queries of a position. Head dims (16, 16), (32, 32) and (64, 64) are supported.
+// chainCodes/chainBias (self-attention of the trunk, both null if none): a code per row and the bias [numHeads][3] of
+// the pairs of rows by their codes, see SparseDotsNN::chainCategory.
 template <typename T>
 void sparseDotsAttention(
   const T* Q, const T* K, const T* V, T* output, const int* qStart, const int* kvStart, int numSegs, int maxQLen,
-  int numHeads, int numKVHeads, int qHeadDim, int vHeadDim, int qStride, int kvStride, cudaStream_t stream);
+  int numHeads, int numKVHeads, int qHeadDim, int vHeadDim, int qStride, int kvStride, const int* chainCodes,
+  const float* chainBias, cudaStream_t stream);
 
 // Pooling over the rows of each position of x [rows, channels], out [numSegs, 3 * channels]:
 // gpool mode:  [mean, mean * off / 10, max]
