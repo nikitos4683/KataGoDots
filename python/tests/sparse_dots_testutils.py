@@ -30,6 +30,30 @@ def tiny_sparse_config(decoder_layers=1):
     })
 
 
+def point_chains(points) -> List[int]:
+    """Chains of the points (x, y, owner, ...): 8-connected components of the points of the same owner, numbered in
+    the order of the points, as the engine numbers them."""
+    index_of = {(p[0], p[1]): i for i, p in enumerate(points)}
+    chains = [-1] * len(points)
+    num_chains = 0
+    for start in range(len(points)):
+        if chains[start] >= 0:
+            continue
+        chains[start] = num_chains
+        stack = [start]
+        while stack:
+            i = stack.pop()
+            x, y, owner = points[i][0], points[i][1], points[i][2]
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    j = index_of.get((x + dx, y + dy))
+                    if j is not None and chains[j] < 0 and points[j][2] == owner:
+                        chains[j] = num_chains
+                        stack.append(j)
+        num_chains += 1
+    return chains
+
+
 def random_row(rng: random.Random, x_size: int, y_size: int) -> Dict:
     cells = [(x, y) for y in range(y_size) for x in range(x_size)]
     rng.shuffle(cells)
@@ -42,13 +66,14 @@ def random_row(rng: random.Random, x_size: int, y_size: int) -> Dict:
     row = {
         "boardSizeN": [x_size, y_size],
         "globalInputNC": [rng.uniform(-1, 1) for _ in range(8)],
-        # x, y, owner, grounded, movesAgo, areaCount, areaMovesAgo, insideMy, insideOpp
+        # x, y, owner, grounded, movesAgo, areaCount, areaMovesAgo, insideMy, insideOpp (the chain is appended below)
         "points": [(x, y, rng.randint(0, 1), rng.randint(0, 1), rng.randint(0, 5), area_count,
                     rng.randint(0, 5) if area_count else 0, rng.randint(0, 9) * area_count, rng.randint(0, 9) * area_count)
                    for (x, y) in points for area_count in [rng.choice([0, 0, 1, 1, 2])]],
         "cands": [(x, y, rng.randint(-3, 3), rng.randint(-3, 3), rng.randint(0, 1), rng.randint(0, 1)) for (x, y) in cands],
         "groundN": [ground_allowed, rng.uniform(-10, 10)],
     }
+    row["points"] = [p + (chain,) for p, chain in zip(row["points"], point_chains(row["points"]))]
     # Targets
     policy = [[rng.randint(0, 50), rng.randint(0, 50)] for _ in cands]
     row["candPolicyTargetsNM"] = policy
@@ -92,6 +117,7 @@ def collate(rows: List[Dict], pad_extra: int = 0) -> Dict[str, torch.Tensor]:
         "pointCountN": np.zeros(n, np.int16),
         "pointCoordsNP": np.zeros((n, P, 2), np.int8),
         "pointDataNP": np.zeros((n, P, 7), np.int16),
+        "pointChainNP": np.full((n, P), -1, np.int16),
         "candCountN": np.zeros(n, np.int16),
         "candCoordsNM": np.zeros((n, M, 2), np.int8),
         "candDataNM": np.zeros((n, M, 4), np.int16),
@@ -111,6 +137,7 @@ def collate(rows: List[Dict], pad_extra: int = 0) -> Dict[str, torch.Tensor]:
         for j, point in enumerate(r["points"]):
             b["pointCoordsNP"][i, j] = point[0:2]
             b["pointDataNP"][i, j] = point[2:9]
+            b["pointChainNP"][i, j] = point[9]
         b["candCountN"][i] = len(r["cands"])
         for j, c in enumerate(r["cands"]):
             b["candCoordsNM"][i, j] = c[0:2]

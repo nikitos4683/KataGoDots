@@ -275,6 +275,7 @@ The loop carries out five stages sequentially:
    - The old dense Dots path (`nninputsdots.cpp`, 22 spatial and 19 global features, model versions up to 17) is still in the code but dense Dots models are rejected; it is to be removed once the sparse path is in use.
    - Value / auxiliary heads: KataGo's original Go-specific seki and score distribution heads were removed in commit `885e426f`. Do not reintroduce them without updating model definitions in both C++ and Python.
    - Ownership is predicted per placed dot (a sigmoid on the point tokens).
+   - The trunk attention gets a learned per-head bias by the chains of the points (8-connected components of the dots of one owner, computed by the engine and written as `pointChainP`). Models and data without chains are rejected.
 
 4. **Code Formatting & Cleanliness**:
    - **C++**: Follow the rules defined in `.clang-format` (Chromium base, 2-space indentation, 120 characters column limit). Keep headers alphabetically sorted.

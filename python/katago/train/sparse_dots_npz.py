@@ -9,8 +9,7 @@
 #   their weights (summing to 100).
 # - Small values are stored in int8.
 #
-# Older files are converted on loading: the unpadded files with dense candidate targets, a full score distribution
-# and int16 data, and before them the files with the per-entity arrays padded to the maxima of the file.
+# Files of older formats (without the chains of the points) are rejected.
 
 from typing import Dict, List, Optional
 
@@ -22,8 +21,9 @@ ROW_ARRAY_NAMES = [
 ]
 # The per-entity arrays of each count array
 ENTITY_ARRAY_NAMES = {
-    # owner, grounded, movesAgo, areaCount, areaMovesAgo (int8); insideMy, insideOpp (int16)
-    "pointCountN": ["pointCoordsP", "pointStateP", "pointInsideP", "pointOwnershipTargetsP"],
+    # owner, grounded, movesAgo, areaCount, areaMovesAgo (int8); insideMy, insideOpp (int16); the chain of the point
+    # (int16, the 8-connected component of the points of its owner, numbered within the row)
+    "pointCountN": ["pointCoordsP", "pointStateP", "pointInsideP", "pointChainP", "pointOwnershipTargetsP"],
     # gainMy, gainOpp (int16); inMyHouse, inOppHouse (int8)
     "candCountN": ["candCoordsM", "candGainM", "candHouseM"],
     # The candidates with a nonzero policy target (my move or the opponent's reply): their index and visits
@@ -36,21 +36,11 @@ ARRAY_NAMES = ROW_ARRAY_NAMES + [name for names in ENTITY_ARRAY_NAMES.values() f
 
 # Arrays of a batch built by collate(): the row arrays and these per-entity arrays padded to the max of the batch
 BATCH_PADDED_NAMES = [
-    "pointCoordsNP", "pointDataNP", "pointOwnershipTargetsNP",
+    "pointCoordsNP", "pointDataNP", "pointChainNP", "pointOwnershipTargetsNP",
     "candCoordsNM", "candDataNM", "candPolicyTargetsNM", "candFutureposTargetsNM",
 ]
 
 GLOBAL_TARGETS_NC_CHANNELS = 80
-
-# Older formats: the unpadded one with dense candidate targets, and the names of its arrays padded to the maxima
-# of the file in the oldest one
-_V1_POINT_ARRAY_NAMES = ["pointCoordsP", "pointDataP", "pointOwnershipTargetsP"]
-_V1_CAND_ARRAY_NAMES = ["candCoordsM", "candDataM", "candPolicyTargetsM", "candFutureposTargetsM"]
-_V1_PADDED_NAME = {
-    "pointCoordsP": "pointCoordsNP", "pointDataP": "pointDataNP", "pointOwnershipTargetsP": "pointOwnershipTargetsNP",
-    "candCoordsM": "candCoordsNM", "candDataM": "candDataNM", "candPolicyTargetsM": "candPolicyTargetsNM",
-    "candFutureposTargetsM": "candFutureposTargetsNM",
-}
 
 
 def is_sparse_npz_names(names) -> bool:
@@ -78,85 +68,14 @@ def offsets(counts: np.ndarray) -> np.ndarray:
     return np.cumsum(counts) - counts
 
 
-def score_distribution_bins(dense: np.ndarray):
-    """A full score distribution [N, L] (one or two adjacent nonzero bins per row, the middle bin at L / 2) as the
-    scores of two adjacent bins [N, 2] int16 (ascending; bin minus the middle bin) and their weights [N, 2] int8.
-    A single nonzero bin is paired with the next one (the previous one at the end) with weight 0, like
-    TrainingWriteBuffers::writeDotsSparseArrays does."""
-    length = dense.shape[1]
-    nonzero = dense != 0
-    counts = nonzero.sum(axis=1)
-    assert counts.min(initial=1) >= 1 and counts.max(initial=1) <= 2, "A score distribution row needs one or two nonzero bins"
-    first_two = np.argsort(~nonzero, axis=1, kind="stable")[:, :2]
-    lo, hi = first_two[:, 0], first_two[:, 1]
-    single = counts == 1
-    hi = np.where(single, lo + 1, hi)
-    at_end = single & (lo == length - 1)
-    lo = np.where(at_end, length - 2, lo)
-    hi = np.where(at_end, length - 1, hi)
-    bins = np.stack([lo, hi], axis=1)
-    assert ((bins[:, 1] - bins[:, 0]) == 1).all(), "The nonzero bins of a score distribution row must be adjacent"
-    weights = np.take_along_axis(dense, bins, axis=1)
-    return (bins - length // 2).astype(np.int16), weights.astype(np.int8)
-
-
-def _row_of_entities(counts: np.ndarray):
-    """For the concatenated entities of the rows: the row of each one and its index within the row."""
-    counts = counts.astype(np.int64)
-    rows = np.repeat(np.arange(len(counts), dtype=np.int64), counts)
-    within = np.arange(int(counts.sum()), dtype=np.int64) - np.repeat(offsets(counts), counts)
-    return rows, within
-
-
-def _sparse_targets(dense: np.ndarray, cand_counts: np.ndarray):
-    """Dense per-candidate targets [ΣM, 2] as the count of nonzero candidates of each row, their indices and values."""
-    rows, within = _row_of_entities(cand_counts)
-    nonzero = (dense != 0).any(axis=1)
-    counts = np.bincount(rows[nonzero], minlength=len(cand_counts)).astype(np.int16)
-    return counts, within[nonzero].astype(np.int16), dense[nonzero]
-
-
-def _convert_v1(v1: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
-    """The arrays of an unpadded file with dense candidate targets (pointDataP [ΣP, 7] int16, candDataM [ΣM, 4]
-    int16, candPolicyTargetsM, candFutureposTargetsM, scoreDistrN) in the current format."""
-    arrays = {name: v1[name] for name in ["boardSizeN", "globalInputNC", "pointCountN", "candCountN", "groundN",
-                                          "groundPolicyTargetsN", "globalTargetsNC"]}
-    point_data = v1["pointDataP"]
-    arrays["pointCoordsP"] = v1["pointCoordsP"]
-    arrays["pointStateP"] = point_data[:, :5].astype(np.int8)
-    arrays["pointInsideP"] = point_data[:, 5:7].astype(np.int16)
-    arrays["pointOwnershipTargetsP"] = v1["pointOwnershipTargetsP"]
-    cand_data = v1["candDataM"]
-    arrays["candCoordsM"] = v1["candCoordsM"]
-    arrays["candGainM"] = cand_data[:, :2].astype(np.int16)
-    arrays["candHouseM"] = cand_data[:, 2:4].astype(np.int8)
-    cand_counts = v1["candCountN"]
-    arrays["policyTargetCountN"], arrays["policyTargetCandT"], policy = _sparse_targets(v1["candPolicyTargetsM"], cand_counts)
-    arrays["policyTargetsT"] = policy.astype(np.int16)
-    arrays["futureposTargetCountN"], arrays["futureposTargetCandF"], futurepos = _sparse_targets(v1["candFutureposTargetsM"], cand_counts)
-    arrays["futureposTargetsF"] = futurepos.astype(np.int8)
-    arrays["scoreDistrScoresN"], arrays["scoreDistrWeightsN"] = score_distribution_bins(v1["scoreDistrN"])
-    return arrays
-
-
 def load_sparse_npz(filename: str) -> Dict[str, np.ndarray]:
     with np.load(filename) as npz:
         assert is_sparse_npz_names(npz.files), f"{filename} is not a sparse Dots data file"
-        if "pointStateP" in npz.files:
-            arrays = {name: npz[name] for name in ARRAY_NAMES}
-        else:
-            v1 = {name: npz[name] for name in ["boardSizeN", "globalInputNC", "pointCountN", "candCountN", "groundN",
-                                               "groundPolicyTargetsN", "globalTargetsNC", "scoreDistrN"]}
-            for name, padded_name in _V1_PADDED_NAME.items():
-                if name in npz.files:
-                    v1[name] = npz[name]
-                else:
-                    # Oldest padded file: keep the entries of each row below its count, in row order
-                    padded = npz[padded_name]
-                    count_name = "pointCountN" if name in _V1_POINT_ARRAY_NAMES else "candCountN"
-                    counts = v1[count_name].astype(np.int64)
-                    v1[name] = padded[np.arange(padded.shape[1])[None, :] < counts[:, None]]
-            arrays = _convert_v1(v1)
+        missing = [name for name in ARRAY_NAMES if name not in npz.files]
+        if missing:
+            raise ValueError(f"{filename} has an older format of the sparse Dots data (no {', '.join(missing)}), "
+                             f"it must be generated again by the current katago")
+        arrays = {name: npz[name] for name in ARRAY_NAMES}
     arrays["globalTargetsNC"] = pad_global_targets_nc(arrays["globalTargetsNC"])
     return arrays
 
@@ -216,8 +135,8 @@ def collate(arrays: Dict[str, np.ndarray], rows: np.ndarray, starts: Optional[Di
         length = max(1, int(counts[rows].max())) if n > 0 else 1
         return src, dst_row, dst_pos, length
 
-    def scatter(length, dst_row, dst_pos, values):
-        out = np.zeros((n, length) + values.shape[1:], dtype=values.dtype)
+    def scatter(length, dst_row, dst_pos, values, fill=0):
+        out = np.full((n, length) + values.shape[1:], fill, dtype=values.dtype)
         out[dst_row, dst_pos] = values
         return out
 
@@ -225,6 +144,7 @@ def collate(arrays: Dict[str, np.ndarray], rows: np.ndarray, starts: Optional[Di
     batch["pointCoordsNP"] = scatter(num_points, dst_row, dst_pos, arrays["pointCoordsP"][src])
     point_data = np.concatenate([arrays["pointStateP"][src].astype(np.int16), arrays["pointInsideP"][src]], axis=1)
     batch["pointDataNP"] = scatter(num_points, dst_row, dst_pos, point_data)
+    batch["pointChainNP"] = scatter(num_points, dst_row, dst_pos, arrays["pointChainP"][src], fill=-1)
     batch["pointOwnershipTargetsNP"] = scatter(num_points, dst_row, dst_pos, arrays["pointOwnershipTargetsP"][src])
 
     src, dst_row, dst_pos, num_cands = padded_entities("candCountN")

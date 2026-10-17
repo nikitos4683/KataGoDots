@@ -70,7 +70,7 @@ nlohmann::json DotsSparseInput::toJson() const {
     pointsJson.push_back({
       {"x", point.x}, {"y", point.y}, {"owner", point.owner}, {"grounded", point.grounded}, {"movesAgo", point.movesAgo},
       {"areaCount", point.areaCount}, {"areaMovesAgo", point.areaMovesAgo}, {"insideMy", point.insideMy},
-      {"insideOpp", point.insideOpp}
+      {"insideOpp", point.insideOpp}, {"chain", point.chain}
     });
   }
   result["points"] = pointsJson;
@@ -213,6 +213,36 @@ void NNInputs::fillDotsSparseInput(
       pointIdxOfLoc[loc] = static_cast<int32_t>(result.points.size());
       result.points.push_back(point);
       result.pointLocs.push_back(loc);
+    }
+  }
+
+  // Chains: 8-connected components of the points of the same owner ------------------------------------------------
+  // The dots inside the areas are not points, so they never connect chains
+  {
+    const int stride = xSize + 1;
+    const int neighborOffsets[8] = {-stride - 1, -stride, -stride + 1, -1, 1, stride - 1, stride, stride + 1};
+    vector<int32_t> stack;
+    for(auto& point : result.points)
+      point.chain = -1;
+    int16_t numChains = 0;
+    for(size_t start = 0; start < result.points.size(); start++) {
+      if(result.points[start].chain >= 0)
+        continue;
+      result.points[start].chain = numChains;
+      stack.push_back(static_cast<int32_t>(start));
+      while(!stack.empty()) {
+        const int32_t idx = stack.back();
+        stack.pop_back();
+        const Loc loc = result.pointLocs[idx];
+        for(const int offset : neighborOffsets) {
+          const int32_t adjIdx = pointIdxOfLoc[loc + offset];
+          if(adjIdx < 0 || result.points[adjIdx].chain >= 0 || result.points[adjIdx].owner != result.points[idx].owner)
+            continue;
+          result.points[adjIdx].chain = numChains;
+          stack.push_back(adjIdx);
+        }
+      }
+      numChains++;
     }
   }
 

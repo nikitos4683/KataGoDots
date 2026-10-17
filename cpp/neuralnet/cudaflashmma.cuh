@@ -13,6 +13,9 @@
 //   - The varlen variant (launchFlashAttentionMmaVarlen) has no padding and no masks: batch
 //     element n owns the query rows [qStarts[n], qStarts[n+1]) and the key rows
 //     [kvStarts[n], kvStarts[n+1]) of Q/K/V/output packed one after another.
+//   - Chain bias (varlen self-attention of the sparse Dots trunk only): chainCodes has a code per
+//     packed row (-1 = none), chainBias [numHeads][3]; a pair of rows with codes a, b >= 0 gets
+//     chainBias[h][a == b ? 0 : ((a ^ b) & 1 ? 2 : 1)] added to its scaled score.
 //
 // FlashAttention-2 style: online softmax in FP32, K/V tiled through shared memory,
 // Q fragments held in registers, one warp per 16 query rows. FP32 accumulation for both
@@ -135,14 +138,16 @@ __device__ __forceinline__ void fmmaCpAsyncWaitAll() {
 #define FMMA_NEG_BIG (-1e30f)
 
 // D = qHeadDim = vHeadDim; 32 or 64. With VARLEN, qLen and kvLen are ignored and the rows of
-// batch element n are given by qStarts and kvStarts.
-template<int D, bool VARLEN>
+// batch element n are given by qStarts and kvStarts. CHAIN (self-attention only, with VARLEN)
+// adds the chain bias, see the header comment.
+template<int D, bool VARLEN, bool CHAIN>
 __global__ void __launch_bounds__(FMMA_NWARPS * 32)
 flashAttentionMmaKernel(
   const half* __restrict__ Q, const half* __restrict__ K, const half* __restrict__ V,
   const half* __restrict__ qMask, const half* __restrict__ kvMask, half* __restrict__ out,
   int qLen, int kvLen, int numHeads, int numKVHeads, float scale, int qStride, int kvStride,
-  const int* __restrict__ qStarts, const int* __restrict__ kvStarts
+  const int* __restrict__ qStarts, const int* __restrict__ kvStarts,
+  const int* __restrict__ chainCodes, const float* __restrict__ chainBias
 ) {
 #if __CUDA_ARCH__ >= 750
   constexpr int BQ = FMMA_BLOCK_Q;
@@ -195,6 +200,8 @@ flashAttentionMmaKernel(
   // Per-buffer live-key ballots (one word per 32 keys). A tile whose keys are all masked
   // or out-of-range contributes nothing and is skipped entirely.
   __shared__ int anyLiveParts[2][BKV / 32];
+  // Chain codes of the keys of each buffer
+  __shared__ int codeTiles[2][CHAIN ? BKV : 1];
   static_assert(BKV % 32 == 0 && NTHREADS >= BKV, "mask ballot layout");
   static_assert(BQ <= BKV, "Q staging reuses buffer 1's K tile and must fit in it");
 
@@ -228,6 +235,8 @@ flashAttentionMmaKernel(
       int g = kvStart + tid;
       bool live = g < kvLen && (maskBase == NULL || (float)maskBase[g] != 0.0f);
       maskTiles[buf][tid] = live ? 0.0f : -CUDART_INF_F;
+      if(CHAIN)
+        codeTiles[buf][tid] = g < kvLen ? chainCodes[kvRowBase + g] : -1;
       uint32_t ballot = __ballot_sync(0xffffffff, live);
       if((tid & 31) == 0)
         anyLiveParts[buf][tid >> 5] = (int)ballot;
@@ -270,6 +279,27 @@ flashAttentionMmaKernel(
   }
 
   const float scaleLog2 = scale * 1.4426950408889634f;  // fold log2(e) into the scale
+
+  // Chain bias of this head (in the log2 domain of the scores) and the codes of the rows gr and gr+8 of the warp
+  float chainB0 = 0.0f, chainB1 = 0.0f, chainB2 = 0.0f;
+  int rowCode0 = -1, rowCode1 = -1;
+  if(CHAIN) {
+    chainB0 = chainBias[h * 3 + 0] * 1.4426950408889634f;
+    chainB1 = chainBias[h * 3 + 1] * 1.4426950408889634f;
+    chainB2 = chainBias[h * 3 + 2] * 1.4426950408889634f;
+    const int r0 = qBlockStart + warp * 16 + gr;
+    if(r0 < qLen)
+      rowCode0 = chainCodes[qRowBase + r0];
+    if(r0 + 8 < qLen)
+      rowCode1 = chainCodes[qRowBase + r0 + 8];
+  }
+  auto chainBiasOf = [&](int rowCode, int keyCode) {
+    if(rowCode < 0 || keyCode < 0)
+      return 0.0f;
+    if(rowCode == keyCode)
+      return chainB0;
+    return ((rowCode ^ keyCode) & 1) ? chainB2 : chainB1;
+  };
 
   float sFrag[NT_S][4];      // scores, later reused as softmax numerators p
   float oFrag[NT_O][4];      // output accumulator
@@ -336,6 +366,14 @@ flashAttentionMmaKernel(
       float s1 = fmaf(sFrag[nt][1], scaleLog2, b1);
       float s2 = fmaf(sFrag[nt][2], scaleLog2, b0);
       float s3 = fmaf(sFrag[nt][3], scaleLog2, b1);
+      if(CHAIN) {
+        const int k0 = codeTiles[tile & 1][nt * 8 + q4 * 2];
+        const int k1 = codeTiles[tile & 1][nt * 8 + q4 * 2 + 1];
+        s0 += chainBiasOf(rowCode0, k0);
+        s1 += chainBiasOf(rowCode0, k1);
+        s2 += chainBiasOf(rowCode1, k0);
+        s3 += chainBiasOf(rowCode1, k1);
+      }
       sFrag[nt][0] = s0; sFrag[nt][1] = s1; sFrag[nt][2] = s2; sFrag[nt][3] = s3;
       pm0[nt] = fmaxf(s0, s1);
       pm1[nt] = fmaxf(s2, s3);
@@ -506,19 +544,25 @@ inline void launchFlashAttentionMmaForDim(
 ) {
   dim3 grid((qLen + FMMA_BLOCK_Q - 1) / FMMA_BLOCK_Q, numHeads, batchSize);
   dim3 block(FMMA_NWARPS * 32);
-  flashAttentionMmaKernel<D, false><<<grid, block, 0, stream>>>(
-    Q, K, V, qMask, kvMask, out, qLen, kvLen, numHeads, numKVHeads, scale, qStride, kvStride, NULL, NULL);
+  flashAttentionMmaKernel<D, false, false><<<grid, block, 0, stream>>>(
+    Q, K, V, qMask, kvMask, out, qLen, kvLen, numHeads, numKVHeads, scale, qStride, kvStride, NULL, NULL, NULL, NULL);
 }
 
 template<int D>
 inline void launchFlashAttentionMmaVarlenForDim(
   const half* Q, const half* K, const half* V, half* out, const int* qStarts, const int* kvStarts,
-  int batchSize, int maxQLen, int numHeads, int numKVHeads, float scale, int qStride, int kvStride, cudaStream_t stream
+  int batchSize, int maxQLen, int numHeads, int numKVHeads, float scale, int qStride, int kvStride,
+  const int* chainCodes, const float* chainBias, cudaStream_t stream
 ) {
   dim3 grid((maxQLen + FMMA_BLOCK_Q - 1) / FMMA_BLOCK_Q, numHeads, batchSize);
   dim3 block(FMMA_NWARPS * 32);
-  flashAttentionMmaKernel<D, true><<<grid, block, 0, stream>>>(
-    Q, K, V, NULL, NULL, out, 0, 0, numHeads, numKVHeads, scale, qStride, kvStride, qStarts, kvStarts);
+  if(chainCodes != NULL)
+    flashAttentionMmaKernel<D, true, true><<<grid, block, 0, stream>>>(
+      Q, K, V, NULL, NULL, out, 0, 0, numHeads, numKVHeads, scale, qStride, kvStride, qStarts, kvStarts, chainCodes,
+      chainBias);
+  else
+    flashAttentionMmaKernel<D, true, false><<<grid, block, 0, stream>>>(
+      Q, K, V, NULL, NULL, out, 0, 0, numHeads, numKVHeads, scale, qStride, kvStride, qStarts, kvStarts, NULL, NULL);
 }
 }  // namespace flashmma
 
@@ -598,11 +642,12 @@ inline bool launchFlashAttentionMmaCross(
 
 // Packed attention without padding and masks: batch element n has the query rows [qStarts[n], qStarts[n+1])
 // and the key/value rows [kvStarts[n], kvStarts[n+1]) (device arrays), maxQLen is the max number of query rows
-// of an element. Returns false like launchFlashAttentionMmaGeneral.
+// of an element. chainCodes/chainBias (both null or both set, self-attention only): the chain bias, see the header
+// comment. Returns false like launchFlashAttentionMmaGeneral.
 inline bool launchFlashAttentionMmaVarlen(
   const half* Q, const half* K, const half* V, half* out, const int* qStarts, const int* kvStarts,
   int batchSize, int maxQLen, int numHeads, int numKVHeads, int qHeadDim, int vHeadDim,
-  int qStride, int kvStride, cudaStream_t stream
+  int qStride, int kvStride, const int* chainCodes, const float* chainBias, cudaStream_t stream
 ) {
   using namespace flashmma;
   if(!flashAttentionMmaSupportsShape(numHeads, numKVHeads, qHeadDim, vHeadDim))
@@ -619,9 +664,11 @@ inline bool launchFlashAttentionMmaVarlen(
   float scale = 1.0f / sqrtf((float)qHeadDim);
   if(qHeadDim == 32)
     launchFlashAttentionMmaVarlenForDim<32>(
-      Q, K, V, out, qStarts, kvStarts, batchSize, maxQLen, numHeads, numKVHeads, scale, qStride, kvStride, stream);
+      Q, K, V, out, qStarts, kvStarts, batchSize, maxQLen, numHeads, numKVHeads, scale, qStride, kvStride, chainCodes,
+      chainBias, stream);
   else
     launchFlashAttentionMmaVarlenForDim<64>(
-      Q, K, V, out, qStarts, kvStarts, batchSize, maxQLen, numHeads, numKVHeads, scale, qStride, kvStride, stream);
+      Q, K, V, out, qStarts, kvStarts, batchSize, maxQLen, numHeads, numKVHeads, scale, qStride, kvStride, chainCodes,
+      chainBias, stream);
   return true;
 }

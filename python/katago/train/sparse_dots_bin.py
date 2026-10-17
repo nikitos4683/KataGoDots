@@ -11,7 +11,7 @@ import torch
 
 from ..train import modelconfigs
 from ..train.model_pytorch import Game, NormMask, TransformerAttentionBlock, TransformerFFNBlock
-from ..train.model_sparse_dots import NUM_POINT_FEATURES, CrossAttentionBlock, SparseDotsModel
+from ..train.model_sparse_dots import NUM_CHAIN_CATEGORIES, NUM_POINT_FEATURES, CrossAttentionBlock, SparseDotsModel
 
 
 class BinReader:
@@ -178,7 +178,8 @@ def load_sparse_dots_bin(path: str, config: modelconfigs.ModelConfig) -> Tuple[S
     assert meta == [0] * 8
     reader.expect("sparse_dots_model")
     assert [reader.int() for _ in range(2)] == [8, 1]
-    assert [reader.int() for _ in range(6)] == [0] * 6
+    assert reader.int() == NUM_CHAIN_CATEGORIES
+    assert [reader.int() for _ in range(5)] == [0] * 5
 
     _load_linear(reader, "model.linear_point", model.linear_point)
     _set(model.global_token, reader.matbias("model.global_token"))
@@ -213,6 +214,13 @@ def load_sparse_dots_bin(path: str, config: modelconfigs.ModelConfig) -> Tuple[S
     _set(model.norm_trunkfinal.gamma, gamma)
     _set(model.norm_trunkfinal.beta, beta)
     reader.activation("model.act_trunkfinal")
+    reader.expect("model.chain_bias")
+    blocks = model.trunk_attention_blocks()
+    shape = (reader.int(), reader.int(), reader.int())
+    assert shape == (len(blocks), blocks[0].num_heads, NUM_CHAIN_CATEGORIES)
+    tables = reader.floats(shape[0] * shape[1] * shape[2]).reshape(shape)
+    for block, table in zip(blocks, tables):
+        _set(block.chain_bias, table)
 
     decoder = model.decoder
     reader.expect("model.decoder")

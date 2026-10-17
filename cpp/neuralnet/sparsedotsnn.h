@@ -51,6 +51,18 @@ namespace SparseDotsNN {
   void pointFeaturesAt(const DotsSparseInput::Point& p, int x, int y, int xSize, int ySize, float* out);
   void candidateFeaturesAt(const DotsSparseInput::Candidate& cnd, int x, int y, int xSize, int ySize, float* out);
 
+  // Chain code of a trunk token for the chain attention bias: -1 for GLOBAL, 2 * chain + owner for a point.
+  // Equal codes = the same chain, equal parities = the same owner.
+  inline int pointChainCode(const DotsSparseInput::Point& p) { return 2 * p.chain + p.owner; }
+  // Category of a pair of token codes (index into the chain bias of a head), -1 = no bias (a GLOBAL token)
+  inline int chainCategory(int codeA, int codeB) {
+    if(codeA < 0 || codeB < 0)
+      return -1;
+    if(codeA == codeB)
+      return 0;
+    return (codeA & 1) == (codeB & 1) ? 1 : 2;
+  }
+
   // The symmetry actually applied to the position: transposing symmetries need a square board
   int effectiveSymmetry(int symmetry, int xSize, int ySize);
 

@@ -145,6 +145,7 @@ struct Attention {
   RowRMSNorm norm;
   Linear q, k, v, out;
   vector<float> ropeFreqs; // [kvHeads][pairs][2]
+  vector<float> chainBias; // [heads][SparseDotsDesc::NUM_CHAIN_CATEGORIES], trunk layers only
 
   void init(const TransformerAttentionDesc& desc) {
     testAssert(desc.useRope && desc.learnableRope);
@@ -299,6 +300,7 @@ struct SparseDotsNN::Model::Impl {
     globalToken = desc.globalToken.weights;
     global.init(desc.globalMul);
 
+    size_t numTrunkAttentions = 0;
     for(const auto& blockPair : desc.blocks) {
       const auto& nested = *static_cast<const NestedBottleneckResidualBlockDesc*>(blockPair.second.get());
       TrunkBlock block;
@@ -308,6 +310,8 @@ struct SparseDotsNN::Model::Impl {
         if(sub.first == TRANSFORMER_ATTENTION_BLOCK_KIND) {
           block.attentions.emplace_back();
           block.attentions.back().init(*static_cast<const TransformerAttentionDesc*>(sub.second.get()));
+          testAssert(numTrunkAttentions < desc.chainBias.size());
+          block.attentions.back().chainBias = desc.chainBias[numTrunkAttentions++];
           block.isAttention.push_back(true);
         }
         else {
@@ -408,11 +412,13 @@ struct SparseDotsNN::Model::Impl {
   }
 
   // Attention of the normalized queries [numQueries x Cq] to the keys/values source [seqLen x Ckv].
-  // Returns the output projection [numQueries x Cq] in result.
+  // Returns the output projection [numQueries x Cq] in result. With chainCodes (self-attention of the trunk, one code
+  // per token, see chainCategory) the scores get the chain bias of the layer.
   static void attend(
     const Attention& layer,
     const float* queriesNorm, int numQueries, const RopeTables& queryTables,
     const float* source, int seqLen, const RopeTables& keyTables,
+    const int* chainCodes,
     vector<float>& result
   ) {
     const int heads = layer.numHeads;
@@ -442,6 +448,11 @@ struct SparseDotsNN::Model::Impl {
           for(int d = 0; d < dq; d++)
             dot += qi[d] * kj[d];
           scores[j] = dot * scale;
+          if(chainCodes != nullptr) {
+            const int category = chainCategory(chainCodes[i], chainCodes[j]);
+            if(category >= 0)
+              scores[j] += layer.chainBias[(size_t)h * SparseDotsDesc::NUM_CHAIN_CATEGORIES + category];
+          }
           maxScore = std::max(maxScore, scores[j]);
         }
         float sum = 0.0f;
@@ -488,6 +499,9 @@ struct SparseDotsNN::Model::Impl {
     }
 
     // Trunk -------------------------------------------------------------------------------------------------------
+    vector<int> chainCodes(seqLen, -1);
+    for(int i = 0; i < numPoints; i++)
+      chainCodes[1 + i] = pointChainCode(input.points[i]);
     RopeTables tables;
     vector<float> tmp((size_t)seqLen * c);
     vector<float> mid((size_t)seqLen * midChannels);
@@ -503,7 +517,7 @@ struct SparseDotsNN::Model::Impl {
           const Attention& layer = block.attentions[attentionIdx++];
           layer.norm.apply(mid.data(), seqLen, midTmp.data());
           tokenTables(layer, input, tables);
-          attend(layer, midTmp.data(), seqLen, tables, midTmp.data(), seqLen, tables, attnOut);
+          attend(layer, midTmp.data(), seqLen, tables, midTmp.data(), seqLen, tables, chainCodes.data(), attnOut);
           for(size_t i = 0; i < mid.size(); i++)
             mid[i] += attnOut[i];
         }
@@ -578,7 +592,7 @@ struct SparseDotsNN::Model::Impl {
         layer.norm.apply(queries.data(), numQueries, queriesNorm.data());
         candidateTables(layer, input, numQueries, queryTables);
         tokenTables(layer, input, tables);
-        attend(layer, queriesNorm.data(), numQueries, queryTables, trunk.data(), seqLen, tables, attnOut);
+        attend(layer, queriesNorm.data(), numQueries, queryTables, trunk.data(), seqLen, tables, nullptr, attnOut);
         for(size_t i = 0; i < queries.size(); i++)
           queries[i] += attnOut[i];
         decoderFFNs[l].applyResidual(queries.data(), numQueries);

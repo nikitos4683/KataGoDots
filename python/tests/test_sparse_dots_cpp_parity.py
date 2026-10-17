@@ -13,7 +13,7 @@ from katago.train.model_pytorch import Game
 from katago.train.model_sparse_dots import create_model
 from katago.train.sparse_dots_bin import load_sparse_dots_bin
 
-from sparse_dots_testutils import collate, tiny_sparse_config
+from sparse_dots_testutils import point_chains, collate, tiny_sparse_config
 
 PYTHON_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO_DIR = os.path.dirname(PYTHON_DIR)
@@ -38,7 +38,7 @@ def json_to_row(entry):
         "boardSizeN": [inp["xSize"], inp["ySize"]],
         "globalInputNC": inp["global"],
         "points": [(p["x"], p["y"], p["owner"], p["grounded"], p["movesAgo"], p["areaCount"], p["areaMovesAgo"],
-                    p["insideMy"], p["insideOpp"]) for p in inp["points"]],
+                    p["insideMy"], p["insideOpp"], p["chain"]) for p in inp["points"]],
         "cands": cands,
         "groundN": [1.0 if inp["groundAllowed"] else 0.0, inp["groundResult"]],
         "candPolicyTargetsNM": [[0, 0] for _ in cands],
@@ -52,6 +52,9 @@ def json_to_row(entry):
 
 def check_parity(model, entries, atol):
     rows = [json_to_row(e) for e in entries]
+    # The chains of the engine are the 8-connected components of the points of the same owner
+    for row in rows:
+        assert [p[9] for p in row["points"]] == point_chains(row["points"])
     batch = collate(rows, pad_extra=2)
     with torch.no_grad():
         policy, value, misc, moremisc, ownership, _, _ = model(batch)[0]

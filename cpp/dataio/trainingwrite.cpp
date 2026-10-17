@@ -665,6 +665,7 @@ void TrainingWriteBuffers::addRow(
   //Expected time of arrival of winloss variance, in turns
   {
     double sum = 0.0;
+    double totalVariance = 0.0;
     for(int i = whiteValueTargetsIdx+1; i<whiteValueTargets.size(); i++) {
       int turnsFromNow = i-whiteValueTargetsIdx;
       const ValueTargets& prevTargets = whiteValueTargets[i-1];
@@ -673,7 +674,14 @@ void TrainingWriteBuffers::addRow(
       double nextWL = targets.win - targets.loss;
       double variance = (nextWL - prevWL) * (nextWL - prevWL);
       sum += turnsFromNow * variance;
+      totalVariance += variance;
     }
+    // In a game the value usually goes from about 0 to +-1, a total variance of about 1, and the sum is the time
+    // until the game is decided. In long Dots games with a noisy value (an untrained net, few visits) the total
+    // variance grows with the length and the target with its square (up to ~300000 turns on 39x32), which blows up
+    // the training. So beyond 1 it is normalized: the target stays at most the number of the remaining turns.
+    if(hist.rules.isDots && totalVariance > 1.0)
+      sum /= totalVariance;
     rowGlobal[22] = (float)sum;
   }
 
@@ -1018,6 +1026,8 @@ void TrainingWriteBuffers::writeDotsSparseArrays(ZipFile& zipFile) {
   NumpyBuffer<int8_t> pointStateP({totalPoints, 5});
   //insideMy, insideOpp
   NumpyBuffer<int16_t> pointInsideP({totalPoints, 2});
+  //index of the 8-connected chain of the dots of the same owner within the row
+  NumpyBuffer<int16_t> pointChainP({totalPoints});
   NumpyBuffer<int8_t> pointOwnershipTargetsP({totalPoints});
   NumpyBuffer<int16_t> candCountN({n});
   NumpyBuffer<int8_t> candCoordsM({totalCands, 2});
@@ -1058,6 +1068,7 @@ void TrainingWriteBuffers::writeDotsSparseArrays(ZipFile& zipFile) {
       state[4] = p.areaMovesAgo;
       pointInsideP.data[pointIdx * 2 + 0] = p.insideMy;
       pointInsideP.data[pointIdx * 2 + 1] = p.insideOpp;
+      pointChainP.data[pointIdx] = p.chain;
       pointOwnershipTargetsP.data[pointIdx] = row.pointOwnership[i];
     }
 
@@ -1138,6 +1149,7 @@ void TrainingWriteBuffers::writeDotsSparseArrays(ZipFile& zipFile) {
   writeNumpyToZip(zipFile, "pointCoordsP", pointCoordsP, totalPoints);
   writeNumpyToZip(zipFile, "pointStateP", pointStateP, totalPoints);
   writeNumpyToZip(zipFile, "pointInsideP", pointInsideP, totalPoints);
+  writeNumpyToZip(zipFile, "pointChainP", pointChainP, totalPoints);
   writeNumpyToZip(zipFile, "pointOwnershipTargetsP", pointOwnershipTargetsP, totalPoints);
   writeNumpyToZip(zipFile, "candCoordsM", candCoordsM, totalCands);
   writeNumpyToZip(zipFile, "candGainM", candGainM, totalCands);

@@ -3016,9 +3016,13 @@ SparseDotsDesc::SparseDotsDesc(istream& in, int modelVersion, bool binaryFloats,
     throw StringError("Expected sparse_dots_model, got " + tag);
   in >> numCandFeatures;
   in >> numGroundFeatures;
+  int numChainCategories = 0;
+  in >> numChainCategories;
   if(in.fail())
     throw StringError("sparse_dots_model: failed to parse the header");
-  for(int i = 0; i < 6; i++) {
+  if(numChainCategories != NUM_CHAIN_CATEGORIES)
+    throw StringError("sparse_dots_model: the model has no chain attention bias, it is from an older version");
+  for(int i = 0; i < 5; i++) {
     int unused = 0;
     in >> unused;
     if(unused != 0)
@@ -3084,6 +3088,29 @@ SparseDotsDesc::SparseDotsDesc(istream& in, int modelVersion, bool binaryFloats,
   if(trunkTipRMSNorm.numChannels != trunkNumChannels || !trunkTipRMSNorm.spatial)
     throw StringError("sparse_dots_model: the trunk tip must be a spatial RMSNorm of the trunk channels");
   trunkTipActivation = ActivationLayerDesc(in, modelVersion);
+
+  {
+    string chainBiasName;
+    int numLayers = 0, numHeads = 0, numCategories = 0;
+    in >> chainBiasName >> numLayers >> numHeads >> numCategories;
+    if(in.fail() || chainBiasName != "model.chain_bias")
+      throw StringError("sparse_dots_model: failed to parse the chain bias header");
+    vector<int> heads;
+    for(const auto& block : blocks)
+      for(const auto& sub : static_cast<const NestedBottleneckResidualBlockDesc*>(block.second.get())->blocks)
+        if(sub.first == TRANSFORMER_ATTENTION_BLOCK_KIND)
+          heads.push_back(static_cast<const TransformerAttentionDesc*>(sub.second.get())->numHeads);
+    if(numLayers != (int)heads.size() || numCategories != NUM_CHAIN_CATEGORIES)
+      throw StringError("sparse_dots_model: the chain bias doesn't match the trunk attention layers");
+    for(int numLayerHeads : heads)
+      if(numHeads != numLayerHeads)
+        throw StringError("sparse_dots_model: the chain bias doesn't match the heads of the trunk attention");
+    vector<float> floats;
+    readFloats(in, (size_t)numLayers * numHeads * numCategories, binaryFloats, chainBiasName, floats);
+    const size_t layerSize = (size_t)numHeads * numCategories;
+    for(int l = 0; l < numLayers; l++)
+      chainBias.emplace_back(floats.begin() + l * layerSize, floats.begin() + (l + 1) * layerSize);
+  }
 
   string decoderName;
   in >> decoderName;
@@ -3176,6 +3203,8 @@ int64_t SparseDotsDesc::getNumParameters() const {
   for(const auto& block : blocks)
     result += static_cast<const NestedBottleneckResidualBlockDesc*>(block.second.get())->getNumParameters();
   result += trunkTipRMSNorm.getNumParameters();
+  for(const auto& table : chainBias)
+    result += (int64_t)table.size();
   for(const auto& attention : decoderAttention)
     result += attention.getNumParameters();
   for(const auto& ffn : decoderFFN)
@@ -3194,6 +3223,7 @@ void SparseDotsDesc::releaseWeights() {
   for(auto& block : blocks)
     static_cast<NestedBottleneckResidualBlockDesc*>(block.second.get())->releaseWeights();
   trunkTipRMSNorm.releaseWeights();
+  std::vector<std::vector<float>>().swap(chainBias);
   for(auto& attention : decoderAttention)
     attention.releaseWeights();
   for(auto& ffn : decoderFFN)

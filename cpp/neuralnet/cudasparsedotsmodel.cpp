@@ -156,6 +156,7 @@ struct Attention {
   Linear q, kv;
   Linear out;
   DeviceBuf ropeFreqs;
+  DeviceBuf chainBias; // [heads][SparseDotsDesc::NUM_CHAIN_CATEGORIES], trunk layers only
 
   void init(const TransformerAttentionDesc& desc, bool selfAttention, bool fp16) {
     testAssert(desc.useRope && desc.learnableRope);
@@ -332,6 +333,7 @@ struct SparseDotsCudaModel::Impl {
     globalToken.upload(desc.globalToken.name, desc.globalToken.weights, false);
     global.init(desc.globalMul, nullptr, false);
 
+    size_t numTrunkAttentions = 0;
     for(const auto& blockPair : desc.blocks) {
       testAssert(blockPair.first == NESTED_BOTTLENECK_BLOCK_KIND);
       const auto& nested = *static_cast<const NestedBottleneckResidualBlockDesc*>(blockPair.second.get());
@@ -344,6 +346,8 @@ struct SparseDotsCudaModel::Impl {
         if(sub.first == TRANSFORMER_ATTENTION_BLOCK_KIND) {
           auto attention = std::make_unique<Attention>();
           attention->init(*static_cast<const TransformerAttentionDesc*>(sub.second.get()), true, useFP16);
+          testAssert(numTrunkAttentions < desc.chainBias.size());
+          attention->chainBias.upload("chainBias", desc.chainBias[numTrunkAttentions++], false);
           maxQKVDim = std::max(maxQKVDim, attention->qkv.outC);
           maxAttDim = std::max(maxAttDim, attention->attDim());
           block->attentions.push_back(std::move(attention));
@@ -439,7 +443,7 @@ struct SparseDotsCudaModel::Impl {
     // Device pointers into inputDev
     float* pointFeat; int* pointDst;
     float* global; float* boardOffset;
-    int* tokStart; int* tokSeg; float* tokPos;
+    int* tokStart; int* tokSeg; float* tokPos; int* tokCode;
     float* candFeat; int* candDst;
     float* groundFeat; int* groundDst;
     int* qStart; int* qSeg; float* qPos;
@@ -472,6 +476,7 @@ struct SparseDotsCudaModel::Impl {
     const size_t oTokStart = layout.reserve(sizeof(int) * (b.n + 1));
     const size_t oTokSeg = layout.reserve(sizeof(int) * b.tokens);
     const size_t oTokPos = layout.reserve(sizeof(float) * 3 * b.tokens);
+    const size_t oTokCode = layout.reserve(sizeof(int) * b.tokens);
     const size_t oCandFeat = layout.reserve(sizeof(float) * b.totalCands * SparseDotsNN::NUM_CAND_FEATURES);
     const size_t oCandDst = layout.reserve(sizeof(int) * b.totalCands);
     const size_t oGroundFeat = layout.reserve(sizeof(float) * b.totalGrounds);
@@ -488,6 +493,7 @@ struct SparseDotsCudaModel::Impl {
     float* boardOffset = (float*)(h + oBoardOffset);
     int* tokSeg = (int*)(h + oTokSeg);
     float* tokPos = (float*)(h + oTokPos);
+    int* tokCode = (int*)(h + oTokCode);
     float* candFeat = (float*)(h + oCandFeat);
     int* candDst = (int*)(h + oCandDst);
     float* groundFeat = (float*)(h + oGroundFeat);
@@ -523,6 +529,7 @@ struct SparseDotsCudaModel::Impl {
       tokPos[3 * tokenBase] = 0.0f;
       tokPos[3 * tokenBase + 1] = 0.0f;
       tokPos[3 * tokenBase + 2] = 0.0f;
+      tokCode[tokenBase] = -1;
       for(int i = 0; i < numPoints; i++) {
         const auto& p = in.points[i];
         int x, y;
@@ -534,6 +541,7 @@ struct SparseDotsCudaModel::Impl {
         tokPos[3 * row] = (float)x;
         tokPos[3 * row + 1] = (float)y;
         tokPos[3 * row + 2] = 1.0f;
+        tokCode[row] = SparseDotsNN::pointChainCode(p);
       }
 
       // Decoder rows: the point candidates then the grounding (no position)
@@ -575,6 +583,7 @@ struct SparseDotsCudaModel::Impl {
     b.tokStart = (int*)(d + oTokStart);
     b.tokSeg = (int*)(d + oTokSeg);
     b.tokPos = (float*)(d + oTokPos);
+    b.tokCode = (int*)(d + oTokCode);
     b.candFeat = (float*)(d + oCandFeat);
     b.candDst = (int*)(d + oCandDst);
     b.groundFeat = (float*)(d + oGroundFeat);
@@ -628,16 +637,18 @@ struct SparseDotsCudaModel::Impl {
     ownershipOut.ensure(tokens * fb);
   }
 
-  // Attention of the rows of every position (Q with qStride) to the keys of the same position (K and V with kvStride)
+  // Attention of the rows of every position (Q with qStride) to the keys of the same position (K and V with kvStride).
+  // chainCodes: the codes of the rows for the chain bias of the layer (self-attention of the trunk), null if none.
   template <typename T>
   void attention(const Attention& layer, const T* Q, const T* K, const T* V, T* out, const int* qStart, const int* kvStart,
-                 int numSegs, int maxQLen, int qStride, int kvStride) {
+                 int numSegs, int maxQLen, int qStride, int kvStride, const int* chainCodes) {
+    const float* chainBias = chainCodes != nullptr ? layer.chainBias.f() : nullptr;
     bool done = false;
     if constexpr(std::is_same<T, half>::value) {
       if(useMmaAttention && layer.qHeadDim == layer.vHeadDim) {
         done = customCudaFlashAttentionMmaVarlen(
           Q, K, V, out, qStart, kvStart, numSegs, maxQLen, layer.numHeads, layer.numKVHeads, layer.qHeadDim,
-          layer.vHeadDim, qStride, kvStride, stream);
+          layer.vHeadDim, qStride, kvStride, chainCodes, chainBias, stream);
         if(done && !loggedMma) {
           loggedMma = true;
           if(logger != nullptr)
@@ -647,7 +658,7 @@ struct SparseDotsCudaModel::Impl {
     }
     if(!done)
       sparseDotsAttention<T>(Q, K, V, out, qStart, kvStart, numSegs, maxQLen, layer.numHeads, layer.numKVHeads,
-                             layer.qHeadDim, layer.vHeadDim, qStride, kvStride, stream);
+                             layer.qHeadDim, layer.vHeadDim, qStride, kvStride, chainCodes, chainBias, stream);
   }
 
   template <typename T>
@@ -665,7 +676,7 @@ struct SparseDotsCudaModel::Impl {
     T* vT = kT + layer.kDim();
     sparseDotsApplyRopeQK<T>(qT, kT, layer.ropeFreqs.f(), b.tokPos, (int)rows, layer.numHeads, layer.numKVHeads, layer.qHeadDim,
                              stride, stride, stream);
-    attention<T>(layer, qT, kT, vT, attT, b.tokStart, b.tokStart, b.n, b.maxTokens, stride, stride);
+    attention<T>(layer, qT, kT, vT, attT, b.tokStart, b.tokStart, b.n, b.maxTokens, stride, stride, b.tokCode);
     gemm(layer.out, attT, rows, midT, true);
   }
 
@@ -726,7 +737,8 @@ struct SparseDotsCudaModel::Impl {
                              layer.qHeadDim, layer.qDim(), stream);
       sparseDotsApplyRope<T>(kvT, layer.ropeFreqs.f(), b.tokPos, (int)tokens, layer.numKVHeads, layer.numKVHeads,
                              layer.qHeadDim, kvStride, stream);
-      attention<T>(layer, dqT, kvT, kvT + layer.kDim(), attT, b.qStart, b.tokStart, b.n, b.maxQueries, layer.qDim(), kvStride);
+      attention<T>(layer, dqT, kvT, kvT + layer.kDim(), attT, b.qStart, b.tokStart, b.n, b.maxQueries, layer.qDim(), kvStride,
+                   nullptr);
       gemm(layer.out, attT, numQueries, query, true);
       ffnResidual<T>(*decoderFFNs[l], query, queryNorm, numQueries);
     }

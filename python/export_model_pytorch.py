@@ -883,8 +883,9 @@ def main(args):
         writeln("sparse_dots_model")
         writeln(model_sparse_dots.NUM_CAND_FEATURES)
         writeln(model_sparse_dots.NUM_GROUND_FEATURES)
-        # Spare slots for future options
-        for _ in range(6):
+        # Number of categories of the chain attention bias, then spare slots for future options
+        writeln(model_sparse_dots.NUM_CHAIN_CATEGORIES)
+        for _ in range(5):
             writeln(0)
 
         write_linear("model.linear_point", model.linear_point)
@@ -908,6 +909,12 @@ def main(args):
             write_block("model.blocks."+str(i), block)
         write_rmsnorm("model.norm_trunkfinal", model.norm_trunkfinal)
         write_activation("model.act_trunkfinal", model.act_trunkfinal)
+        # Chain attention bias [attention layers of the trunk in order, heads, categories]
+        tables = torch.stack([block.chain_bias.detach() for block in model.trunk_attention_blocks()])
+        writeln("model.chain_bias")
+        for dim in tables.shape:
+            writeln(dim)
+        write_weights(tables)
 
         decoder = model.decoder
         writeln("model.decoder")

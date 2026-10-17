@@ -1,5 +1,8 @@
 // Tests of the sparse Dots position format (model version 18), see docs/DotsSparseNN.md
 
+#include <functional>
+#include <map>
+
 #include "../tests/tests.h"
 #include "../tests/testdotsutils.h"
 
@@ -140,6 +143,42 @@ void checkSparseInvariants(const Board& board, const BoardHistory& hist, const P
       testAssert(point.insideMy == insideMy[j]);
       testAssert(point.insideOpp == insideOpp[j]);
       testAssert(point.areaMovesAgo == areaMovesAgo[j]);
+    }
+  }
+
+  // Chains: two points share a chain iff they have the same owner and are linked by a path of points of that owner,
+  // each step to one of the 8 neighbors. Checked against a union-find over the coordinates, independent of the board.
+  {
+    const size_t n = input.points.size();
+    vector<size_t> parent(n);
+    for(size_t j = 0; j < n; j++)
+      parent[j] = j;
+    std::function<size_t(size_t)> find = [&](size_t j) { return parent[j] == j ? j : parent[j] = find(parent[j]); };
+    vector<int> pointAt((size_t)input.xSize * input.ySize, -1);
+    for(size_t j = 0; j < n; j++)
+      pointAt[(size_t)input.points[j].y * input.xSize + input.points[j].x] = (int)j;
+    for(size_t a = 0; a < n; a++) {
+      const auto& pa = input.points[a];
+      for(int dy = -1; dy <= 1; dy++)
+        for(int dx = -1; dx <= 1; dx++) {
+          const int x = pa.x + dx;
+          const int y = pa.y + dy;
+          if(x < 0 || y < 0 || x >= input.xSize || y >= input.ySize)
+            continue;
+          const int b = pointAt[(size_t)y * input.xSize + x];
+          if(b >= 0 && input.points[b].owner == pa.owner)
+            parent[find(a)] = find((size_t)b);
+        }
+    }
+    // The same partition: chain -> root and root -> chain are both functions
+    std::map<int, size_t> rootOfChain;
+    std::map<size_t, int> chainOfRoot;
+    for(size_t a = 0; a < n; a++) {
+      const int chain = input.points[a].chain;
+      testAssert(chain >= 0);
+      const size_t root = find(a);
+      testAssert(rootOfChain.emplace(chain, root).first->second == root);
+      testAssert(chainOfRoot.emplace(root, chain).first->second == chain);
     }
   }
 
