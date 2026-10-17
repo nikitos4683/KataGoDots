@@ -2140,10 +2140,10 @@ for name, base_config in list(config_of_name.items()):
 # Sparse Dots models (model version 18), see docs/DotsSparseNN.md --------------------------------------------------
 # For Dots, every transformer config name gives the sparse model with the same trunk: the convolutional stem is
 # replaced by token embeddings and the policy head by a candidate decoder. Optional suffixes for comparisons:
-#   -dec1    one candidate decoder layer instead of two
+#   -dec2    two candidate decoder layers instead of one
 SPARSE_DOTS_VERSION = 18
 SPARSE_DOTS_SUFFIXES = {
-    "-dec1": {"candidate_decoder_layers": 1},
+    "-dec2": {"candidate_decoder_layers": 2},
 }
 # What the sparse model implements (in PyTorch, the export, the CPU reference and CUDA).
 # Trunk block kinds: internal length of the nested bottleneck. The C++ FFN is SwiGLU only.
@@ -2193,7 +2193,7 @@ def make_sparse_dots_config(config: ModelConfig, overrides: Dict[str,Any] = None
     result = dict(config)
     result["version"] = SPARSE_DOTS_VERSION
     result["sparse_dots"] = True
-    result.setdefault("candidate_decoder_layers", 2)
+    result.setdefault("candidate_decoder_layers", 1)
     result.setdefault("candidate_decoder_channels", config["mid_num_channels"])
     result.setdefault("candidate_decoder_ffn_channels", config["transformer_ffn_channels"])
     if overrides:

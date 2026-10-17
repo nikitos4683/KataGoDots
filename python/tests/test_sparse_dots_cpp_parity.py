@@ -46,6 +46,7 @@ def json_to_row(entry):
         "candFutureposTargetsNM": [[0, 0] for _ in cands],
         "pointOwnershipTargetsNP": [0 for _ in inp["points"]],
         "globalTargetsNC": [0.0] * 64,
+        "scoreDistr": ([0, 1], [100, 0]),
     }
 
 

@@ -47,6 +47,9 @@ namespace SparseDotsNN {
   void pointFeatures(const DotsSparseInput& input, int i, float* out);
   void candidateFeatures(const DotsSparseInput& input, int i, float* out);
   float groundFeature(const DotsSparseInput& input);
+  // The same with the coordinates and the board size given explicitly, e.g. after a symmetry
+  void pointFeaturesAt(const DotsSparseInput::Point& p, int x, int y, int xSize, int ySize, float* out);
+  void candidateFeaturesAt(const DotsSparseInput::Candidate& cnd, int x, int y, int xSize, int ySize, float* out);
 
   // The symmetry actually applied to the position: transposing symmetries need a square board
   int effectiveSymmetry(int symmetry, int xSize, int ySize);

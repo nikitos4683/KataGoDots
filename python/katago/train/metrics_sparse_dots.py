@@ -7,7 +7,7 @@ from typing import Dict
 import torch
 import torch.nn.functional
 
-from ..train.metrics_pytorch import Metrics, constant_like, cross_entropy
+from ..train.metrics_pytorch import Metrics, cross_entropy
 from ..train.model_sparse_dots import count_mask
 
 
@@ -18,6 +18,14 @@ def sparse_policy_targets(batch: Dict[str, torch.Tensor]):
     player = torch.cat([cand[:, :, 0], ground[:, 0:1]], dim=1)
     opponent = torch.cat([cand[:, :, 1], ground[:, 1:2]], dim=1)
     return player, opponent
+
+
+def score_distribution(batch: Dict[str, torch.Tensor], length: int) -> torch.Tensor:
+    """The score distribution target [N, length] (weights summing to 100) from its two bins: their scores (bin minus
+    the middle bin length / 2) and their weights. Scores beyond the ends go to the end bins."""
+    bins = (batch["scoreDistrScoresN"].long() + length // 2).clamp(0, length - 1)
+    weights = batch["scoreDistrWeightsN"].to(torch.float32)
+    return torch.zeros((bins.shape[0], length), dtype=torch.float32, device=bins.device).scatter_add_(1, bins, weights)
 
 
 def sparse_cand_mask(batch: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -49,8 +57,10 @@ class SparseDotsMetrics(Metrics):
     def loss_futurepos_sparse_samplewise(self, pred_pretanh, target, weight, cand_mask, board_area, global_weight):
         # pred_pretanh, target [N,2,M]. Normalized by sqrt of the real board area like the dense model.
         loss = torch.square(torch.tanh(pred_pretanh) - target) * cand_mask.unsqueeze(1)
-        loss = loss * constant_like([1.0, 0.25], loss).view(1, 2, 1)
-        loss = torch.sum(loss, dim=(1, 2)) / torch.sqrt(board_area)
+        # Horizon weights 1 and 0.25 as scalars: a constant tensor would keep the compiled loss out of the
+        # AOTAutograd cache
+        loss = torch.sum(loss[:, 0], dim=1) + 0.25 * torch.sum(loss[:, 1], dim=1)
+        loss = loss / torch.sqrt(board_area)
         return 0.25 * global_weight * weight * loss
 
     def metrics_dict_batchwise_single_heads_output(
@@ -86,7 +96,7 @@ class SparseDotsMetrics(Metrics):
         ) = model_output_postprocessed
 
         target_global_nc = batch["globalTargetsNC"]
-        score_distribution_ns = batch["scoreDistrN"]
+        score_distribution_ns = score_distribution(batch, scorebelief_logits.shape[1])
         board_size = batch["boardSizeN"].to(torch.float32)
         board_area = board_size[:, 0] * board_size[:, 1]
 

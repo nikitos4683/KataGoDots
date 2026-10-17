@@ -211,11 +211,11 @@ struct RopeTables {
 
 }  // namespace
 
-static void edgeFeatures(const DotsSparseInput& input, float x, float y, float* out) {
+static void edgeFeatures(float x, float y, int xSize, int ySize, float* out) {
   out[0] = x * COORD_SCALE;
   out[1] = y * COORD_SCALE;
-  out[2] = ((float)input.xSize - 1.0f - x) * COORD_SCALE;
-  out[3] = ((float)input.ySize - 1.0f - y) * COORD_SCALE;
+  out[2] = ((float)xSize - 1.0f - x) * COORD_SCALE;
+  out[3] = ((float)ySize - 1.0f - y) * COORD_SCALE;
 }
 
 static void movesAgoOneHot(int movesAgo, float* out) {
@@ -225,8 +225,12 @@ static void movesAgoOneHot(int movesAgo, float* out) {
 
 void SparseDotsNN::pointFeatures(const DotsSparseInput& input, int i, float* out) {
   const auto& p = input.points[i];
+  pointFeaturesAt(p, p.x, p.y, input.xSize, input.ySize, out);
+}
+
+void SparseDotsNN::pointFeaturesAt(const DotsSparseInput::Point& p, int x, int y, int xSize, int ySize, float* out) {
   out[0] = p.owner;
-  edgeFeatures(input, p.x, p.y, out + 1);
+  edgeFeatures((float)x, (float)y, xSize, ySize, out + 1);
   out[5] = p.grounded;
   movesAgoOneHot(p.movesAgo, out + 6);
   // Facts of the areas whose boundary has the dot
@@ -238,7 +242,13 @@ void SparseDotsNN::pointFeatures(const DotsSparseInput& input, int i, float* out
 
 void SparseDotsNN::candidateFeatures(const DotsSparseInput& input, int i, float* out) {
   const auto& cnd = input.candidates[i];
-  edgeFeatures(input, cnd.x, cnd.y, out);
+  candidateFeaturesAt(cnd, cnd.x, cnd.y, input.xSize, input.ySize, out);
+}
+
+void SparseDotsNN::candidateFeaturesAt(
+  const DotsSparseInput::Candidate& cnd, int x, int y, int xSize, int ySize, float* out
+) {
+  edgeFeatures((float)x, (float)y, xSize, ySize, out);
   out[4] = cnd.gainMy * COUNT_SCALE;
   out[5] = cnd.gainOpp * COUNT_SCALE;
   out[6] = cnd.inMyHouse;

@@ -60,6 +60,7 @@ namespace MainCmds {
   int dumpsparse(const std::vector<std::string>& args);
   int dumpsparsenn(const std::vector<std::string>& args);
   int testsparsenn(const std::vector<std::string>& args);
+  int benchsparsenn(const std::vector<std::string>& args);
   int sampleinitializations(const std::vector<std::string>& args);
   int evalrandominits(const std::vector<std::string>& args);
   int searchentropyanalysis(const std::vector<std::string>& args);

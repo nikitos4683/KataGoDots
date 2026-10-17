@@ -619,6 +619,10 @@ class SparseDotsModel(torch.nn.Module):
     def supports_per_block_compile(self) -> bool:
         return False
 
+    def compile_with_dynamic_shapes(self) -> bool:
+        # The numbers of points and candidates change from batch to batch
+        return True
+
     def disable_fused_attention_kernels(self) -> bool:
         return False
 
@@ -688,19 +692,21 @@ class SparseDotsModel(torch.nn.Module):
         if extra_outputs is not None:
             extra_outputs.report("trunkfinal", out)
 
+        cand_mask = torch.cat([
+            count_mask(batch["candCountN"], num_cands),
+            batch["groundN"][:, 0:1].to(torch.float32),
+        ], dim=1)
+        # The decoder runs under the autocast of the caller like the trunk (it has as many rows as the trunk or more),
+        # its logits and the value head are in FP32
+        cand_out = self.decoder(
+            out, mask, num_tokens, board_size,
+            cand_features(batch["candCoordsNM"], batch["candDataNM"], board_size),
+            ground_features(batch["groundN"]),
+            cand_mask,
+            positions,
+        ).float()
         with autocast("cuda", enabled=False):
             out = out.float()
-            cand_mask = torch.cat([
-                count_mask(batch["candCountN"], num_cands),
-                batch["groundN"][:, 0:1].to(torch.float32),
-            ], dim=1)
-            cand_out = self.decoder(
-                out, mask, num_tokens, board_size,
-                cand_features(batch["candCoordsNM"], batch["candDataNM"], board_size),
-                ground_features(batch["groundN"]),
-                cand_mask,
-                positions,
-            )
             out_policy = cand_out[..., :NUM_POLICY_OUTPUTS].permute(0, 2, 1) - (1.0 - cand_mask.unsqueeze(1)) * 5000.0
             out_futurepos = cand_out[:, :num_cands, NUM_POLICY_OUTPUTS:].permute(0, 2, 1)
             out_value, out_miscvalue, out_moremiscvalue, out_ownership, out_scorebelief = self.value_head(

@@ -5531,16 +5531,15 @@ void NeuralNet::getOutput(
 #ifdef KATAGO_GPU_CUDA
   if(gpuHandle->sparseModel != nullptr) {
     testAssert(dotsGame);
-    std::vector<DotsSparseInput> symmetric(batchSize);
     std::vector<const DotsSparseInput*> inputs(batchSize);
+    std::vector<int> symmetries(batchSize);
     for(int row = 0; row < batchSize; row++) {
       const DotsSparseInput& input = inputBufs[row]->dotsSparseInput;
-      const int symmetry = SparseDotsNN::effectiveSymmetry(inputBufs[row]->symmetry, input.xSize, input.ySize);
-      symmetric[row] = input.withSymmetry(symmetry);
-      inputs[row] = &symmetric[row];
+      inputs[row] = &input;
+      symmetries[row] = SparseDotsNN::effectiveSymmetry(inputBufs[row]->symmetry, input.xSize, input.ySize);
     }
     std::vector<SparseDotsNN::RawOutput> raw;
-    gpuHandle->sparseModel->evaluate(inputs, raw);
+    gpuHandle->sparseModel->evaluate(inputs, symmetries, raw);
     for(int row = 0; row < batchSize; row++)
       SparseDotsNN::writeOutput(inputBufs[row]->dotsSparseInput, raw[row], (float)inputBufs[row]->policyOptimism, *outputs[row]);
     return;

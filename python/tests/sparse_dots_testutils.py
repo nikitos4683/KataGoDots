@@ -9,7 +9,7 @@ import torch
 from katago.train import modelconfigs
 
 
-def tiny_sparse_config(decoder_layers=2):
+def tiny_sparse_config(decoder_layers=1):
     config = dict(modelconfigs.config_of_name["b5c384h6nbttflrs-fson-silu-rsnh"])
     config.update({
         "trunk_num_channels": 64,
@@ -72,11 +72,17 @@ def random_row(rng: random.Random, x_size: int, y_size: int) -> Dict:
     for i in (26, 27, 28, 29, 33):
         global_targets[i] = 1.0
     row["globalTargetsNC"] = global_targets
+    # The two bins of the final score distribution as trainingwrite.cpp makes them: scores floor and floor + 1
+    score = rng.uniform(-4, 4)
+    floor_score = int(np.floor(score))
+    upper = min(99, int(round((score - floor_score) * 100)))
+    row["scoreDistr"] = ([floor_score, floor_score + 1], [100 - upper, upper])
     return row
 
 
-def collate(rows: List[Dict], pad_extra: int = 0, score_len: int = None) -> Dict[str, torch.Tensor]:
-    """Pads the rows to the max counts plus pad_extra entries of each kind."""
+def collate(rows: List[Dict], pad_extra: int = 0) -> Dict[str, torch.Tensor]:
+    """A batch of the rows as the loader gives it: the points and candidates padded to the max counts plus
+    pad_extra entries of each kind."""
     n = len(rows)
     P = max([len(r["points"]) for r in rows] + [1]) + pad_extra
     M = max([len(r["cands"]) for r in rows] + [1]) + pad_extra
@@ -95,6 +101,8 @@ def collate(rows: List[Dict], pad_extra: int = 0, score_len: int = None) -> Dict
         "candFutureposTargetsNM": np.zeros((n, M, 2), np.int8),
         "pointOwnershipTargetsNP": np.zeros((n, P), np.int8),
         "globalTargetsNC": np.zeros((n, 64), np.float32),
+        "scoreDistrScoresN": np.zeros((n, 2), np.int16),
+        "scoreDistrWeightsN": np.zeros((n, 2), np.int8),
     }
     for i, r in enumerate(rows):
         b["boardSizeN"][i] = r["boardSizeN"]
@@ -114,14 +122,10 @@ def collate(rows: List[Dict], pad_extra: int = 0, score_len: int = None) -> Dict
         for j, t in enumerate(r["pointOwnershipTargetsNP"]):
             b["pointOwnershipTargetsNP"][i, j] = t
         b["globalTargetsNC"][i] = r["globalTargetsNC"]
-    result = {k: torch.from_numpy(v) for k, v in b.items()}
-    if score_len is not None:
-        score = torch.zeros((n, score_len), dtype=torch.float32)
-        score[:, score_len // 2] = 100.0
-        result["scoreDistrN"] = score
-    return result
+        b["scoreDistrScoresN"][i], b["scoreDistrWeightsN"][i] = r["scoreDistr"]
+    return {k: torch.from_numpy(v) for k, v in b.items()}
 
 
-def random_batch(seed: int, n: int = 4, x_size: int = 9, y_size: int = 7, pad_extra: int = 0, score_len: int = None):
+def random_batch(seed: int, n: int = 4, x_size: int = 9, y_size: int = 7, pad_extra: int = 0):
     rng = random.Random(seed)
-    return collate([random_row(rng, x_size, y_size) for _ in range(n)], pad_extra=pad_extra, score_len=score_len)
+    return collate([random_row(rng, x_size, y_size) for _ in range(n)], pad_extra=pad_extra)

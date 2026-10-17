@@ -68,69 +68,66 @@ void sparseDotsScatterRows(const float* src, float* dst, const int* dstRows, int
 //------------------------------------------------------------------------------------------------------------------
 
 __global__ void sparseDotsAddGlobalKernel(
-  float* seq, const float* globalToken, const float* globalProj, const float* mask, int batchSize, int seqLen, int channels
+  float* seq, const float* globalToken, const float* globalProj, const int* rowSeg, const int* segStart, int rows, int channels
 ) {
   long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i >= (long long)batchSize * seqLen * channels)
+  if(i >= (long long)rows * channels)
     return;
   int c = (int)(i % channels);
-  long long ns = i / channels;
-  int s = (int)(ns % seqLen);
-  int n = (int)(ns / seqLen);
+  int r = (int)(i / channels);
+  int n = rowSeg[r];
   float g = globalProj[(long long)n * channels + c];
-  if(s == 0)
+  if(r == segStart[n])
     seq[i] = globalToken[c] + g;
-  else if(mask[ns] != 0.0f)
-    seq[i] += g;
   else
-    seq[i] = 0.0f;
+    seq[i] += g;
 }
 
 void sparseDotsAddGlobal(
-  float* seq, const float* globalToken, const float* globalProj, const float* mask, int batchSize, int seqLen, int channels,
-  cudaStream_t stream
+  float* seq, const float* globalToken, const float* globalProj, const int* rowSeg, const int* segStart, int rows,
+  int channels, cudaStream_t stream
 ) {
-  long long n = (long long)batchSize * seqLen * channels;
-  sparseDotsAddGlobalKernel<<<numBlocksFor(n, 256), 256, 0, stream>>>(seq, globalToken, globalProj, mask, batchSize, seqLen, channels);
+  long long n = (long long)rows * channels;
+  if(n > 0)
+    sparseDotsAddGlobalKernel<<<numBlocksFor(n, 256), 256, 0, stream>>>(seq, globalToken, globalProj, rowSeg, segStart, rows, channels);
 }
 
-__global__ void sparseDotsAddRowVectorKernel(float* x, const float* v, int batchSize, int len, int channels) {
+__global__ void sparseDotsAddRowVectorKernel(float* x, const float* v, const int* rowSeg, int rows, int channels) {
   long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i >= (long long)batchSize * len * channels)
+  if(i >= (long long)rows * channels)
     return;
   int c = (int)(i % channels);
-  int n = (int)(i / ((long long)len * channels));
-  x[i] += v[(long long)n * channels + c];
+  int r = (int)(i / channels);
+  x[i] += v[(long long)rowSeg[r] * channels + c];
 }
 
-void sparseDotsAddRowVector(float* x, const float* v, int batchSize, int len, int channels, cudaStream_t stream) {
-  long long n = (long long)batchSize * len * channels;
+void sparseDotsAddRowVector(float* x, const float* v, const int* rowSeg, int rows, int channels, cudaStream_t stream) {
+  long long n = (long long)rows * channels;
   if(n > 0)
-    sparseDotsAddRowVectorKernel<<<numBlocksFor(n, 256), 256, 0, stream>>>(x, v, batchSize, len, channels);
+    sparseDotsAddRowVectorKernel<<<numBlocksFor(n, 256), 256, 0, stream>>>(x, v, rowSeg, rows, channels);
 }
 
 //------------------------------------------------------------------------------------------------------------------
 
 template <typename T>
 __global__ void sparseDotsScaleBiasActKernel(
-  const T* in, T* out, const float* scale, const float* bias, const float* mask, long long rows, int channels, int activation
+  const T* in, T* out, const float* scale, const float* bias, long long rows, int channels, int activation
 ) {
   long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
   if(i >= rows * channels)
     return;
   int c = (int)(i % channels);
-  float m = mask != nullptr ? mask[i / channels] : 1.0f;
-  out[i] = fromFloat<T>(activate(toFloat(in[i]) * scale[c] + bias[c], activation) * m);
+  out[i] = fromFloat<T>(activate(toFloat(in[i]) * scale[c] + bias[c], activation));
 }
 
 template <typename T>
 void sparseDotsScaleBiasAct(
-  const T* in, T* out, const float* scale, const float* bias, const float* mask, long long rows, int channels, int activation,
+  const T* in, T* out, const float* scale, const float* bias, long long rows, int channels, int activation,
   cudaStream_t stream
 ) {
   long long n = rows * channels;
   if(n > 0)
-    sparseDotsScaleBiasActKernel<T><<<numBlocksFor(n, 256), 256, 0, stream>>>(in, out, scale, bias, mask, rows, channels, activation);
+    sparseDotsScaleBiasActKernel<T><<<numBlocksFor(n, 256), 256, 0, stream>>>(in, out, scale, bias, rows, channels, activation);
 }
 
 template <typename T>
@@ -153,9 +150,7 @@ void sparseDotsBiasAct(T* buf, const float* bias, long long rows, int channels, 
 
 // One warp per row
 template <typename T>
-__global__ void sparseDotsRMSNormKernel(
-  const T* in, T* out, const float* weight, const float* mask, long long rows, int channels, float epsilon
-) {
+__global__ void sparseDotsRMSNormKernel(const T* in, T* out, const float* weight, long long rows, int channels, float epsilon) {
   long long row = ((long long)blockIdx.x * blockDim.x + threadIdx.x) / 32;
   int lane = threadIdx.x % 32;
   if(row >= rows)
@@ -169,66 +164,63 @@ __global__ void sparseDotsRMSNormKernel(
   for(int offset = 16; offset > 0; offset /= 2)
     sumSq += __shfl_xor_sync(0xffffffff, sumSq, offset);
   float inv = rsqrtf(sumSq / (float)channels + epsilon);
-  if(mask != nullptr)
-    inv *= mask[row];
   T* o = out + row * channels;
   for(int c = lane; c < channels; c += 32)
     o[c] = fromFloat<T>(toFloat(x[c]) * inv * weight[c]);
 }
 
 template <typename T>
-void sparseDotsRMSNorm(
-  const T* in, T* out, const float* weight, const float* mask, long long rows, int channels, float epsilon,
-  cudaStream_t stream
-) {
+void sparseDotsRMSNorm(const T* in, T* out, const float* weight, long long rows, int channels, float epsilon, cudaStream_t stream) {
   if(rows > 0)
-    sparseDotsRMSNormKernel<T><<<numBlocksFor(rows * 32, 128), 128, 0, stream>>>(in, out, weight, mask, rows, channels, epsilon);
+    sparseDotsRMSNormKernel<T><<<numBlocksFor(rows * 32, 128), 128, 0, stream>>>(in, out, weight, rows, channels, epsilon);
 }
 
 template <typename T>
-__global__ void sparseDotsResidualAddKernel(T* x, const T* delta, const float* mask, long long rows, int channels) {
+__global__ void sparseDotsResidualAddKernel(T* x, const T* delta, long long n) {
+  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if(i < n)
+    x[i] = fromFloat<T>(toFloat(x[i]) + toFloat(delta[i]));
+}
+
+template <typename T>
+void sparseDotsResidualAdd(T* x, const T* delta, long long rows, int channels, cudaStream_t stream) {
+  long long n = rows * channels;
+  if(n > 0)
+    sparseDotsResidualAddKernel<T><<<numBlocksFor(n, 256), 256, 0, stream>>>(x, delta, n);
+}
+
+template <typename T>
+__global__ void sparseDotsSwiGLUKernel(T* ab, long long rows, int channels) {
   long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
   if(i >= rows * channels)
     return;
-  float m = mask != nullptr ? mask[i / channels] : 1.0f;
-  x[i] = fromFloat<T>(toFloat(x[i]) + toFloat(delta[i]) * m);
+  long long r = i / channels;
+  int c = (int)(i % channels);
+  T* a = ab + r * 2 * channels + c;
+  float v = toFloat(*a);
+  *a = fromFloat<T>(v / (1.0f + __expf(-v)) * toFloat(a[channels]));
 }
 
 template <typename T>
-void sparseDotsResidualAdd(T* x, const T* delta, const float* mask, long long rows, int channels, cudaStream_t stream) {
+void sparseDotsSwiGLU(T* ab, long long rows, int channels, cudaStream_t stream) {
   long long n = rows * channels;
   if(n > 0)
-    sparseDotsResidualAddKernel<T><<<numBlocksFor(n, 256), 256, 0, stream>>>(x, delta, mask, rows, channels);
-}
-
-template <typename T>
-__global__ void sparseDotsSwiGLUKernel(T* a, const T* g, long long n) {
-  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i >= n)
-    return;
-  float v = toFloat(a[i]);
-  a[i] = fromFloat<T>(v / (1.0f + __expf(-v)) * toFloat(g[i]));
-}
-
-template <typename T>
-void sparseDotsSwiGLU(T* a, const T* g, long long n, cudaStream_t stream) {
-  if(n > 0)
-    sparseDotsSwiGLUKernel<T><<<numBlocksFor(n, 256), 256, 0, stream>>>(a, g, n);
+    sparseDotsSwiGLUKernel<T><<<numBlocksFor(n, 256), 256, 0, stream>>>(ab, rows, channels);
 }
 
 //------------------------------------------------------------------------------------------------------------------
 
-constexpr int SPATIAL_RMSNORM_BLOCKS_PER_ROW = 16;
+constexpr int SPATIAL_RMSNORM_BLOCKS_PER_SEG = 8;
 
 template <typename T>
-__global__ void sparseDotsSpatialSumSqKernel(const T* in, const float* mask, int seqLen, int channels, float* sumSqBuf) {
+__global__ void sparseDotsSpatialSumSqKernel(const T* in, const int* segStart, int channels, float* sumSqBuf) {
   __shared__ float shared[256];
   int n = blockIdx.y;
-  long long total = (long long)seqLen * channels;
-  const T* x = in + (long long)n * total;
+  long long begin = (long long)segStart[n] * channels;
+  long long end = (long long)segStart[n + 1] * channels;
   float acc = 0.0f;
-  for(long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (long long)blockDim.x * gridDim.x) {
-    float v = toFloat(x[i]) * mask[(long long)n * seqLen + i / channels];
+  for(long long i = begin + (long long)blockIdx.x * blockDim.x + threadIdx.x; i < end; i += (long long)blockDim.x * gridDim.x) {
+    float v = toFloat(in[i]);
     acc += v * v;
   }
   shared[threadIdx.x] = acc;
@@ -244,90 +236,62 @@ __global__ void sparseDotsSpatialSumSqKernel(const T* in, const float* mask, int
 
 template <typename T>
 __global__ void sparseDotsSpatialApplyKernel(
-  const T* in, T* out, const float* gamma, const float* beta, const float* mask, const float* numTokens,
-  int batchSize, int seqLen, int channels, float epsilon, int activation, const float* sumSqBuf
+  const T* in, T* out, const float* gamma, const float* beta, const int* rowSeg, const int* segStart, int rows, int channels,
+  float epsilon, int activation, const float* sumSqBuf
 ) {
   long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i >= (long long)batchSize * seqLen * channels)
+  if(i >= (long long)rows * channels)
     return;
-  long long token = i / channels;
+  int r = (int)(i / channels);
   int c = (int)(i % channels);
-  int n = (int)(token / seqLen);
-  float inv = rsqrtf(sumSqBuf[n] / (numTokens[n] * (float)channels) + epsilon);
-  float m = mask[token];
-  out[i] = fromFloat<T>(activate(toFloat(in[i]) * m * inv * gamma[c] + beta[c], activation) * m);
+  int n = rowSeg[r];
+  float numTokens = (float)(segStart[n + 1] - segStart[n]);
+  float inv = rsqrtf(sumSqBuf[n] / (numTokens * (float)channels) + epsilon);
+  out[i] = fromFloat<T>(activate(toFloat(in[i]) * inv * gamma[c] + beta[c], activation));
 }
 
 template <typename T>
 void sparseDotsSpatialRMSNorm(
-  const T* in, T* out, const float* gamma, const float* beta, const float* mask, const float* numTokens,
-  int batchSize, int seqLen, int channels, float epsilon, int activation, float* sumSqBuf, cudaStream_t stream
+  const T* in, T* out, const float* gamma, const float* beta, const int* rowSeg, const int* segStart, int numSegs, int rows,
+  int channels, float epsilon, int activation, float* sumSqBuf, cudaStream_t stream
 ) {
-  if(batchSize > 65535)
-    throw std::runtime_error("sparseDotsSpatialRMSNorm: batchSize too large");
-  cudaMemsetAsync(sumSqBuf, 0, sizeof(float) * batchSize, stream);
-  dim3 grid(SPATIAL_RMSNORM_BLOCKS_PER_ROW, batchSize);
-  sparseDotsSpatialSumSqKernel<T><<<grid, 256, 0, stream>>>(in, mask, seqLen, channels, sumSqBuf);
-  long long n = (long long)batchSize * seqLen * channels;
+  if(numSegs > 65535)
+    throw std::runtime_error("sparseDotsSpatialRMSNorm: too many positions");
+  if(rows <= 0)
+    return;
+  cudaMemsetAsync(sumSqBuf, 0, sizeof(float) * numSegs, stream);
+  dim3 grid(SPATIAL_RMSNORM_BLOCKS_PER_SEG, numSegs);
+  sparseDotsSpatialSumSqKernel<T><<<grid, 256, 0, stream>>>(in, segStart, channels, sumSqBuf);
+  long long n = (long long)rows * channels;
   sparseDotsSpatialApplyKernel<T><<<numBlocksFor(n, 256), 256, 0, stream>>>(
-    in, out, gamma, beta, mask, numTokens, batchSize, seqLen, channels, epsilon, activation, sumSqBuf);
+    in, out, gamma, beta, rowSeg, segStart, rows, channels, epsilon, activation, sumSqBuf);
 }
 
 //------------------------------------------------------------------------------------------------------------------
 
-__global__ void sparseDotsRopeTablesKernel(
-  const float* freqs, const int* segStart, const float* posXYW, int numTokens, int numKVHeadPairs, float* cosOut, float* sinOut
-) {
-  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i >= (long long)numTokens * numKVHeadPairs)
-    return;
-  int t = (int)(i / numKVHeadPairs);
-  int j = (int)(i % numKVHeadPairs);
-  float fx = freqs[2 * j];
-  float fy = freqs[2 * j + 1];
-  float c = 0.0f;
-  float s = 0.0f;
-  int end = segStart[t + 1];
-  for(int e = segStart[t]; e < end; e++) {
-    float x = posXYW[3 * e];
-    float y = posXYW[3 * e + 1];
-    float w = posXYW[3 * e + 2];
-    float sn, cs;
-    sincosf(x * fx + y * fy, &sn, &cs);
-    c += w * cs;
-    s += w * sn;
-  }
-  cosOut[i] = c;
-  sinOut[i] = s;
-}
-
-void sparseDotsRopeTables(
-  const float* freqs, const int* segStart, const float* posXYW, int numTokens, int numKVHeadPairs, float* cosOut, float* sinOut,
-  cudaStream_t stream
-) {
-  if(numTokens <= 0)
-    return;
-  long long n = (long long)numTokens * numKVHeadPairs;
-  sparseDotsRopeTablesKernel<<<numBlocksFor(n, 256), 256, 0, stream>>>(freqs, segStart, posXYW, numTokens, numKVHeadPairs, cosOut, sinOut);
-}
-
 template <typename T>
 __global__ void sparseDotsApplyRopeKernel(
-  T* x, const float* cosTable, const float* sinTable, int numTokens, int numHeads, int numKVHeads, int headDim, int rowStride
+  T* x, const float* freqs, const float* pos, int rows, int numHeads, int numKVHeads, int headDim, int rowStride
 ) {
   int numPairs = headDim / 2;
   long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i >= (long long)numTokens * numHeads * numPairs)
+  if(i >= (long long)rows * numHeads * numPairs)
     return;
   int p = (int)(i % numPairs);
-  long long th = i / numPairs;
-  int h = (int)(th % numHeads);
-  long long t = th / numHeads;
+  long long rh = i / numPairs;
+  int h = (int)(rh % numHeads);
+  long long r = rh / numHeads;
   int kvh = h * numKVHeads / numHeads;
-  long long tableIdx = t * numKVHeads * numPairs + (long long)kvh * numPairs + p;
-  float c = cosTable[tableIdx];
-  float s = sinTable[tableIdx];
-  T* pair = x + t * rowStride + (long long)h * headDim + 2 * p;
+  const float* rowPos = pos + r * 3;
+  T* pair = x + r * rowStride + (long long)h * headDim + 2 * p;
+  if(rowPos[2] == 0.0f) {
+    pair[0] = fromFloat<T>(0.0f);
+    pair[1] = fromFloat<T>(0.0f);
+    return;
+  }
+  const float* f = freqs + 2 * ((long long)kvh * numPairs + p);
+  float s, c;
+  sincosf(rowPos[0] * f[0] + rowPos[1] * f[1], &s, &c);
   float x0 = toFloat(pair[0]);
   float x1 = toFloat(pair[1]);
   pair[0] = fromFloat<T>(x0 * c - x1 * s);
@@ -336,38 +300,88 @@ __global__ void sparseDotsApplyRopeKernel(
 
 template <typename T>
 void sparseDotsApplyRope(
-  T* x, const float* cosTable, const float* sinTable, int numTokens, int numHeads, int numKVHeads, int headDim, int rowStride,
+  T* x, const float* freqs, const float* pos, int rows, int numHeads, int numKVHeads, int headDim, int rowStride,
   cudaStream_t stream
 ) {
-  if(numTokens <= 0)
+  if(rows <= 0)
     return;
-  long long n = (long long)numTokens * numHeads * (headDim / 2);
-  sparseDotsApplyRopeKernel<T><<<numBlocksFor(n, 256), 256, 0, stream>>>(x, cosTable, sinTable, numTokens, numHeads, numKVHeads, headDim, rowStride);
+  long long n = (long long)rows * numHeads * (headDim / 2);
+  sparseDotsApplyRopeKernel<T><<<numBlocksFor(n, 256), 256, 0, stream>>>(x, freqs, pos, rows, numHeads, numKVHeads, headDim, rowStride);
+}
+
+template <typename T>
+__device__ __forceinline__ void sparseDotsRotatePair(T* pair, float c, float s) {
+  float x0 = toFloat(pair[0]);
+  float x1 = toFloat(pair[1]);
+  pair[0] = fromFloat<T>(x0 * c - x1 * s);
+  pair[1] = fromFloat<T>(x0 * s + x1 * c);
+}
+
+template <typename T>
+__global__ void sparseDotsApplyRopeQKKernel(
+  T* q, T* k, const float* freqs, const float* pos, int rows, int numHeads, int numKVHeads, int headDim, int qStride,
+  int kStride
+) {
+  int numPairs = headDim / 2;
+  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  if(i >= (long long)rows * numKVHeads * numPairs)
+    return;
+  int p = (int)(i % numPairs);
+  long long rh = i / numPairs;
+  int kvh = (int)(rh % numKVHeads);
+  long long r = rh / numKVHeads;
+  const float* rowPos = pos + r * 3;
+  float s = 0.0f, c = 0.0f;
+  if(rowPos[2] != 0.0f) {
+    const float* f = freqs + 2 * ((long long)kvh * numPairs + p);
+    sincosf(rowPos[0] * f[0] + rowPos[1] * f[1], &s, &c);
+  }
+  sparseDotsRotatePair(k + r * kStride + (long long)kvh * headDim + 2 * p, c, s);
+  int rep = numHeads / numKVHeads;
+  for(int j = 0; j < rep; j++)
+    sparseDotsRotatePair(q + r * qStride + (long long)(kvh * rep + j) * headDim + 2 * p, c, s);
+}
+
+template <typename T>
+void sparseDotsApplyRopeQK(
+  T* q, T* k, const float* freqs, const float* pos, int rows, int numHeads, int numKVHeads, int headDim, int qStride,
+  int kStride, cudaStream_t stream
+) {
+  if(rows <= 0)
+    return;
+  if(numHeads % numKVHeads != 0)
+    throw std::runtime_error("sparseDotsApplyRopeQK: numHeads must divide by numKVHeads");
+  long long n = (long long)rows * numKVHeads * (headDim / 2);
+  sparseDotsApplyRopeQKKernel<T><<<numBlocksFor(n, 256), 256, 0, stream>>>(
+    q, k, freqs, pos, rows, numHeads, numKVHeads, headDim, qStride, kStride);
 }
 
 //------------------------------------------------------------------------------------------------------------------
-// Attention with online softmax, tiled like flashAttentionTiledImpl in cudaandrocmhelpers.inc but with different
-// query and key lengths and no query mask. One thread per query, BLOCK_KV keys in shared memory.
+// Attention with online softmax, tiled like flashAttentionTiledImpl in cudaandrocmhelpers.inc but over the packed
+// positions. One thread per query, BLOCK_KV keys in shared memory. Used when the tensor-core kernel isn't.
 
 template <typename T, int qHeadDim, int vHeadDim, int BLOCK_Q, int BLOCK_KV>
 __global__ void sparseDotsAttentionKernel(
-  const T* Q, const T* K, const T* V, const float* kvMask, T* output,
-  int qLen, int kvLen, int numHeads, int numKVHeads, float scale
+  const T* Q, const T* K, const T* V, T* output, const int* qStart, const int* kvStart, int numHeads, int numKVHeads,
+  int qStride, int kvStride, float scale
 ) {
   const int tid = threadIdx.x;
-  const int qPos = blockIdx.x * BLOCK_Q + tid;
   const int bh = blockIdx.y;
   const int n = bh / numHeads;
   const int h = bh % numHeads;
   const int kvh = h * numKVHeads / numHeads;
-  const int qTotalDim = numHeads * qHeadDim;
-  const int kTotalDim = numKVHeads * qHeadDim;
-  const int vTotalDim = numKVHeads * vHeadDim;
+  const int qBase = qStart[n];
+  const int qLen = qStart[n + 1] - qBase;
+  const int kvBase = kvStart[n];
+  const int kvLen = kvStart[n + 1] - kvBase;
+  const int qBlockStart = blockIdx.x * BLOCK_Q;
+  if(qBlockStart >= qLen)
+    return;
+  const int qPos = qBlockStart + tid;
   const int oTotalDim = numHeads * vHeadDim;
 
   __shared__ float kTile[BLOCK_KV * qHeadDim];
   __shared__ float vTile[BLOCK_KV * vHeadDim];
-  __shared__ float maskTile[BLOCK_KV];
 
   float qReg[qHeadDim];
   float acc[vHeadDim];
@@ -375,7 +389,7 @@ __global__ void sparseDotsAttentionKernel(
   float runningSum = 0.0f;
   const bool active = qPos < qLen;
   if(active) {
-    const T* qPtr = Q + ((long long)n * qLen + qPos) * qTotalDim + h * qHeadDim;
+    const T* qPtr = Q + (long long)(qBase + qPos) * qStride + h * qHeadDim;
     #pragma unroll
     for(int d = 0; d < qHeadDim; d++)
       qReg[d] = toFloat(qPtr[d]) * scale;
@@ -384,25 +398,19 @@ __global__ void sparseDotsAttentionKernel(
   for(int d = 0; d < vHeadDim; d++)
     acc[d] = 0.0f;
 
-  for(int kvStart = 0; kvStart < kvLen; kvStart += BLOCK_KV) {
+  for(int kvTileStart = 0; kvTileStart < kvLen; kvTileStart += BLOCK_KV) {
     for(int t = tid; t < BLOCK_KV * qHeadDim; t += BLOCK_Q) {
-      int pos = kvStart + t / qHeadDim;
-      kTile[t] = pos < kvLen ? toFloat(K[((long long)n * kvLen + pos) * kTotalDim + kvh * qHeadDim + t % qHeadDim]) : 0.0f;
+      int p = kvTileStart + t / qHeadDim;
+      kTile[t] = p < kvLen ? toFloat(K[(long long)(kvBase + p) * kvStride + kvh * qHeadDim + t % qHeadDim]) : 0.0f;
     }
     for(int t = tid; t < BLOCK_KV * vHeadDim; t += BLOCK_Q) {
-      int pos = kvStart + t / vHeadDim;
-      vTile[t] = pos < kvLen ? toFloat(V[((long long)n * kvLen + pos) * vTotalDim + kvh * vHeadDim + t % vHeadDim]) : 0.0f;
-    }
-    for(int t = tid; t < BLOCK_KV; t += BLOCK_Q) {
-      int pos = kvStart + t;
-      maskTile[t] = pos < kvLen ? kvMask[(long long)n * kvLen + pos] : 0.0f;
+      int p = kvTileStart + t / vHeadDim;
+      vTile[t] = p < kvLen ? toFloat(V[(long long)(kvBase + p) * kvStride + kvh * vHeadDim + t % vHeadDim]) : 0.0f;
     }
     __syncthreads();
     if(active) {
-      int kvEnd = min(BLOCK_KV, kvLen - kvStart);
+      int kvEnd = min(BLOCK_KV, kvLen - kvTileStart);
       for(int tk = 0; tk < kvEnd; tk++) {
-        if(maskTile[tk] == 0.0f)
-          continue;
         float dot = 0.0f;
         #pragma unroll
         for(int d = 0; d < qHeadDim; d++)
@@ -421,7 +429,7 @@ __global__ void sparseDotsAttentionKernel(
   }
 
   if(active) {
-    T* outRow = output + ((long long)n * qLen + qPos) * oTotalDim + h * vHeadDim;
+    T* outRow = output + (long long)(qBase + qPos) * oTotalDim + h * vHeadDim;
     float invSum = runningSum > 0.0f ? 1.0f / runningSum : 0.0f;
     #pragma unroll
     for(int d = 0; d < vHeadDim; d++)
@@ -431,23 +439,26 @@ __global__ void sparseDotsAttentionKernel(
 
 template <typename T>
 void sparseDotsAttention(
-  const T* Q, const T* K, const T* V, const float* kvMask, T* output,
-  int batchSize, int qLen, int kvLen, int numHeads, int numKVHeads, int qHeadDim, int vHeadDim, cudaStream_t stream
+  const T* Q, const T* K, const T* V, T* output, const int* qStart, const int* kvStart, int numSegs, int maxQLen,
+  int numHeads, int numKVHeads, int qHeadDim, int vHeadDim, int qStride, int kvStride, cudaStream_t stream
 ) {
-  if(batchSize * numHeads > 65535)
-    throw std::runtime_error("sparseDotsAttention: batchSize * numHeads too large");
-  if(qLen <= 0)
+  if((long long)numSegs * numHeads > 65535)
+    throw std::runtime_error("sparseDotsAttention: too many positions * heads");
+  if(maxQLen <= 0 || numSegs <= 0)
     return;
   float scale = 1.0f / sqrtf((float)qHeadDim);
   constexpr int BLOCK_Q = 64;
   constexpr int BLOCK_KV = 32;
-  dim3 grid((qLen + BLOCK_Q - 1) / BLOCK_Q, batchSize * numHeads);
+  dim3 grid((maxQLen + BLOCK_Q - 1) / BLOCK_Q, numSegs * numHeads);
   if(qHeadDim == 32 && vHeadDim == 32)
-    sparseDotsAttentionKernel<T, 32, 32, BLOCK_Q, BLOCK_KV><<<grid, BLOCK_Q, 0, stream>>>(Q, K, V, kvMask, output, qLen, kvLen, numHeads, numKVHeads, scale);
+    sparseDotsAttentionKernel<T, 32, 32, BLOCK_Q, BLOCK_KV><<<grid, BLOCK_Q, 0, stream>>>(
+      Q, K, V, output, qStart, kvStart, numHeads, numKVHeads, qStride, kvStride, scale);
   else if(qHeadDim == 64 && vHeadDim == 64)
-    sparseDotsAttentionKernel<T, 64, 64, BLOCK_Q, BLOCK_KV><<<grid, BLOCK_Q, 0, stream>>>(Q, K, V, kvMask, output, qLen, kvLen, numHeads, numKVHeads, scale);
+    sparseDotsAttentionKernel<T, 64, 64, BLOCK_Q, BLOCK_KV><<<grid, BLOCK_Q, 0, stream>>>(
+      Q, K, V, output, qStart, kvStart, numHeads, numKVHeads, qStride, kvStride, scale);
   else if(qHeadDim == 16 && vHeadDim == 16)
-    sparseDotsAttentionKernel<T, 16, 16, BLOCK_Q, BLOCK_KV><<<grid, BLOCK_Q, 0, stream>>>(Q, K, V, kvMask, output, qLen, kvLen, numHeads, numKVHeads, scale);
+    sparseDotsAttentionKernel<T, 16, 16, BLOCK_Q, BLOCK_KV><<<grid, BLOCK_Q, 0, stream>>>(
+      Q, K, V, output, qStart, kvStart, numHeads, numKVHeads, qStride, kvStride, scale);
   else
     throw std::runtime_error("sparseDotsAttention: unsupported head dims");
 }
@@ -455,24 +466,23 @@ void sparseDotsAttention(
 //------------------------------------------------------------------------------------------------------------------
 
 __global__ void sparseDotsPoolKernel(
-  const float* x, const float* mask, const float* numTokens, const float* boardOffset, float* out,
-  int batchSize, int seqLen, int channels, bool valueHeadMode
+  const float* x, const int* segStart, const float* boardOffset, float* out, int numSegs, int channels, bool valueHeadMode
 ) {
   long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i >= (long long)batchSize * channels)
+  if(i >= (long long)numSegs * channels)
     return;
   int n = (int)(i / channels);
   int c = (int)(i % channels);
   float sum = 0.0f;
   float maxV = -1e30f;
-  for(int s = 0; s < seqLen; s++) {
-    if(mask[(long long)n * seqLen + s] == 0.0f)
-      continue;
-    float v = x[((long long)n * seqLen + s) * channels + c];
+  const int begin = segStart[n];
+  const int end = segStart[n + 1];
+  for(int r = begin; r < end; r++) {
+    float v = x[(long long)r * channels + c];
     sum += v;
     maxV = fmaxf(maxV, v);
   }
-  float mean = sum / numTokens[n];
+  float mean = sum / (float)(end - begin);
   float off = boardOffset[n];
   float* o = out + (long long)n * 3 * channels;
   o[c] = mean;
@@ -481,26 +491,28 @@ __global__ void sparseDotsPoolKernel(
 }
 
 void sparseDotsPool(
-  const float* x, const float* mask, const float* numTokens, const float* boardOffset, float* out,
-  int batchSize, int seqLen, int channels, bool valueHeadMode, cudaStream_t stream
+  const float* x, const int* segStart, const float* boardOffset, float* out, int numSegs, int channels, bool valueHeadMode,
+  cudaStream_t stream
 ) {
-  long long n = (long long)batchSize * channels;
-  sparseDotsPoolKernel<<<numBlocksFor(n, 128), 128, 0, stream>>>(x, mask, numTokens, boardOffset, out, batchSize, seqLen, channels, valueHeadMode);
+  long long n = (long long)numSegs * channels;
+  if(n > 0)
+    sparseDotsPoolKernel<<<numBlocksFor(n, 128), 128, 0, stream>>>(x, segStart, boardOffset, out, numSegs, channels, valueHeadMode);
 }
 
 //------------------------------------------------------------------------------------------------------------------
 
 #define SPARSE_DOTS_INSTANTIATE(T) \
-  template void sparseDotsScaleBiasAct<T>(const T*, T*, const float*, const float*, const float*, long long, int, int, cudaStream_t); \
+  template void sparseDotsScaleBiasAct<T>(const T*, T*, const float*, const float*, long long, int, int, cudaStream_t); \
   template void sparseDotsBiasAct<T>(T*, const float*, long long, int, int, cudaStream_t); \
-  template void sparseDotsRMSNorm<T>(const T*, T*, const float*, const float*, long long, int, float, cudaStream_t); \
-  template void sparseDotsResidualAdd<T>(T*, const T*, const float*, long long, int, cudaStream_t); \
-  template void sparseDotsSwiGLU<T>(T*, const T*, long long, cudaStream_t); \
+  template void sparseDotsRMSNorm<T>(const T*, T*, const float*, long long, int, float, cudaStream_t); \
+  template void sparseDotsResidualAdd<T>(T*, const T*, long long, int, cudaStream_t); \
+  template void sparseDotsSwiGLU<T>(T*, long long, int, cudaStream_t); \
   template void sparseDotsSpatialRMSNorm<T>( \
-    const T*, T*, const float*, const float*, const float*, const float*, int, int, int, float, int, float*, cudaStream_t); \
+    const T*, T*, const float*, const float*, const int*, const int*, int, int, int, float, int, float*, cudaStream_t); \
   template void sparseDotsApplyRope<T>(T*, const float*, const float*, int, int, int, int, int, cudaStream_t); \
+  template void sparseDotsApplyRopeQK<T>(T*, T*, const float*, const float*, int, int, int, int, int, int, cudaStream_t); \
   template void sparseDotsAttention<T>( \
-    const T*, const T*, const T*, const float*, T*, int, int, int, int, int, int, int, cudaStream_t);
+    const T*, const T*, const T*, T*, const int*, const int*, int, int, int, int, int, int, int, int, cudaStream_t);
 
 SPARSE_DOTS_INSTANTIATE(float)
 SPARSE_DOTS_INSTANTIATE(half)

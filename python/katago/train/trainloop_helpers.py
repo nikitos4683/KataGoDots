@@ -67,10 +67,13 @@ KATAGO_COMPILE_PER_BLOCK (default 1):
 import logging
 import math
 import os
+import shutil
+import subprocess
 from collections import defaultdict
 
 import torch
 import torch._dynamo
+import torch._inductor.config
 from torch.nn.parallel import DistributedDataParallel
 
 
@@ -147,14 +150,70 @@ def align_conv1x1_weight_strides_for_ddp(raw_model) -> int:
     return aligned_count
 
 
+def limit_cuda_memory(device) -> None:
+    """On Windows the driver doesn't fail an allocation beyond the GPU memory but silently moves it to system
+    memory, which is many times slower. The caching allocator reserves far more than it uses when the shapes change
+    from batch to batch (sparse Dots: 11 GiB used, 20 GiB reserved on a 16 GiB GPU at batch 128), so training
+    stalls for seconds at random steps. Capping the process makes the allocator free its cache instead.
+    KATAGO_CUDA_MEMORY_FRACTION overrides the cap (0 disables it), the default is 0.9 on Windows and none elsewhere."""
+    default = "0.9" if os.name == "nt" else "0"
+    fraction = float(os.environ.get("KATAGO_CUDA_MEMORY_FRACTION", default))
+    if fraction > 0.0:
+        torch.cuda.set_per_process_memory_fraction(fraction, device)
+        logging.info(f"Capping the CUDA memory of this process to {fraction:.2f} of the device (KATAGO_CUDA_MEMORY_FRACTION)")
+
+
+def ensure_msvc_for_compile() -> bool:
+    """torch.compile (inductor) on Windows needs the MSVC compiler cl.exe. If it isn't on PATH, takes the environment
+    of the latest Visual Studio with the C++ tools (vcvars64.bat), so training also works from a plain shell.
+    Returns whether cl.exe is available."""
+    if os.name != "nt" or shutil.which("cl") is not None:
+        return True
+    program_files = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    vswhere = os.path.join(program_files, "Microsoft Visual Studio", "Installer", "vswhere.exe")
+    if not os.path.exists(vswhere):
+        return False
+    try:
+        found = subprocess.run(
+            [vswhere, "-latest", "-products", "*", "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+             "-property", "installationPath"],
+            capture_output=True, check=True,
+        ).stdout.decode("utf-8", errors="replace").strip().splitlines()
+        if not found:
+            return False
+        vcvars = os.path.join(found[0].strip(), "VC", "Auxiliary", "Build", "vcvars64.bat")
+        if not os.path.exists(vcvars):
+            return False
+        # A string command goes to CreateProcess as is, keeping the quoting that cmd expects
+        output = subprocess.run(f'cmd /s /c ""{vcvars}" >nul && set"', capture_output=True, check=True).stdout
+    except (OSError, subprocess.CalledProcessError) as e:
+        logging.warning(f"Could not set up the MSVC environment for torch.compile: {e}")
+        return False
+    for line in output.decode("oem", errors="replace").splitlines():
+        name, sep, value = line.partition("=")
+        if sep and name:
+            os.environ[name] = value
+    available = shutil.which("cl") is not None
+    if available:
+        logging.info(f"Using the MSVC environment of {vcvars} for torch.compile")
+    return available
+
+
 def wrap_model_for_training(raw_model, device, world_size: int, no_compile: bool):
     """Apply torch.compile and DDP without changing ownership of raw_model.
 
     Must be called before the optimizer is constructed because 1x1 conv stride alignment can replace Parameter objects.
     """
     compile_mode = None if no_compile else get_compile_mode()
+    # Models whose input shapes change from batch to batch (sparse Dots) are compiled once with dynamic shapes
+    dynamic = bool(getattr(raw_model, "compile_with_dynamic_shapes", lambda: False)())
     if not no_compile:
         configure_model_for_compile(raw_model)
+        if dynamic:
+            # Inductor's coalescing analysis of the tiling fails an assertion on some dynamic-shape kernels of the
+            # sparse Dots model (torch 2.11); without it the kernels are only tiled by the default heuristics
+            torch._inductor.config.triton.coalesce_tiling_analysis = False
+            logging.info("Compiling with dynamic shapes")
     if world_size <= 1:
         logging.info(
             f"Training model wrapper: single GPU, compile={not no_compile}, "
@@ -162,7 +221,7 @@ def wrap_model_for_training(raw_model, device, world_size: int, no_compile: bool
         )
         if no_compile:
             return raw_model
-        return torch.compile(raw_model, mode=compile_mode)
+        return torch.compile(raw_model, mode=compile_mode, dynamic=dynamic or None)
 
     static_graph = env_flag("KATAGO_DDP_STATIC_GRAPH", default=True)
     gradient_as_bucket_view = env_flag("KATAGO_DDP_GRADIENT_AS_BUCKET_VIEW", default=True)
@@ -219,7 +278,7 @@ def wrap_model_for_training(raw_model, device, world_size: int, no_compile: bool
         _maybe_register_ddp_comm_hook(ddp_model)
         return ddp_model
 
-    compiled_model = torch.compile(raw_model, mode=compile_mode)
+    compiled_model = torch.compile(raw_model, mode=compile_mode, dynamic=dynamic or None)
     ddp_model = DistributedDataParallel(compiled_model, **ddp_kwargs)
     _maybe_register_ddp_comm_hook(ddp_model)
     return ddp_model
@@ -239,7 +298,18 @@ def configure_model_for_compile(raw_model, per_block=None):
     6-head model: every gradient nonfinite at batch sizes of 128 or more). Disabling that inductor
     optimization instead costs several percent of throughput on these models. So when the model is
     compiled as a single graph, the fused Q/K/V projection and RoPE path is turned off here.
+
+    The same layout optimization also breaks the gradients of the plain flex attention path, with or without the
+    fused kernels and per-block compilation (torch 2.11, triton 3.6): the q/k projection gradients come out 8-35%
+    off on every attention layer (b5c384h6 at 39x32 and 19x19), while the forward is right and eager or SDPA
+    gradients match FP32 to ~0.1%. Such training can diverge (exploding gradients were seen in Dots training
+    without KATAGO_FLEX_ATTENTION=0). So the optimization is
+    turned off whenever flex attention is used; it is also faster then (b5c384h6, 39x32, batch 64 on an RTX
+    5060 Ti: 300 rows/s, against 207 with it and 160 with SDPA attention).
     """
+    if getattr(raw_model, "use_flex_attention", False):
+        torch._inductor.config.layout_optimization = False
+        logging.info("Disabled inductor layout optimization: it breaks the flex attention gradients")
     if per_block is None:
         per_block = env_flag("KATAGO_COMPILE_PER_BLOCK", default=True)
     if per_block and not raw_model.supports_per_block_compile():
@@ -286,8 +356,9 @@ def get_model_norms_only_at_print() -> bool:
     return env_flag("KATAGO_MODEL_NORMS_ONLY_AT_PRINT", default=True)
 
 
-def make_training_metrics_fn(metrics_obj, no_compile: bool, model_norms_only_at_print: bool):
-    """Return the (possibly torch.compiled) training metrics/loss function."""
+def make_training_metrics_fn(metrics_obj, no_compile: bool, model_norms_only_at_print: bool, dynamic: bool = False):
+    """Return the (possibly torch.compiled) training metrics/loss function. dynamic: the shapes of the outputs
+    and the batch change from batch to batch (sparse Dots)."""
     compile_requested = env_flag("KATAGO_COMPILE_TRAINING_LOSS", default=True)
     compile_training_loss = compile_requested and not no_compile
     if compile_requested and not compile_training_loss:
@@ -300,7 +371,7 @@ def make_training_metrics_fn(metrics_obj, no_compile: bool, model_norms_only_at_
             "so the compiled result structure is fixed"
         )
     logging.info(f"Compiling training loss with mode={get_compile_mode()}")
-    return torch.compile(metrics_obj.metrics_dict_batchwise, mode=get_compile_mode(), dynamic=False)
+    return torch.compile(metrics_obj.metrics_dict_batchwise, mode=get_compile_mode(), dynamic=dynamic)
 
 
 def clip_gradients_and_record(ddp_model, gnorm_cap, metrics, batch_size):

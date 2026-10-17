@@ -175,6 +175,7 @@ This comprehensive suite runs:
 Additional C++ test commands:
 - `.\katago.exe runoutputtests` — Tests model loading, SGF handling, time controls, and output formatting.
 - `.\katago.exe testsparsenn -model <MODEL> [-use-fp16 true]` — Compares the outputs of the backend of the build (e.g. CUDA) with the CPU reference of a sparse Dots model on positions of random games.
+- `.\katago.exe benchsparsenn -model <MODEL> [-sgfs <GAMES>.sgfs] [-batch-size 32] [-threads 2]` — Measures the speed of the backend on batches mixing positions of different games, as in selfplay.
 - `.\katago.exe dumpsparsenn -model <MODEL> -output <JSON>` — Writes inputs and CPU reference outputs for the PyTorch parity test (`python/tests/test_sparse_dots_cpp_parity.py`).
 - `.\katago.exe dumpsparse <SGF>` — Prints the sparse Dots input of a position as JSON.
 - `.\katago.exe version` — Prints engine version, git commit, build type, backend, and board dimensions.
