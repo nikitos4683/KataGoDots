@@ -48,6 +48,20 @@ NUM_FUTUREPOS_OUTPUTS = 2
 COORD_SCALE = 1.0 / 40.0
 COUNT_SCALE = 1.0 / 20.0
 
+# Initial learnable RoPE frequencies, rad per point along x and y. Up to pi (instead of 1 as in the dense model)
+# so that from the start a head can tell a point from its neighbor: without a grid, the exact neighborhood of
+# a dot or a candidate is seen only through RoPE.
+ROPE_FREQ_INIT_MIN = 1.0 / 50.0
+ROPE_FREQ_INIT_MAX = math.pi
+
+
+def init_rope_freqs(num_heads: int, num_pairs: int) -> torch.Tensor:
+    """Log-uniform magnitudes in [ROPE_FREQ_INIT_MIN, ROPE_FREQ_INIT_MAX] with random signs, [num_heads, num_pairs, 2]."""
+    log_magnitudes = torch.empty(num_heads, num_pairs, 2).uniform_(math.log(ROPE_FREQ_INIT_MIN), math.log(ROPE_FREQ_INIT_MAX))
+    magnitudes = torch.exp(log_magnitudes)
+    signs = (torch.randint(0, 2, (num_heads, num_pairs, 2)) * 2 - 1).float()
+    return magnitudes * signs
+
 # Keys of the batch dict (training data arrays, docs/DotsSparseNN.md 7.2)
 INPUT_KEYS = [
     "boardSizeN", "globalInputNC",
@@ -312,15 +326,7 @@ class CrossAttentionBlock(torch.nn.Module):
         self.k_proj = torch.nn.Linear(c_kv, num_heads * head_dim, bias=False)
         self.v_proj = torch.nn.Linear(c_kv, num_heads * head_dim, bias=False)
         self.out_proj = torch.nn.Linear(num_heads * head_dim, c_query, bias=False)
-        # Same initialization as the learnable RoPE of TransformerAttentionBlock
-        num_pairs = head_dim // 2
-        log_lo = math.log(1.0 / 50.0)
-        log_hi = math.log(1.0)
-        init_freqs = (
-            torch.exp(torch.empty(num_heads, num_pairs, 2).uniform_(log_lo, log_hi))
-            * (torch.randint(0, 2, (num_heads, num_pairs, 2)) * 2 - 1).float()
-        )
-        self.rope_freqs = torch.nn.Parameter(init_freqs)
+        self.rope_freqs = torch.nn.Parameter(init_rope_freqs(num_heads, head_dim // 2))
 
     def add_reg_dict(self, reg_dict: Dict[str, List]):
         for name, param in self.named_parameters():
@@ -571,6 +577,7 @@ class SparseDotsModel(torch.nn.Module):
             for sub in block.blockstack:
                 if isinstance(sub, TransformerAttentionBlock):
                     sub.__class__ = SparseRoPEAttentionBlock
+                    sub.rope_freqs = torch.nn.Parameter(init_rope_freqs(*sub.rope_freqs.shape[:2]))
             self.blocks.append(block)
         self.norm_trunkfinal = SparseRMSNormMask(self.c_trunk)
         self.act_trunkfinal = act(self.activation)
