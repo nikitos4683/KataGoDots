@@ -54,6 +54,7 @@ int MainCmds::runtests(const vector<string>& args) {
   Tests::runDotsBoardHistoryGroundingTests();
   Tests::runDotsPosHashTests();
   Tests::runDotsStartPosTests();
+  Tests::runDotsSgfStartPosesTests();
 
   Tests::runDotsSymmetryTests();
   Tests::runDotsOwnershipTests();

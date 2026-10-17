@@ -80,6 +80,23 @@ const InitialPosition* ForkData::getSeki(Rand& rand) {
 
 //------------------------------------------------------------------------------------------------
 
+//Whether a sample is the other one with fewer moves (or the same)
+static bool isSameGameSample(const Sgf::PositionSample& sample, const Sgf::PositionSample& other) {
+  if(sample.board.x_size != other.board.x_size || sample.board.y_size != other.board.y_size ||
+     sample.board.pos_hash != other.board.pos_hash || sample.board.ko_loc != other.board.ko_loc ||
+     sample.nextPla != other.nextPla || sample.initialTurnNumber != other.initialTurnNumber ||
+     //A hint is the move after all moves of its sample
+     sample.hintLoc != Board::NULL_LOC || other.hintLoc != Board::NULL_LOC ||
+     sample.weight != other.weight || sample.trainingWeight != other.trainingWeight || sample.metadata != other.metadata)
+    return false;
+  const size_t numMoves = std::min(sample.moves.size(), other.moves.size());
+  for(size_t i = 0; i<numMoves; i++) {
+    if(!movesEqual(sample.moves[i], other.moves[i]))
+      return false;
+  }
+  return true;
+}
+
 GameInitializer::GameInitializer(ConfigParser& cfg, Logger& logger)
   :createGameMutex(),rand()
 {
@@ -150,7 +167,11 @@ void GameInitializer::initShared(ConfigParser& cfg, Logger& logger) {
   if (allowedSuicideLegals.empty())
     throw IOError("multiStoneSuicideLegals or " + SUICIDE_LEGALS_KEY + " must have at least one value in " + cfg.getFileName());
 
-  if (cfg.contains(START_POSES_KEY) || dotsGame) {
+  //Dots games from SGF positions are played under the rules of their SGFs (see getDotsRulesOfSample),
+  //so startPoses is needed only if some games start from scratch.
+  const bool allGamesFromSgfPoses = cfg.contains("startPosesFromSgfDir") && cfg.getDouble("startPosesProb",0.0,1.0) >= 1.0;
+  const bool startPosesRequired = dotsGame && !allGamesFromSgfPoses;
+  if (cfg.contains(START_POSES_KEY) || startPosesRequired) {
     auto allowedStartPosRuleStrs = cfg.getStrings(START_POSES_KEY, Rules::startPosStrings());
     for(const auto& allowedStartPosRuleStr : allowedStartPosRuleStrs)
       allowedStartPosRules.push_back(Rules::parseStartPos(allowedStartPosRuleStr));
@@ -158,7 +179,7 @@ void GameInitializer::initShared(ConfigParser& cfg, Logger& logger) {
       throw IOError(START_POSES_KEY + " must have at least one value in " + cfg.getFileName());
   }
 
-  if (cfg.contains(START_POSES_ARE_RANDOM_KEY) || dotsGame) {
+  if (cfg.contains(START_POSES_ARE_RANDOM_KEY) || startPosesRequired) {
     allowedStartPosRandomRules = cfg.getBools(START_POSES_ARE_RANDOM_KEY);
     if(allowedStartPosRandomRules.empty())
       throw IOError(START_POSES_ARE_RANDOM_KEY + " must have at least one value in " + cfg.getFileName());
@@ -256,19 +277,25 @@ void GameInitializer::initShared(ConfigParser& cfg, Logger& logger) {
   sgfCompensateKomiProb = cfg.getOrDefaultDouble("sgfCompensateKomiProb", 0.0, 1.0, forkCompensateKomiProb);
   komiAllowIntegerProb = cfg.getOrDefaultDouble("komiAllowIntegerProb", 0.0, 1.0, 1.0);
 
-  auto generateCumProbs = [](const vector<Sgf::PositionSample>& poses, double lambda, double& effectiveSampleSize) {
+  //The positions are the samples poses[getSampleIdx(i)] with getNumMoves(i) of their moves
+  auto generateCumProbs = [](
+    const vector<Sgf::PositionSample>& poses, size_t numPositions,
+    const std::function<size_t(size_t)>& getSampleIdx, const std::function<size_t(size_t)>& getNumMoves,
+    double lambda, double& effectiveSampleSize
+  ) {
     int64_t minInitialTurnNumber = 0;
     for(size_t i = 0; i<poses.size(); i++)
       minInitialTurnNumber = std::min(minInitialTurnNumber, poses[i].initialTurnNumber);
 
     vector<double> cumProbs;
-    cumProbs.resize(poses.size());
+    cumProbs.resize(numPositions);
     // Fill with uncumulative probs
-    for(size_t i = 0; i<poses.size(); i++) {
-      int64_t startTurn = poses[i].getCurrentTurnNumber() - minInitialTurnNumber;
-      cumProbs[i] = exp(-startTurn * lambda) * poses[i].weight;
+    for(size_t i = 0; i<numPositions; i++) {
+      const Sgf::PositionSample& pos = poses[getSampleIdx(i)];
+      int64_t startTurn = std::max((int64_t)0, pos.initialTurnNumber + (int64_t)getNumMoves(i)) - minInitialTurnNumber;
+      cumProbs[i] = exp(-startTurn * lambda) * pos.weight;
     }
-    for(size_t i = 0; i<poses.size(); i++) {
+    for(size_t i = 0; i<numPositions; i++) {
       if(!(cumProbs[i] > -1e200 && cumProbs[i] < 1e200)) {
         throw StringError("startPos found bad unnormalized probability: " + Global::doubleToString(cumProbs[i]));
       }
@@ -277,14 +304,14 @@ void GameInitializer::initShared(ConfigParser& cfg, Logger& logger) {
     // Compute ESS
     double sum = 0.0;
     double sumSq = 0.0;
-    for(size_t i = 0; i<poses.size(); i++) {
+    for(size_t i = 0; i<numPositions; i++) {
       sum += cumProbs[i];
       sumSq += cumProbs[i]*cumProbs[i];
     }
     effectiveSampleSize = sum * sum / (sumSq + 1e-200);
 
     // Make cumulative
-    for(size_t i = 1; i<poses.size(); i++)
+    for(size_t i = 1; i<numPositions; i++)
       cumProbs[i] += cumProbs[i-1];
 
     return cumProbs;
@@ -292,10 +319,7 @@ void GameInitializer::initShared(ConfigParser& cfg, Logger& logger) {
 
   startPosesProb = 0.0;
   if(string startPosesFromSgfDir; cfg.tryGetString("startPosesFromSgfDir", startPosesFromSgfDir)) {
-    if (!allowedStartPosRules.empty()) {
-      throw StringError("startPosesFromSgfDir is not compatible with " + START_POSES_KEY + ". Please specify only one key.");
-    }
-
+    startPosSamples.clear();
     startPoses.clear();
     startPosCumProbs.clear();
     startPosesProb = cfg.getDouble("startPosesProb",0.0,1.0);
@@ -307,8 +331,9 @@ void GameInitializer::initShared(ConfigParser& cfg, Logger& logger) {
 
     vector<string> files;
     FileHelpers::collectSgfsFromDirs(dirs,files);
+    FileHelpers::collectMultiSgfsFromDirs(dirs,files);
     std::set<Hash128> excludeHashes = Sgf::readExcludes(excludes);
-    logger.write("Found " + Global::uint64ToString(files.size()) + " sgf files");
+    logger.write("Found " + Global::uint64ToString(files.size()) + " sgf and sgfs files");
     logger.write("Loaded " + Global::uint64ToString(excludeHashes.size()) + " excludes");
     std::set<Hash128> uniqueHashes;
     std::function<void(Sgf::PositionSample&, const BoardHistory&, const string&)> posHandler = [startPosesLoadProb,this](
@@ -316,35 +341,56 @@ void GameInitializer::initShared(ConfigParser& cfg, Logger& logger) {
     ) {
       (void)hist;
       (void)comments;
-      if(rand.nextBool(startPosesLoadProb))
-        startPoses.push_back(posSample);
-    };
-    int64_t numExcluded = 0;
-    for(size_t i = 0; i<files.size(); i++) {
-      std::unique_ptr<Sgf> sgf = nullptr;
-      try {
-        sgf = Sgf::loadFile(files[i]);
-        if(contains(excludeHashes,sgf->hash))
-          numExcluded += 1;
-        else {
-          bool hashComments = false;
-          bool hashParent = false;
-          bool flipIfPassOrWFirst = true;
-          bool allowGameOver = false;
-          sgf->iterAllUniquePositions(uniqueHashes, hashComments, hashParent, flipIfPassOrWFirst, allowGameOver, NULL, posHandler);
+      if(!rand.nextBool(startPosesLoadProb))
+        return;
+      if(!startPosSamples.empty()) {
+        Sgf::PositionSample& lastSample = startPosSamples.back();
+        if(isSameGameSample(lastSample, posSample)) {
+          if(posSample.moves.size() > lastSample.moves.size())
+            lastSample.moves.insert(lastSample.moves.end(), posSample.moves.begin() + lastSample.moves.size(), posSample.moves.end());
+          startPoses.push_back({startPosSamples.size() - 1, posSample.moves.size()});
+          return;
         }
       }
-      catch(const StringError& e) {
-        logger.write("Invalid SGF " + files[i] + ": " + e.what());
+      startPosSamples.push_back(posSample);
+      startPoses.push_back({startPosSamples.size() - 1, posSample.moves.size()});
+    };
+    int64_t numExcluded = 0;
+    int64_t numSgfs = 0;
+    for(size_t i = 0; i<files.size(); i++) {
+      //A .sgfs file (as written by selfplay) has a game per line
+      std::vector<std::unique_ptr<Sgf>> sgfs = Sgf::loadSgfOrSgfsLogAndIgnoreErrors(files[i],logger);
+      for(const std::unique_ptr<Sgf>& sgf : sgfs) {
+        numSgfs += 1;
+        try {
+          if(contains(excludeHashes,sgf->hash))
+            numExcluded += 1;
+          else {
+            bool hashComments = false;
+            bool hashParent = false;
+            bool flipIfPassOrWFirst = true;
+            bool allowGameOver = false;
+            sgf->iterAllUniquePositions(uniqueHashes, hashComments, hashParent, flipIfPassOrWFirst, allowGameOver, NULL, posHandler);
+          }
+        }
+        catch(const StringError& e) {
+          logger.write("Invalid SGF " + files[i] + ": " + e.what());
+        }
       }
     }
-    logger.write("Kept " + Global::uint64ToString(startPoses.size()) + " start positions");
-    logger.write("Excluded " + Global::int64ToString(numExcluded) + "/" + Global::uint64ToString(files.size()) + " sgf files");
+    logger.write("Kept " + Global::uint64ToString(startPoses.size()) + " start positions in " + Global::uint64ToString(startPosSamples.size()) + " samples");
+    logger.write("Excluded " + Global::int64ToString(numExcluded) + "/" + Global::int64ToString(numSgfs) + " sgfs");
 
     double ess = 0.0;
-    startPosCumProbs = generateCumProbs(startPoses, startPosesTurnWeightLambda, ess);
+    startPosCumProbs = generateCumProbs(
+      startPosSamples, startPoses.size(),
+      [this](size_t i) { return startPoses[i].sampleIdx; }, [this](size_t i) { return startPoses[i].numMoves; },
+      startPosesTurnWeightLambda, ess
+    );
 
     if(startPoses.size() <= 0) {
+      if(dotsGame && allowedStartPosRules.empty())
+        throw IOError("No start positions loaded from startPosesFromSgfDir and " + START_POSES_KEY + " isn't specified in " + cfg.getFileName());
       logger.write("No start positions loaded, disabling start position logic");
       startPosesProb = 0;
     }
@@ -393,7 +439,11 @@ void GameInitializer::initShared(ConfigParser& cfg, Logger& logger) {
     logger.write("Loaded " + Global::uint64ToString(hintPoses.size()) + " hint positions");
 
     double ess = 0.0;
-    hintPosCumProbs = generateCumProbs(hintPoses, 0.0, ess);
+    hintPosCumProbs = generateCumProbs(
+      hintPoses, hintPoses.size(),
+      [](size_t i) { return i; }, [this](size_t i) { return hintPoses[i].moves.size(); },
+      0.0, ess
+    );
 
     if(hintPoses.size() <= 0) {
       logger.write("No hint positions loaded, disabling hint position logic");
@@ -547,6 +597,28 @@ Rules GameInitializer::createRulesUnsynchronized() {
   return rules;
 }
 
+//A Dots game from a position sample goes on under the rules of the sample: its moves make another position under
+//other rules (e.g. of the capture of empty bases). The start pos is recognized from the dots of the sample's board,
+//the same way as from the placements of an SGF, so that the written SGF of the game loads back. A sample from an SGF
+//is the start of its game with all moves (see Sgf::PositionSample::writePosOfHist).
+static Rules getDotsRulesOfSample(const Board& sampleBoard, float komi) {
+  if(!sampleBoard.isDots())
+    throw StringError("A Go position can't start a Dots game");
+  Rules rules = sampleBoard.rules;
+  rules.komi = komi;
+  vector<Move> dots = sampleBoard.start_pos_moves;
+  if(dots.empty()) {
+    int numBlackDots, numWhiteDots;
+    dots = sampleBoard.getCurrentMoves(numBlackDots, numWhiteDots, true);
+  }
+  vector<Move> startPosMoves;
+  bool randomized;
+  vector<Move> remainingMoves;
+  rules.startPos = Rules::recognizeStartPos(dots, sampleBoard.x_size, sampleBoard.y_size, startPosMoves, randomized, &remainingMoves);
+  rules.startPosIsRandom = randomized || sampleBoard.rules.startPosIsRandom;
+  return rules;
+}
+
 void GameInitializer::createGameSharedUnsynchronized(
   Board& board, Player& pla, BoardHistory& hist,
   ExtraBlackAndKomi& extraBlackAndKomi,
@@ -602,33 +674,43 @@ void GameInitializer::createGameSharedUnsynchronized(
   Rules rules = createRulesUnsynchronized();
 
   const Sgf::PositionSample* posSample = NULL;
-  if(startPosSample != NULL)
+  //The position is posSample with this number of its moves
+  size_t numPosSampleMoves = 0;
+  if(startPosSample != NULL) {
     posSample = startPosSample;
+    numPosSampleMoves = posSample->moves.size();
+  }
 
   if(posSample == NULL) {
     if(startPosesProb > 0 && rand.nextBool(startPosesProb)) {
       testAssert(startPoses.size() > 0);
       size_t r = rand.nextIndexCumulative(startPosCumProbs.data(),startPosCumProbs.size());
       assert(r < startPosCumProbs.size());
-      posSample = &(startPoses[r]);
+      posSample = &(startPosSamples[startPoses[r].sampleIdx]);
+      numPosSampleMoves = startPoses[r].numMoves;
     }
     else if(hintPosesProb > 0 && rand.nextBool(hintPosesProb)) {
       testAssert(hintPoses.size() > 0);
       size_t r = rand.nextIndexCumulative(hintPosCumProbs.data(),hintPosCumProbs.size());
       assert(r < hintPosCumProbs.size());
       posSample = &(hintPoses[r]);
+      numPosSampleMoves = posSample->moves.size();
     }
   }
 
   if(posSample != NULL) {
     const Sgf::PositionSample& startPos = *posSample;
     board = startPos.board;
+    if(dotsGame) {
+      rules = getDotsRulesOfSample(startPos.board, rules.komi);
+      board.rules = rules;
+    }
     pla = startPos.nextPla;
     hist.clear(board,pla,rules,0);
     hist.setInitialTurnNumber(startPos.initialTurnNumber);
     Loc hintLoc = startPos.hintLoc;
-    testAssert(startPos.moves.size() < 0xFFFFFF);
-    for(size_t i = 0; i<startPos.moves.size(); i++) {
+    testAssert(numPosSampleMoves <= startPos.moves.size() && numPosSampleMoves < 0xFFFFFF);
+    for(size_t i = 0; i<numPosSampleMoves; i++) {
       bool isLegal = hist.isLegal(board,startPos.moves[i].loc,startPos.moves[i].pla);
       //Makes a best effort to still use the position, stopping if we hit an illegal move. It's possible
       //we hit this because of rules differences making a superko move or self-capture illegal, for example.

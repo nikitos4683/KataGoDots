@@ -23,6 +23,8 @@ namespace Tests {
   void runDotsBoardHistoryGroundingTests();
   void runDotsPosHashTests();
   void runDotsStartPosTests();
+  //testdotssgfstartposes.cpp
+  void runDotsSgfStartPosesTests();
 
   enum CheckingMode {
     REGULAR,
