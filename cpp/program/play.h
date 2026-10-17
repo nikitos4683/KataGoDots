@@ -176,7 +176,14 @@ class GameInitializer {
   double noResultStdev;
   double drawRandRadius;
 
-  std::vector<Sgf::PositionSample> startPoses;
+  //A start position is a number of moves of a sample: the positions of an SGF that only add moves to the previous one
+  //share its sample, which keeps all positions of a Dots game in one sample (see Sgf::PositionSample::writePosOfHist).
+  struct StartPos {
+    size_t sampleIdx;
+    size_t numMoves;
+  };
+  std::vector<Sgf::PositionSample> startPosSamples;
+  std::vector<StartPos> startPoses;
   std::vector<double> startPosCumProbs;
   double startPosesProb;
 

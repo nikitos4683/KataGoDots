@@ -172,6 +172,27 @@ static Rules getRulesFromSgf(const SgfNode& rootNode, const int xSize, const int
   return rules;
 }
 
+//Places the root placements of a Dots SGF: the recognized start pos as start pos dots (as Board::setStartPos does),
+//then the remaining placements.
+static bool setDotsRootPlacements(Board& board, const vector<Move>& placements) {
+  vector<Move> startPosMoves;
+  bool randomized;
+  vector<Move> remainingMoves;
+  Rules::recognizeStartPos(placements, board.x_size, board.y_size, startPosMoves, randomized, &remainingMoves);
+  return board.setStonesFailIfNoLibs(startPosMoves, true) && board.setStonesFailIfNoLibs(remainingMoves);
+}
+
+//Dots positions are played under the rules of their SGF (start pos, suicide, capture of empty bases),
+//Go positions under tolerant Tromp-Taylor-like rules.
+static Rules getRulesForIteratingPositions(const vector<std::unique_ptr<SgfNode>>& nodes, bool isDots, int xSize, int ySize) {
+  if(isDots)
+    return nodes.empty() ? Rules::DEFAULT_DOTS : getRulesFromSgf(*nodes[0], xSize, ySize, &Rules::DEFAULT_DOTS);
+  Rules rules = Rules::getTrompTaylorish();
+  rules.koRule = Rules::KO_SITUATIONAL;
+  rules.multiStoneSuicideLegal = true;
+  return rules;
+}
+
 bool SgfNode::hasProperty(const char* key) const {
   if(props == nullptr)
     return false;
@@ -829,14 +850,10 @@ void Sgf::iterAllUniquePositions(
   int xSize = size.x;
   int ySize = size.y;
 
-  Rules rules = Rules::getDefaultOrTrompTaylorish(isDots);
+  Rules rules = getRulesForIteratingPositions(nodes, isDots, xSize, ySize);
   Player nextPla = nodes.size() > 0 ? nodes[0]->getPLSpecifiedColor() : C_EMPTY;
   if(nextPla == C_EMPTY)
     nextPla = C_BLACK;
-  if (!isDots) {
-    rules.koRule = Rules::KO_SITUATIONAL;
-    rules.multiStoneSuicideLegal = true;
-  }
   Board board(xSize,ySize,rules);
   BoardHistory hist(board,nextPla,rules,0,BoardHistoryModes());
 
@@ -863,11 +880,7 @@ void Sgf::iterAllPositions(
   Player nextPla = nodes.size() > 0 ? nodes[0]->getPLSpecifiedColor() : C_EMPTY;
   if(nextPla == C_EMPTY)
     nextPla = C_BLACK;
-  Rules rules = Rules::getDefaultOrTrompTaylorish(isDots);
-  if (!isDots) {
-    rules.koRule = Rules::KO_SITUATIONAL;
-    rules.multiStoneSuicideLegal = true;
-  }
+  Rules rules = getRulesForIteratingPositions(nodes, isDots, xSize, ySize);
   Board board(xSize,ySize,rules);
   BoardHistory hist(board,nextPla,rules,0,BoardHistoryModes());
 
@@ -955,7 +968,7 @@ void Sgf::iterAllPositionsHelper(
           }
         }
         else {
-          bool suc = board.setStonesFailIfNoLibs(buf);
+          bool suc = rules.isDots && isRoot && i == 0 ? setDotsRootPlacements(board,buf) : board.setStonesFailIfNoLibs(buf);
           if(!suc) {
             throw StringError(
               "Illegal placements in " + fileName + " SGF trace (branches 0-indexed): " + buildTrace(i)
@@ -1006,7 +1019,8 @@ void Sgf::iterAllPositionsHelper(
       // ruleSuicideIllegal - a multi-stone self-capture that the rules in force forbid
       bool tolerantLegal = hist.isLegalTolerant(board,moveLoc,movePla);
       bool simpleKoBanned = board.isKoBanned(moveLoc);
-      bool superKoIllegal = hist.superKoBanned[moveLoc];
+      // Dots has no superko (the history doesn't even allocate superKoBanned)
+      bool superKoIllegal = !rules.isDots && hist.superKoBanned[moveLoc];
       bool ruleSuicideIllegal = moveLoc != Board::PASS_LOC && board.isIllegalSuicide(moveLoc,movePla,rules.multiStoneSuicideLegal);
 
       // Ko/superko/out-of-turn are history-or-turn-order violations of an otherwise-normal board transition, so we
@@ -1092,6 +1106,18 @@ void Sgf::iterAllPositionsHelper(
 }
 
 void Sgf::PositionSample::writePosOfHist(PositionSample& sampleBuf, const BoardHistory& hist, Player nextPla) {
+  if(hist.rules.isDots) {
+    //A Dots board isn't defined by its dots (bases and captures depend on the order of moves), and a game from it
+    //should be written with its real start pos, so a Dots sample is the initial board with all moves of the history.
+    sampleBuf.board = hist.initialBoard;
+    sampleBuf.nextPla = hist.moveHistory.empty() ? nextPla : hist.moveHistory[0].pla;
+    sampleBuf.moves = hist.moveHistory;
+    sampleBuf.initialTurnNumber = hist.initialTurnNumber;
+    sampleBuf.hintLoc = Board::NULL_LOC;
+    sampleBuf.weight = 1.0;
+    return;
+  }
+
   //Snap the position 5 turns ago so as to include 5 moves of history.
   static_assert(BoardHistory::NUM_RECENT_BOARDS > 5, "");
   int turnsAgoToSnap = 0;
@@ -1175,7 +1201,8 @@ void Sgf::samplePositionHelper(
 
   Sgf::PositionSample::writePosOfHist(sampleBuf, hist, nextPla);
 
-  if(flipIfPassOrWFirst) {
+  //A pass ends a Dots game, and the colors of a Dots position can't be flipped without replaying it
+  if(flipIfPassOrWFirst && !hist.rules.isDots) {
     if(hist.hasBlackPassOrWhiteFirst())
       sampleBuf = sampleBuf.getColorFlipped();
   }
