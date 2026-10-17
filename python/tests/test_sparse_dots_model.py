@@ -299,11 +299,10 @@ def test_export_round_trip(tmp_path, decoder_layers):
     assert torch.allclose(ownership[point_mask], ownership_l[point_mask], atol=1e-5)
 
 
-@pytest.mark.parametrize("name", ["b5c384h6nbttflrs-fson-silu-rsnh", "b5c384h6nbttflrs-fson-silu-rsnh-dec2"])
-def test_target_kind_is_sparse(name):
-    config = modelconfigs.get_config(name, dots=True)
+def test_target_kind_is_sparse():
+    config = modelconfigs.get_config("b5c384h6nbttflrs-fson-silu-rsnh", dots=True)
     assert config["sparse_dots"] and config["version"] == modelconfigs.SPARSE_DOTS_VERSION
-    assert config["candidate_decoder_layers"] == (2 if name.endswith("-dec2") else 1)
+    assert config["candidate_decoder_layers"] == 1
 
 
 @pytest.mark.parametrize("name, reason", [

@@ -2139,12 +2139,8 @@ for name, base_config in list(config_of_name.items()):
 
 # Sparse Dots models (model version 18), see docs/DotsSparseNN.md --------------------------------------------------
 # For Dots, every transformer config name gives the sparse model with the same trunk: the convolutional stem is
-# replaced by token embeddings and the policy head by a candidate decoder. Optional suffixes for comparisons:
-#   -dec2    two candidate decoder layers instead of one
+# replaced by token embeddings and the policy head by a candidate decoder (one layer).
 SPARSE_DOTS_VERSION = 18
-SPARSE_DOTS_SUFFIXES = {
-    "-dec2": {"candidate_decoder_layers": 2},
-}
 # What the sparse model implements (in PyTorch, the export, the CPU reference and CUDA).
 # Trunk block kinds: internal length of the nested bottleneck. The C++ FFN is SwiGLU only.
 SPARSE_DOTS_TRUNK_BLOCK_KINDS = {
@@ -2204,17 +2200,8 @@ def get_config(name: str, dots: bool) -> ModelConfig:
     """Config of the model name for the game. Dots configs are always sparse."""
     if not dots:
         return config_of_name[name]
-    overrides = {}
-    stripped = True
-    while stripped:
-        stripped = False
-        for suffix, suffix_overrides in SPARSE_DOTS_SUFFIXES.items():
-            if name.endswith(suffix):
-                name = name[:-len(suffix)]
-                overrides.update(suffix_overrides)
-                stripped = True
     error = sparse_dots_config_error(config_of_name[name])
     if error is not None:
         raise ValueError(f"Model kind {name} can't be a Dots model: {error}. Dots models are sparse, "
                          f"see docs/DotsSparseNN.md; the target kind is b5c384h6nbttflrs-fson-silu-rsnh")
-    return make_sparse_dots_config(config_of_name[name], overrides)
+    return make_sparse_dots_config(config_of_name[name])
