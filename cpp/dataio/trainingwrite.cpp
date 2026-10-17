@@ -665,6 +665,7 @@ void TrainingWriteBuffers::addRow(
   //Expected time of arrival of winloss variance, in turns
   {
     double sum = 0.0;
+    double totalVariance = 0.0;
     for(int i = whiteValueTargetsIdx+1; i<whiteValueTargets.size(); i++) {
       int turnsFromNow = i-whiteValueTargetsIdx;
       const ValueTargets& prevTargets = whiteValueTargets[i-1];
@@ -673,7 +674,14 @@ void TrainingWriteBuffers::addRow(
       double nextWL = targets.win - targets.loss;
       double variance = (nextWL - prevWL) * (nextWL - prevWL);
       sum += turnsFromNow * variance;
+      totalVariance += variance;
     }
+    // In a game the value usually goes from about 0 to +-1, a total variance of about 1, and the sum is the time
+    // until the game is decided. In long Dots games with a noisy value (an untrained net, few visits) the total
+    // variance grows with the length and the target with its square (up to ~300000 turns on 39x32), which blows up
+    // the training. So beyond 1 it is normalized: the target stays at most the number of the remaining turns.
+    if(hist.rules.isDots && totalVariance > 1.0)
+      sum /= totalVariance;
     rowGlobal[22] = (float)sum;
   }
 
