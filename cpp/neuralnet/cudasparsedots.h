@@ -6,25 +6,32 @@
 // [rows, channels] row-major: position n owns the rows [segStart[n], segStart[n+1]), and rowSeg[r] is the position
 // of row r. The trunk rows of a position are [GLOBAL][POINT x P], its query rows are [candidates][grounding].
 // Activations T are float or half, parameters (scales, biases, norm weights) are always float, and all
-// the arithmetic is in float.
+// the arithmetic is in float. The elementwise kernels need the channels (and the row strides and head dims of RoPE)
+// to be multiples of 8 and the rows 16-byte aligned.
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-void sparseDotsCopyToHalf(const float* in, half* out, long long n, cudaStream_t stream);
+// n elements, 16-byte aligned
 void sparseDotsCopyFromHalf(const half* in, float* out, long long n, cudaStream_t stream);
 
-// dst[dstRows[r], :] = src[r, :] for r < numRows
-void sparseDotsScatterRows(const float* src, float* dst, const int* dstRows, int numRows, int channels, cudaStream_t stream);
+// The trunk rows of the embedded tokens: for row r of position n = rowSeg[r], the first row of the position (GLOBAL)
+// is globalToken + g[n], the other rows are the points (point i of the position at row segStart[n] + 1 + i, its
+// features at pointFeat[r - n - 1]): pointFeat * weight + bias + g[n], where g[n] = globalFeat[n] * globalWeight.
+// The weights are [features x channels] row-major.
+template <typename T>
+void sparseDotsEmbedTokens(
+  T* out, const float* pointFeat, const float* weight, const float* bias, int numFeatures, const float* globalToken,
+  const float* globalFeat, const float* globalWeight, int numGlobalFeatures, const int* rowSeg, const int* segStart,
+  int rows, int channels, cudaStream_t stream);
 
-// For every row r of position n = rowSeg[r]: the first row of the position (GLOBAL) becomes globalToken + globalProj[n],
-// the other rows get globalProj[n] added.
-void sparseDotsAddGlobal(
-  float* seq, const float* globalToken, const float* globalProj, const int* rowSeg, const int* segStart, int rows,
-  int channels, cudaStream_t stream);
-
-// x[r, :] += v[rowSeg[r], :]
-void sparseDotsAddRowVector(float* x, const float* v, const int* rowSeg, int rows, int channels, cudaStream_t stream);
+// The decoder rows of the embedded queries: row r is candidate rowSrc[r] >= 0 (candFeat * candWeight + candBias) or
+// grounding -rowSrc[r] - 1 (groundFeat * groundWeight + groundBias, one feature), plus poolProj[rowSeg[r]].
+template <typename T>
+void sparseDotsEmbedQueries(
+  T* out, const float* candFeat, const float* candWeight, const float* candBias, int numCandFeatures,
+  const float* groundFeat, const float* groundWeight, const float* groundBias, const float* poolProj, const int* rowSeg,
+  const int* rowSrc, int rows, int channels, cudaStream_t stream);
 
 // out = act(in * scale + bias)
 template <typename T>
@@ -40,20 +47,16 @@ void sparseDotsBiasAct(T* buf, const float* bias, long long rows, int channels, 
 template <typename T>
 void sparseDotsRMSNorm(const T* in, T* out, const float* weight, long long rows, int channels, float epsilon, cudaStream_t stream);
 
-// x += delta
-template <typename T>
-void sparseDotsResidualAdd(T* x, const T* delta, long long rows, int channels, cudaStream_t stream);
-
 // ab [rows, 2 * channels] holds a then g in each row: a = silu(a) * g, in place (g is left as is)
 template <typename T>
 void sparseDotsSwiGLU(T* ab, long long rows, int channels, cudaStream_t stream);
 
-// RMSNorm over all the rows and channels of each position, then out = act(x * inv * gamma + beta).
-// sumSqBuf has numSegs floats. In place is fine.
+// RMSNorm over all the rows and channels of each position, then out = act(x * inv * gamma + beta), also written
+// to outFloat if not null (as out converted to float). sumSqBuf has numSegs floats. In place is fine.
 template <typename T>
 void sparseDotsSpatialRMSNorm(
-  const T* in, T* out, const float* gamma, const float* beta, const int* rowSeg, const int* segStart, int numSegs, int rows,
-  int channels, float epsilon, int activation, float* sumSqBuf, cudaStream_t stream);
+  const T* in, T* out, float* outFloat, const float* gamma, const float* beta, const int* rowSeg, const int* segStart,
+  int numSegs, int rows, int channels, float epsilon, int activation, float* sumSqBuf, cudaStream_t stream);
 
 // Rotates the interleaved pairs (2p, 2p+1) of every head of x [rows, rowStride] (heads at the start of the row) by the
 // angles x_r * fx + y_r * fy, where pos [rows, 3] holds (x, y, hasPosition) and freqs [numKVHeads * numPairs, 2]
@@ -88,6 +91,12 @@ void sparseDotsAttention(
 // where off = boardOffset[n] = sqrt(xSize * ySize) - 14.
 void sparseDotsPool(
   const float* x, const int* segStart, const float* boardOffset, float* out, int numSegs, int channels, bool valueHeadMode,
+  cudaStream_t stream);
+
+// out [rows, outC] = act(in [rows, inC] * weight [inC x outC] + bias), FP32, bias may be null. For the few rows of
+// the positions (one per position), where cuBLAS has too little parallelism.
+void sparseDotsSmallMatMul(
+  const float* in, const float* weight, const float* bias, float* out, int rows, int inC, int outC, int activation,
   cudaStream_t stream);
 
 #endif  // NEURALNET_CUDASPARSEDOTS_H_
