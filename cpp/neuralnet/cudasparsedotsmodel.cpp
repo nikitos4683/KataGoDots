@@ -236,8 +236,10 @@ struct SparseDotsCudaModel::Impl {
   Logger* logger;
   bool loggedMma = false;
 
-  // Stage timing for development, enabled by the environment variable KATAGO_SPARSE_DOTS_PROFILE
-  const bool profiling = std::getenv("KATAGO_SPARSE_DOTS_PROFILE") != nullptr;
+  // Stage timing for development, enabled by the environment variable KATAGO_SPARSE_DOTS_PROFILE.
+  // 2 also times the operations of the trunk and the decoder (the many events slow down small batches).
+  const int profileLevel = profileLevelFromEnv();
+  const bool profiling = profileLevel > 0;
   vector<cudaEvent_t> profileEvents;
   vector<string> profileNames;
   map<string, double> profileMs;
@@ -253,7 +255,17 @@ struct SparseDotsCudaModel::Impl {
     profileEvents.push_back(event);
     profileNames.push_back(name);
   }
-  void finishProfile(double hostMs, int rows) {
+  void markDetail(const char* name) {
+    if(profileLevel >= 2)
+      mark(name);
+  }
+  static int profileLevelFromEnv() {
+    const char* value = std::getenv("KATAGO_SPARSE_DOTS_PROFILE");
+    if(value == nullptr)
+      return 0;
+    return std::max(1, std::atoi(value));
+  }
+  void finishProfile(double hostMs, double launchMs, int rows) {
     if(!profiling)
       return;
     for(size_t i = 1; i < profileEvents.size(); i++) {
@@ -266,6 +278,7 @@ struct SparseDotsCudaModel::Impl {
     profileEvents.clear();
     profileNames.clear();
     profileMs["host pack"] += hostMs;
+    profileMs["host launch"] += launchMs;
     profileCalls++;
     profileRows += rows;
     if(profileCalls % 50 == 0) {
@@ -315,8 +328,7 @@ struct SparseDotsCudaModel::Impl {
   DeviceBuf inputDev;
   // Work buffers. qkv, att and ffn are shared by the trunk and the decoder, which run one after another.
   DeviceBuf seqF, trunkH, tmp, mid, midN, qkv, att, ffn, sumSq;
-  DeviceBuf pointEmb, globalProj;
-  DeviceBuf pooled, poolProj, queriesF, queriesH, queriesNorm, candEmb, groundEmb, dq, policyH, policy;
+  DeviceBuf pooled, poolProj, queriesF, queriesH, queriesNorm, dq, policyH, policy;
   DeviceBuf outV1, pooledV, outV2, value, scoreValue, ownershipOut;
 
   Impl(const SparseDotsDesc& desc, bool fp16, bool mma, cudaStream_t stream_, cublasHandle_t cublas_, Logger* logger_)
@@ -376,6 +388,9 @@ struct SparseDotsCudaModel::Impl {
 
     cand.init(desc.candMul, &desc.candBias, false);
     ground.init(desc.groundMul, &desc.groundBias, false);
+    // Read directly by the embedding kernels
+    testAssert(point.outC == trunkChannels && global.outC == trunkChannels && cand.outC == decoderChannels);
+    testAssert(ground.inC == 1 && ground.outC == decoderChannels);
     pool.init(desc.poolMul, nullptr, false);
     testAssert(desc.decoderAttention.size() == desc.decoderFFN.size());
     for(size_t l = 0; l < desc.decoderAttention.size(); l++) {
@@ -431,6 +446,12 @@ struct SparseDotsCudaModel::Impl {
       sparseDotsBiasAct<float>((float*)out, layer.b.f(), rows, layer.outC, activation, stream);
   }
 
+  // The same for an FP32 layer and the few rows of the positions
+  void smallMatMul(const Linear& layer, const float* in, int rows, float* out, int activation = ACTIVATION_IDENTITY) {
+    testAssert(!layer.useFP16);
+    sparseDotsSmallMatMul(in, layer.w.f(), layer.b.f(), out, rows, layer.inC, layer.outC, activation, stream);
+  }
+
   // The rows of the batch (fixed for one evaluate call)
   struct Batch {
     int n = 0;          // number of positions
@@ -441,12 +462,13 @@ struct SparseDotsCudaModel::Impl {
     int totalPoints = 0, totalCands = 0, totalGrounds = 0;
     vector<int> tokStartHost, qStartHost;
     // Device pointers into inputDev
-    float* pointFeat; int* pointDst;
+    float* pointFeat;
     float* global; float* boardOffset;
     int* tokStart; int* tokSeg; float* tokPos; int* tokCode;
-    float* candFeat; int* candDst;
-    float* groundFeat; int* groundDst;
-    int* qStart; int* qSeg; float* qPos;
+    float* candFeat;
+    float* groundFeat;
+    // qSrc: the candidate of a query row (>= 0) or -1 - its grounding
+    int* qStart; int* qSeg; int* qSrc; float* qPos;
   };
 
   void pack(const vector<const DotsSparseInput*>& inputs, const vector<int>& symmetries, Batch& b) {
@@ -470,7 +492,6 @@ struct SparseDotsCudaModel::Impl {
 
     Layout layout;
     const size_t oPointFeat = layout.reserve(sizeof(float) * b.totalPoints * SparseDotsNN::NUM_POINT_FEATURES);
-    const size_t oPointDst = layout.reserve(sizeof(int) * b.totalPoints);
     const size_t oGlobal = layout.reserve(sizeof(float) * b.n * NNInputs::NUM_FEATURES_GLOBAL_DOTS_SPARSE);
     const size_t oBoardOffset = layout.reserve(sizeof(float) * b.n);
     const size_t oTokStart = layout.reserve(sizeof(int) * (b.n + 1));
@@ -478,27 +499,24 @@ struct SparseDotsCudaModel::Impl {
     const size_t oTokPos = layout.reserve(sizeof(float) * 3 * b.tokens);
     const size_t oTokCode = layout.reserve(sizeof(int) * b.tokens);
     const size_t oCandFeat = layout.reserve(sizeof(float) * b.totalCands * SparseDotsNN::NUM_CAND_FEATURES);
-    const size_t oCandDst = layout.reserve(sizeof(int) * b.totalCands);
     const size_t oGroundFeat = layout.reserve(sizeof(float) * b.totalGrounds);
-    const size_t oGroundDst = layout.reserve(sizeof(int) * b.totalGrounds);
     const size_t oQStart = layout.reserve(sizeof(int) * (b.n + 1));
     const size_t oQSeg = layout.reserve(sizeof(int) * b.queries);
+    const size_t oQSrc = layout.reserve(sizeof(int) * b.queries);
     const size_t oQPos = layout.reserve(sizeof(float) * 3 * b.queries);
     hostIn.ensure(layout.size);
 
     char* h = hostIn.ptr;
     float* pointFeat = (float*)(h + oPointFeat);
-    int* pointDst = (int*)(h + oPointDst);
     float* global = (float*)(h + oGlobal);
     float* boardOffset = (float*)(h + oBoardOffset);
     int* tokSeg = (int*)(h + oTokSeg);
     float* tokPos = (float*)(h + oTokPos);
     int* tokCode = (int*)(h + oTokCode);
     float* candFeat = (float*)(h + oCandFeat);
-    int* candDst = (int*)(h + oCandDst);
     float* groundFeat = (float*)(h + oGroundFeat);
-    int* groundDst = (int*)(h + oGroundDst);
     int* qSeg = (int*)(h + oQSeg);
+    int* qSrc = (int*)(h + oQSrc);
     float* qPos = (float*)(h + oQPos);
     std::memcpy(h + oTokStart, b.tokStartHost.data(), sizeof(int) * (b.n + 1));
     std::memcpy(h + oQStart, b.qStartHost.data(), sizeof(int) * (b.n + 1));
@@ -536,7 +554,6 @@ struct SparseDotsCudaModel::Impl {
         DotsSparseInput::applySymmetry(p.x, p.y, in.xSize, in.ySize, symmetry, x, y);
         SparseDotsNN::pointFeaturesAt(p, x, y, xSize, ySize, pointFeat + (size_t)(pointRow + i) * SparseDotsNN::NUM_POINT_FEATURES);
         const int row = tokenBase + 1 + i;
-        pointDst[pointRow + i] = row;
         tokSeg[row] = n;
         tokPos[3 * row] = (float)x;
         tokPos[3 * row + 1] = (float)y;
@@ -551,7 +568,7 @@ struct SparseDotsCudaModel::Impl {
         DotsSparseInput::applySymmetry(cnd.x, cnd.y, in.xSize, in.ySize, symmetry, x, y);
         SparseDotsNN::candidateFeaturesAt(cnd, x, y, xSize, ySize, candFeat + (size_t)(candRow + i) * SparseDotsNN::NUM_CAND_FEATURES);
         const int row = queryBase + i;
-        candDst[candRow + i] = row;
+        qSrc[row] = candRow + i;
         qSeg[row] = n;
         qPos[3 * row] = (float)x;
         qPos[3 * row + 1] = (float)y;
@@ -560,7 +577,7 @@ struct SparseDotsCudaModel::Impl {
       if(in.groundAllowed) {
         const int row = queryBase + numCands;
         groundFeat[groundRow] = SparseDotsNN::groundFeature(in);
-        groundDst[groundRow] = row;
+        qSrc[row] = -1 - groundRow;
         groundRow++;
         qSeg[row] = n;
         qPos[3 * row] = 0.0f;
@@ -577,7 +594,6 @@ struct SparseDotsCudaModel::Impl {
     char* d = (char*)inputDev.ptr;
     CUDA_ERR("SparseDotsCudaModel", cudaMemcpyAsync(d, h, layout.size, cudaMemcpyHostToDevice, stream));
     b.pointFeat = (float*)(d + oPointFeat);
-    b.pointDst = (int*)(d + oPointDst);
     b.global = (float*)(d + oGlobal);
     b.boardOffset = (float*)(d + oBoardOffset);
     b.tokStart = (int*)(d + oTokStart);
@@ -585,11 +601,10 @@ struct SparseDotsCudaModel::Impl {
     b.tokPos = (float*)(d + oTokPos);
     b.tokCode = (int*)(d + oTokCode);
     b.candFeat = (float*)(d + oCandFeat);
-    b.candDst = (int*)(d + oCandDst);
     b.groundFeat = (float*)(d + oGroundFeat);
-    b.groundDst = (int*)(d + oGroundDst);
     b.qStart = (int*)(d + oQStart);
     b.qSeg = (int*)(d + oQSeg);
+    b.qSrc = (int*)(d + oQSrc);
     b.qPos = (float*)(d + oQPos);
   }
 
@@ -613,19 +628,16 @@ struct SparseDotsCudaModel::Impl {
     ffn.ensure(std::max(tokens * 2 * maxFFN, queries * 2 * maxDecFFN) * actBytes);
     sumSq.ensure((size_t)b.n * fb);
 
-    pointEmb.ensure((size_t)b.totalPoints * c * fb);
-    globalProj.ensure((size_t)b.n * c * fb);
-
     pooled.ensure((size_t)b.n * 3 * c * fb);
     poolProj.ensure((size_t)b.n * cd * fb);
-    queriesF.ensure(queries * cd * fb);
     if(useFP16) {
       queriesH.ensure(queries * cd * actBytes);
       policyH.ensure(queries * decoderOut.outC * actBytes);
     }
+    else {
+      queriesF.ensure(queries * cd * fb);
+    }
     queriesNorm.ensure(queries * cd * actBytes);
-    candEmb.ensure((size_t)b.totalCands * cd * fb);
-    groundEmb.ensure((size_t)b.totalGrounds * cd * fb);
     dq.ensure(queries * maxDecQDim * actBytes);
     policy.ensure(queries * decoderOut.outC * fb);
 
@@ -670,24 +682,33 @@ struct SparseDotsCudaModel::Impl {
     T* attT = (T*)att.ptr;
     const int stride = layer.qkv.outC;
     sparseDotsRMSNorm<T>(midT, midNT, layer.normWeight.f(), rows, midChannels, layer.epsilon, stream);
+    markDetail("trunk norm");
     gemm(layer.qkv, midNT, rows, qkvT);
+    markDetail("trunk qkv");
     T* qT = qkvT;
     T* kT = qkvT + layer.qDim();
     T* vT = kT + layer.kDim();
     sparseDotsApplyRopeQK<T>(qT, kT, layer.ropeFreqs.f(), b.tokPos, (int)rows, layer.numHeads, layer.numKVHeads, layer.qHeadDim,
                              stride, stride, stream);
+    markDetail("trunk rope");
     attention<T>(layer, qT, kT, vT, attT, b.tokStart, b.tokStart, b.n, b.maxTokens, stride, stride, b.tokCode);
+    markDetail("trunk attention");
     gemm(layer.out, attT, rows, midT, true);
+    markDetail("trunk attention out");
   }
 
-  // x += FFN(x)
+  // x += FFN(x). trunk selects the names of the profile.
   template <typename T>
-  void ffnResidual(const FFN& layer, T* x, T* xNorm, long long rows) {
+  void ffnResidual(const FFN& layer, T* x, T* xNorm, long long rows, bool trunk) {
     T* ab = (T*)ffn.ptr;
     sparseDotsRMSNorm<T>(x, xNorm, layer.normWeight.f(), rows, layer.linear1Gate.inC, layer.epsilon, stream);
+    markDetail(trunk ? "trunk norm" : "decoder norm");
     gemm(layer.linear1Gate, xNorm, rows, ab);
+    markDetail(trunk ? "trunk ffn linear1+gate" : "decoder ffn linear1+gate");
     sparseDotsSwiGLU<T>(ab, rows, layer.channels, stream);
+    markDetail(trunk ? "trunk ffn swiglu" : "decoder ffn swiglu");
     gemm(layer.linear2, ab, rows, x, true, ACTIVATION_IDENTITY, 2 * layer.channels);
+    markDetail(trunk ? "trunk ffn linear2" : "decoder ffn linear2");
   }
 
   // Runs the trunk in place, ends with the tip norm
@@ -701,20 +722,24 @@ struct SparseDotsCudaModel::Impl {
       sparseDotsScaleBiasAct<T>(trunk, tmpT, block->preScale.f(), block->preBias.f(), rows, trunkChannels,
                                 block->preActivation, stream);
       gemm(block->preConv, tmpT, rows, midT);
+      markDetail("trunk 1x1 convs");
       size_t attentionIdx = 0;
       size_t ffnIdx = 0;
       for(bool isAttention : block->isAttention) {
         if(isAttention)
           trunkAttention<T>(*block->attentions[attentionIdx++], b);
         else
-          ffnResidual<T>(*block->ffns[ffnIdx++], midT, midNT, rows);
+          ffnResidual<T>(*block->ffns[ffnIdx++], midT, midNT, rows, true);
       }
       sparseDotsScaleBiasAct<T>(midT, midNT, block->postScale.f(), block->postBias.f(), rows, midChannels,
                                 block->postActivation, stream);
       gemm(block->postConv, midNT, rows, trunk, true);
+      markDetail("trunk 1x1 convs");
     }
-    sparseDotsSpatialRMSNorm<T>(trunk, trunk, tipGamma.f(), tipBeta.f(), b.tokSeg, b.tokStart, b.n, b.tokens, trunkChannels,
-                                tipEpsilon, tipActivation, sumSq.f(), stream);
+    // In FP16 the norm also writes the FP32 copy of the trunk (seq) for the pooling and the value head
+    sparseDotsSpatialRMSNorm<T>(trunk, trunk, std::is_same<T, half>::value ? seqF.f() : nullptr, tipGamma.f(), tipBeta.f(),
+                                b.tokSeg, b.tokStart, b.n, b.tokens, trunkChannels, tipEpsilon, tipActivation, sumSq.f(),
+                                stream);
   }
 
   // Runs the decoder layers on the embedded queries, writes the logits to policy (FP32) or policyH (FP16)
@@ -731,16 +756,22 @@ struct SparseDotsCudaModel::Impl {
       const Attention& layer = *decoderAttentions[l];
       const int kvStride = layer.kv.outC;
       sparseDotsRMSNorm<T>(query, queryNorm, layer.normWeight.f(), numQueries, cd, layer.epsilon, stream);
+      markDetail("decoder norm");
       gemm(layer.q, queryNorm, numQueries, dqT);
+      markDetail("decoder q");
       gemm(layer.kv, trunk, tokens, kvT);
+      markDetail("decoder kv of trunk");
       sparseDotsApplyRope<T>(dqT, layer.ropeFreqs.f(), b.qPos, (int)numQueries, layer.numHeads, layer.numKVHeads,
                              layer.qHeadDim, layer.qDim(), stream);
       sparseDotsApplyRope<T>(kvT, layer.ropeFreqs.f(), b.tokPos, (int)tokens, layer.numKVHeads, layer.numKVHeads,
                              layer.qHeadDim, kvStride, stream);
+      markDetail("decoder rope");
       attention<T>(layer, dqT, kvT, kvT + layer.kDim(), attT, b.qStart, b.tokStart, b.n, b.maxQueries, layer.qDim(), kvStride,
                    nullptr);
+      markDetail("decoder attention");
       gemm(layer.out, attT, numQueries, query, true);
-      ffnResidual<T>(*decoderFFNs[l], query, queryNorm, numQueries);
+      markDetail("decoder attention out");
+      ffnResidual<T>(*decoderFFNs[l], query, queryNorm, numQueries, false);
     }
     sparseDotsRMSNorm<T>(query, queryNorm, decoderNormWeight.f(), numQueries, cd, decoderNormEpsilon, stream);
     gemm(decoderOut, queryNorm, numQueries, std::is_same<T, half>::value ? policyH.ptr : policy.ptr);
@@ -757,49 +788,46 @@ struct SparseDotsCudaModel::Impl {
     ensureBuffers(b);
     const double hostMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - hostStart).count();
     mark("start");
+    const auto launchStart = std::chrono::steady_clock::now();
     const long long tokens = b.tokens;
     const long long queries = b.queries;
     const int c = trunkChannels;
     const int cd = decoderChannels;
 
-    // Embeddings in FP32 --------------------------------------------------------------------------------------------
+    // Embeddings, computed in FP32 and written in the type of the trunk ---------------------------------------------
     float* seq = seqF.f();
-    gemm(point, b.pointFeat, b.totalPoints, pointEmb.ptr);
-    sparseDotsScatterRows(pointEmb.f(), seq, b.pointDst, b.totalPoints, c, stream);
-    gemm(global, b.global, b.n, globalProj.ptr);
-    sparseDotsAddGlobal(seq, globalToken.f(), globalProj.f(), b.tokSeg, b.tokStart, b.tokens, c, stream);
+    if(useFP16)
+      sparseDotsEmbedTokens<half>((half*)trunkH.ptr, b.pointFeat, point.w.f(), point.b.f(), point.inC, globalToken.f(),
+                                  b.global, global.w.f(), global.inC, b.tokSeg, b.tokStart, b.tokens, c, stream);
+    else
+      sparseDotsEmbedTokens<float>(seq, b.pointFeat, point.w.f(), point.b.f(), point.inC, globalToken.f(), b.global,
+                                   global.w.f(), global.inC, b.tokSeg, b.tokStart, b.tokens, c, stream);
     mark("embeddings");
 
-    // Trunk -----------------------------------------------------------------------------------------------------------
-    if(useFP16) {
-      sparseDotsCopyToHalf(seq, (half*)trunkH.ptr, tokens * c, stream);
+    // Trunk, its FP32 copy (seq) is written by the tip norm -----------------------------------------------------------
+    if(useFP16)
       runTrunk<half>((half*)trunkH.ptr, b);
-      sparseDotsCopyFromHalf((const half*)trunkH.ptr, seq, tokens * c, stream);
-    }
-    else {
+    else
       runTrunk<float>(seq, b);
-    }
     const float* trunk = seq;
     mark("trunk");
 
     // Candidate decoder ---------------------------------------------------------------------------------------------
     if(queries > 0) {
       sparseDotsPool(trunk, b.tokStart, b.boardOffset, pooled.f(), b.n, c, false, stream);
-      gemm(pool, pooled.ptr, b.n, poolProj.ptr);
-      // Every query row is a candidate or a grounding row, so the scatters fill all of them
-      float* queryF = queriesF.f();
-      gemm(cand, b.candFeat, b.totalCands, candEmb.ptr);
-      sparseDotsScatterRows(candEmb.f(), queryF, b.candDst, b.totalCands, cd, stream);
-      gemm(ground, b.groundFeat, b.totalGrounds, groundEmb.ptr);
-      sparseDotsScatterRows(groundEmb.f(), queryF, b.groundDst, b.totalGrounds, cd, stream);
-      sparseDotsAddRowVector(queryF, poolProj.f(), b.qSeg, b.queries, cd, stream);
+      smallMatMul(pool, pooled.f(), b.n, poolProj.f());
       if(useFP16) {
-        sparseDotsCopyToHalf(queryF, (half*)queriesH.ptr, queries * cd, stream);
+        sparseDotsEmbedQueries<half>((half*)queriesH.ptr, b.candFeat, cand.w.f(), cand.b.f(), cand.inC, b.groundFeat,
+                                     ground.w.f(), ground.b.f(), poolProj.f(), b.qSeg, b.qSrc, b.queries, cd, stream);
+        markDetail("decoder queries");
         runDecoder<half>((const half*)trunkH.ptr, (half*)queriesH.ptr, b);
         sparseDotsCopyFromHalf((const half*)policyH.ptr, policy.f(), queries * decoderOut.outC, stream);
       }
       else {
-        runDecoder<float>(trunk, queryF, b);
+        sparseDotsEmbedQueries<float>(queriesF.f(), b.candFeat, cand.w.f(), cand.b.f(), cand.inC, b.groundFeat,
+                                      ground.w.f(), ground.b.f(), poolProj.f(), b.qSeg, b.qSrc, b.queries, cd, stream);
+        markDetail("decoder queries");
+        runDecoder<float>(trunk, queriesF.f(), b);
       }
     }
     mark("decoder");
@@ -807,9 +835,9 @@ struct SparseDotsCudaModel::Impl {
     // Value head in FP32 ----------------------------------------------------------------------------------------------
     gemm(v1, trunk, tokens, outV1.ptr, false, v1Activation);
     sparseDotsPool(outV1.f(), b.tokStart, b.boardOffset, pooledV.f(), b.n, v1.outC, true, stream);
-    gemm(v2, pooledV.ptr, b.n, outV2.ptr, false, v2Activation);
-    gemm(v3, outV2.ptr, b.n, value.ptr);
-    gemm(sv3, outV2.ptr, b.n, scoreValue.ptr);
+    smallMatMul(v2, pooledV.f(), b.n, outV2.f(), v2Activation);
+    smallMatMul(v3, outV2.f(), b.n, value.f());
+    smallMatMul(sv3, outV2.f(), b.n, scoreValue.f());
     gemm(ownership, outV1.ptr, tokens, ownershipOut.ptr);
     CUDA_ERR("SparseDotsCudaModel", cudaPeekAtLastError());
     mark("value head");
@@ -832,8 +860,9 @@ struct SparseDotsCudaModel::Impl {
     CUDA_ERR("SparseDotsCudaModel", cudaMemcpyAsync(hostOut.ptr + oScore, scoreValue.ptr, sizeof(float) * b.n * 6, cudaMemcpyDeviceToHost, stream));
     CUDA_ERR("SparseDotsCudaModel", cudaMemcpyAsync(hostOut.ptr + oOwnership, ownershipOut.ptr, sizeof(float) * tokens, cudaMemcpyDeviceToHost, stream));
     mark("download");
+    const double launchMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - launchStart).count();
     CUDA_ERR("SparseDotsCudaModel", cudaStreamSynchronize(stream));
-    finishProfile(hostMs, b.n);
+    finishProfile(hostMs, launchMs, b.n);
 
     outputs.resize(b.n);
     for(int n = 0; n < b.n; n++) {

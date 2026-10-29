@@ -116,7 +116,7 @@ selfplay (C++)                                      train.py (PyTorch)
 | `katago benchsparsenn -model M [-sgfs F] [-batch-size B] [-threads T]` | Скорость сети на батчах из позиций разных партий и стадий, как в selfplay |
 | `katago dumpsparse <sgf>` | Вход позиции в JSON |
 | `katago dumpsparsenn -model M -output F` | Входы и выходы CPU-эталона для сверки с PyTorch |
-| `KATAGO_SPARSE_DOTS_PROFILE=1` | CUDA печатает время стадий каждые 50 вызовов |
+| `KATAGO_SPARSE_DOTS_PROFILE=1` | CUDA печатает время стадий каждые 50 вызовов (`=2` — и операций ствола и декодера) |
 
 Тесты: `katago runtests` (в том числе стресс-тест входа на случайных партиях: области, цепи, выигрыши ходов, симметрии), `pytest` (`test_sparse_dots_*`: модель, данные, экспорт, паритет PyTorch ↔ C++).
 

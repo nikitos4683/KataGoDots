@@ -2,7 +2,10 @@
 
 #include "../neuralnet/cudasparsedots.h"
 
+#include <climits>
 #include <stdexcept>
+#include <string>
+#include <type_traits>
 
 #include "../neuralnet/activations.h"
 
@@ -29,95 +32,197 @@ __device__ __forceinline__ float activate(float x, int activation) {
   }
 }
 
+// The elementwise kernels give each thread VEC consecutive elements of a row (one 16-byte load for half), so the
+// channels, the row strides and the offsets of the heads must be multiples of VEC (checked on the host). The
+// indexes are 32-bit: a 64-bit division or remainder per element cost more than the arithmetic of these kernels.
+constexpr int VEC = 8;
+
+__device__ __forceinline__ void loadVec(const half* p, float* v) {
+  const uint4 raw = *reinterpret_cast<const uint4*>(p);
+  const half2* h = reinterpret_cast<const half2*>(&raw);
+  #pragma unroll
+  for(int i = 0; i < VEC / 2; i++) {
+    const float2 f = __half22float2(h[i]);
+    v[2 * i] = f.x;
+    v[2 * i + 1] = f.y;
+  }
+}
+__device__ __forceinline__ void loadVec(const float* p, float* v) {
+  const float4 a = reinterpret_cast<const float4*>(p)[0];
+  const float4 b = reinterpret_cast<const float4*>(p)[1];
+  v[0] = a.x; v[1] = a.y; v[2] = a.z; v[3] = a.w;
+  v[4] = b.x; v[5] = b.y; v[6] = b.z; v[7] = b.w;
+}
+__device__ __forceinline__ void storeVec(half* p, const float* v) {
+  uint4 raw;
+  half2* h = reinterpret_cast<half2*>(&raw);
+  #pragma unroll
+  for(int i = 0; i < VEC / 2; i++)
+    h[i] = __floats2half2_rn(v[2 * i], v[2 * i + 1]);
+  *reinterpret_cast<uint4*>(p) = raw;
+}
+__device__ __forceinline__ void storeVec(float* p, const float* v) {
+  reinterpret_cast<float4*>(p)[0] = make_float4(v[0], v[1], v[2], v[3]);
+  reinterpret_cast<float4*>(p)[1] = make_float4(v[4], v[5], v[6], v[7]);
+}
+
+static void checkVec(long long rows, int channels, const char* name) {
+  if(channels % VEC != 0)
+    throw std::runtime_error(std::string(name) + ": channels must be a multiple of 8");
+  if(rows * channels / VEC > INT_MAX)
+    throw std::runtime_error(std::string(name) + ": too many rows");
+}
+
 //------------------------------------------------------------------------------------------------------------------
 
-template <typename From, typename To>
-__global__ void sparseDotsConvertKernel(const From* in, To* out, long long n) {
-  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i < n)
-    out[i] = fromFloat<To>(toFloat(in[i]));
+// A vector per thread, the last thread converts the elements after the last full vector one by one
+__global__ void sparseDotsCopyFromHalfKernel(const half* in, float* out, int n) {
+  const int begin = (blockIdx.x * blockDim.x + threadIdx.x) * VEC;
+  if(begin + VEC <= n) {
+    float x[VEC];
+    loadVec(in + begin, x);
+    storeVec(out + begin, x);
+  }
+  else {
+    for(int i = begin; i < n; i++)
+      out[i] = __half2float(in[i]);
+  }
 }
 
-void sparseDotsCopyToHalf(const float* in, half* out, long long n, cudaStream_t stream) {
-  if(n > 0)
-    sparseDotsConvertKernel<float, half><<<numBlocksFor(n, 256), 256, 0, stream>>>(in, out, n);
-}
 void sparseDotsCopyFromHalf(const half* in, float* out, long long n, cudaStream_t stream) {
+  if(n + VEC > INT_MAX)
+    throw std::runtime_error("sparseDotsCopyFromHalf: too many elements");
   if(n > 0)
-    sparseDotsConvertKernel<half, float><<<numBlocksFor(n, 256), 256, 0, stream>>>(in, out, n);
+    sparseDotsCopyFromHalfKernel<<<numBlocksFor((n + VEC - 1) / VEC, 256), 256, 0, stream>>>(in, out, (int)n);
 }
 
 //------------------------------------------------------------------------------------------------------------------
 
-__global__ void sparseDotsScatterRowsKernel(const float* src, float* dst, const int* dstRows, int numRows, int channels) {
-  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i >= (long long)numRows * channels)
-    return;
-  int r = (int)(i / channels);
-  int c = (int)(i % channels);
-  dst[(long long)dstRows[r] * channels + c] = src[i];
-}
-
-void sparseDotsScatterRows(const float* src, float* dst, const int* dstRows, int numRows, int channels, cudaStream_t stream) {
-  if(numRows <= 0)
-    return;
-  long long n = (long long)numRows * channels;
-  sparseDotsScatterRowsKernel<<<numBlocksFor(n, 256), 256, 0, stream>>>(src, dst, dstRows, numRows, channels);
-}
-
-//------------------------------------------------------------------------------------------------------------------
-
-__global__ void sparseDotsAddGlobalKernel(
-  float* seq, const float* globalToken, const float* globalProj, const int* rowSeg, const int* segStart, int rows, int channels
+// A thread computes VEC channels of a row: the features of the row are loaded once for all of them
+template <typename T>
+__global__ void sparseDotsEmbedTokensKernel(
+  T* out, const float* pointFeat, const float* weight, const float* bias, int numFeatures, const float* globalToken,
+  const float* globalFeat, const float* globalWeight, int numGlobalFeatures, const int* rowSeg, const int* segStart,
+  int numVecs, int rowVecs, int channels
 ) {
-  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i >= (long long)rows * channels)
+  const int v = blockIdx.x * blockDim.x + threadIdx.x;
+  if(v >= numVecs)
     return;
-  int c = (int)(i % channels);
-  int r = (int)(i / channels);
-  int n = rowSeg[r];
-  float g = globalProj[(long long)n * channels + c];
-  if(r == segStart[n])
-    seq[i] = globalToken[c] + g;
-  else
-    seq[i] += g;
+  const int r = v / rowVecs;
+  const int c = (v - r * rowVecs) * VEC;
+  const int n = rowSeg[r];
+  float x[VEC];
+  if(r == segStart[n]) {
+    loadVec(globalToken + c, x);
+  }
+  else {
+    // Every position has one GLOBAL row before its points
+    const float* f = pointFeat + (size_t)(r - n - 1) * numFeatures;
+    loadVec(bias + c, x);
+    for(int k = 0; k < numFeatures; k++) {
+      const float fk = f[k];
+      float w[VEC];
+      loadVec(weight + (size_t)k * channels + c, w);
+      #pragma unroll
+      for(int j = 0; j < VEC; j++)
+        x[j] += fk * w[j];
+    }
+  }
+  const float* gf = globalFeat + (size_t)n * numGlobalFeatures;
+  for(int k = 0; k < numGlobalFeatures; k++) {
+    const float fk = gf[k];
+    float w[VEC];
+    loadVec(globalWeight + (size_t)k * channels + c, w);
+    #pragma unroll
+    for(int j = 0; j < VEC; j++)
+      x[j] += fk * w[j];
+  }
+  storeVec(out + (size_t)v * VEC, x);
 }
 
-void sparseDotsAddGlobal(
-  float* seq, const float* globalToken, const float* globalProj, const int* rowSeg, const int* segStart, int rows,
-  int channels, cudaStream_t stream
+template <typename T>
+void sparseDotsEmbedTokens(
+  T* out, const float* pointFeat, const float* weight, const float* bias, int numFeatures, const float* globalToken,
+  const float* globalFeat, const float* globalWeight, int numGlobalFeatures, const int* rowSeg, const int* segStart,
+  int rows, int channels, cudaStream_t stream
 ) {
-  long long n = (long long)rows * channels;
-  if(n > 0)
-    sparseDotsAddGlobalKernel<<<numBlocksFor(n, 256), 256, 0, stream>>>(seq, globalToken, globalProj, rowSeg, segStart, rows, channels);
+  checkVec(rows, channels, "sparseDotsEmbedTokens");
+  const int numVecs = (int)((long long)rows * channels / VEC);
+  if(numVecs > 0)
+    sparseDotsEmbedTokensKernel<T><<<numBlocksFor(numVecs, 256), 256, 0, stream>>>(
+      out, pointFeat, weight, bias, numFeatures, globalToken, globalFeat, globalWeight, numGlobalFeatures, rowSeg,
+      segStart, numVecs, channels / VEC, channels);
 }
 
-__global__ void sparseDotsAddRowVectorKernel(float* x, const float* v, const int* rowSeg, int rows, int channels) {
-  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i >= (long long)rows * channels)
+template <typename T>
+__global__ void sparseDotsEmbedQueriesKernel(
+  T* out, const float* candFeat, const float* candWeight, const float* candBias, int numCandFeatures,
+  const float* groundFeat, const float* groundWeight, const float* groundBias, const float* poolProj, const int* rowSeg,
+  const int* rowSrc, int numVecs, int rowVecs, int channels
+) {
+  const int v = blockIdx.x * blockDim.x + threadIdx.x;
+  if(v >= numVecs)
     return;
-  int c = (int)(i % channels);
-  int r = (int)(i / channels);
-  x[i] += v[(long long)rowSeg[r] * channels + c];
+  const int r = v / rowVecs;
+  const int c = (v - r * rowVecs) * VEC;
+  const int src = rowSrc[r];
+  float x[VEC], w[VEC];
+  if(src >= 0) {
+    const float* f = candFeat + (size_t)src * numCandFeatures;
+    loadVec(candBias + c, x);
+    for(int k = 0; k < numCandFeatures; k++) {
+      const float fk = f[k];
+      loadVec(candWeight + (size_t)k * channels + c, w);
+      #pragma unroll
+      for(int j = 0; j < VEC; j++)
+        x[j] += fk * w[j];
+    }
+  }
+  else {
+    const float fg = groundFeat[-src - 1];
+    loadVec(groundBias + c, x);
+    loadVec(groundWeight + c, w);
+    #pragma unroll
+    for(int j = 0; j < VEC; j++)
+      x[j] += fg * w[j];
+  }
+  loadVec(poolProj + (size_t)rowSeg[r] * channels + c, w);
+  #pragma unroll
+  for(int j = 0; j < VEC; j++)
+    x[j] += w[j];
+  storeVec(out + (size_t)v * VEC, x);
 }
 
-void sparseDotsAddRowVector(float* x, const float* v, const int* rowSeg, int rows, int channels, cudaStream_t stream) {
-  long long n = (long long)rows * channels;
-  if(n > 0)
-    sparseDotsAddRowVectorKernel<<<numBlocksFor(n, 256), 256, 0, stream>>>(x, v, rowSeg, rows, channels);
+template <typename T>
+void sparseDotsEmbedQueries(
+  T* out, const float* candFeat, const float* candWeight, const float* candBias, int numCandFeatures,
+  const float* groundFeat, const float* groundWeight, const float* groundBias, const float* poolProj, const int* rowSeg,
+  const int* rowSrc, int rows, int channels, cudaStream_t stream
+) {
+  checkVec(rows, channels, "sparseDotsEmbedQueries");
+  const int numVecs = (int)((long long)rows * channels / VEC);
+  if(numVecs > 0)
+    sparseDotsEmbedQueriesKernel<T><<<numBlocksFor(numVecs, 256), 256, 0, stream>>>(
+      out, candFeat, candWeight, candBias, numCandFeatures, groundFeat, groundWeight, groundBias, poolProj, rowSeg,
+      rowSrc, numVecs, channels / VEC, channels);
 }
 
 //------------------------------------------------------------------------------------------------------------------
 
 template <typename T>
 __global__ void sparseDotsScaleBiasActKernel(
-  const T* in, T* out, const float* scale, const float* bias, long long rows, int channels, int activation
+  const T* in, T* out, const float* scale, const float* bias, int numVecs, int rowVecs, int activation
 ) {
-  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i >= rows * channels)
+  const int v = blockIdx.x * blockDim.x + threadIdx.x;
+  if(v >= numVecs)
     return;
-  int c = (int)(i % channels);
-  out[i] = fromFloat<T>(activate(toFloat(in[i]) * scale[c] + bias[c], activation));
+  const int c = (v % rowVecs) * VEC;
+  float x[VEC];
+  loadVec(in + (size_t)v * VEC, x);
+  #pragma unroll
+  for(int j = 0; j < VEC; j++)
+    x[j] = activate(x[j] * scale[c + j] + bias[c + j], activation);
+  storeVec(out + (size_t)v * VEC, x);
 }
 
 template <typename T>
@@ -125,9 +230,11 @@ void sparseDotsScaleBiasAct(
   const T* in, T* out, const float* scale, const float* bias, long long rows, int channels, int activation,
   cudaStream_t stream
 ) {
-  long long n = rows * channels;
-  if(n > 0)
-    sparseDotsScaleBiasActKernel<T><<<numBlocksFor(n, 256), 256, 0, stream>>>(in, out, scale, bias, rows, channels, activation);
+  checkVec(rows, channels, "sparseDotsScaleBiasAct");
+  const int numVecs = (int)(rows * channels / VEC);
+  if(numVecs > 0)
+    sparseDotsScaleBiasActKernel<T><<<numBlocksFor(numVecs, 256), 256, 0, stream>>>(
+      in, out, scale, bias, numVecs, channels / VEC, activation);
 }
 
 template <typename T>
@@ -150,62 +257,67 @@ void sparseDotsBiasAct(T* buf, const float* bias, long long rows, int channels, 
 
 // One warp per row
 template <typename T>
-__global__ void sparseDotsRMSNormKernel(const T* in, T* out, const float* weight, long long rows, int channels, float epsilon) {
-  long long row = ((long long)blockIdx.x * blockDim.x + threadIdx.x) / 32;
-  int lane = threadIdx.x % 32;
+__global__ void sparseDotsRMSNormKernel(
+  const T* in, T* out, const float* weight, int rows, int channels, float epsilon
+) {
+  const int row = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  const int lane = threadIdx.x % 32;
   if(row >= rows)
     return;
-  const T* x = in + row * channels;
+  const T* x = in + (size_t)row * channels;
   float sumSq = 0.0f;
-  for(int c = lane; c < channels; c += 32) {
-    float v = toFloat(x[c]);
-    sumSq += v * v;
+  float v[VEC];
+  for(int c = lane * VEC; c < channels; c += 32 * VEC) {
+    loadVec(x + c, v);
+    #pragma unroll
+    for(int j = 0; j < VEC; j++)
+      sumSq += v[j] * v[j];
   }
   for(int offset = 16; offset > 0; offset /= 2)
     sumSq += __shfl_xor_sync(0xffffffff, sumSq, offset);
-  float inv = rsqrtf(sumSq / (float)channels + epsilon);
-  T* o = out + row * channels;
-  for(int c = lane; c < channels; c += 32)
-    o[c] = fromFloat<T>(toFloat(x[c]) * inv * weight[c]);
+  const float inv = rsqrtf(sumSq / (float)channels + epsilon);
+  T* o = out + (size_t)row * channels;
+  for(int c = lane * VEC; c < channels; c += 32 * VEC) {
+    loadVec(x + c, v);
+    #pragma unroll
+    for(int j = 0; j < VEC; j++)
+      v[j] = v[j] * inv * weight[c + j];
+    storeVec(o + c, v);
+  }
 }
 
 template <typename T>
 void sparseDotsRMSNorm(const T* in, T* out, const float* weight, long long rows, int channels, float epsilon, cudaStream_t stream) {
+  checkVec(rows, channels, "sparseDotsRMSNorm");
+  if(rows * 32 > INT_MAX)
+    throw std::runtime_error("sparseDotsRMSNorm: too many rows");
   if(rows > 0)
-    sparseDotsRMSNormKernel<T><<<numBlocksFor(rows * 32, 128), 128, 0, stream>>>(in, out, weight, rows, channels, epsilon);
+    sparseDotsRMSNormKernel<T><<<numBlocksFor(rows * 32, 128), 128, 0, stream>>>(in, out, weight, (int)rows, channels, epsilon);
 }
 
 template <typename T>
-__global__ void sparseDotsResidualAddKernel(T* x, const T* delta, long long n) {
-  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i < n)
-    x[i] = fromFloat<T>(toFloat(x[i]) + toFloat(delta[i]));
-}
-
-template <typename T>
-void sparseDotsResidualAdd(T* x, const T* delta, long long rows, int channels, cudaStream_t stream) {
-  long long n = rows * channels;
-  if(n > 0)
-    sparseDotsResidualAddKernel<T><<<numBlocksFor(n, 256), 256, 0, stream>>>(x, delta, n);
-}
-
-template <typename T>
-__global__ void sparseDotsSwiGLUKernel(T* ab, long long rows, int channels) {
-  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i >= rows * channels)
+__global__ void sparseDotsSwiGLUKernel(T* ab, int numVecs, int rowVecs, int channels) {
+  const int v = blockIdx.x * blockDim.x + threadIdx.x;
+  if(v >= numVecs)
     return;
-  long long r = i / channels;
-  int c = (int)(i % channels);
-  T* a = ab + r * 2 * channels + c;
-  float v = toFloat(*a);
-  *a = fromFloat<T>(v / (1.0f + __expf(-v)) * toFloat(a[channels]));
+  const int r = v / rowVecs;
+  const int c = (v - r * rowVecs) * VEC;
+  T* a = ab + (size_t)r * 2 * channels + c;
+  float x[VEC], g[VEC];
+  loadVec(a, x);
+  loadVec(a + channels, g);
+  #pragma unroll
+  for(int j = 0; j < VEC; j++)
+    x[j] = x[j] / (1.0f + __expf(-x[j])) * g[j];
+  storeVec(a, x);
 }
 
 template <typename T>
 void sparseDotsSwiGLU(T* ab, long long rows, int channels, cudaStream_t stream) {
-  long long n = rows * channels;
-  if(n > 0)
-    sparseDotsSwiGLUKernel<T><<<numBlocksFor(n, 256), 256, 0, stream>>>(ab, rows, channels);
+  checkVec(rows, channels, "sparseDotsSwiGLU");
+  const int numVecs = (int)(rows * channels / VEC);
+  if(numVecs > 0)
+    sparseDotsSwiGLUKernel<T><<<numBlocksFor(numVecs, 256), 256, 0, stream>>>(ab, numVecs, channels / VEC, channels);
 }
 
 //------------------------------------------------------------------------------------------------------------------
@@ -215,13 +327,16 @@ constexpr int SPATIAL_RMSNORM_BLOCKS_PER_SEG = 8;
 template <typename T>
 __global__ void sparseDotsSpatialSumSqKernel(const T* in, const int* segStart, int channels, float* sumSqBuf) {
   __shared__ float shared[256];
-  int n = blockIdx.y;
-  long long begin = (long long)segStart[n] * channels;
-  long long end = (long long)segStart[n + 1] * channels;
+  const int n = blockIdx.y;
+  const int begin = segStart[n] * (channels / VEC);
+  const int end = segStart[n + 1] * (channels / VEC);
   float acc = 0.0f;
-  for(long long i = begin + (long long)blockIdx.x * blockDim.x + threadIdx.x; i < end; i += (long long)blockDim.x * gridDim.x) {
-    float v = toFloat(in[i]);
-    acc += v * v;
+  float x[VEC];
+  for(int v = begin + blockIdx.x * blockDim.x + threadIdx.x; v < end; v += blockDim.x * gridDim.x) {
+    loadVec(in + (size_t)v * VEC, x);
+    #pragma unroll
+    for(int j = 0; j < VEC; j++)
+      acc += x[j] * x[j];
   }
   shared[threadIdx.x] = acc;
   __syncthreads();
@@ -236,66 +351,109 @@ __global__ void sparseDotsSpatialSumSqKernel(const T* in, const int* segStart, i
 
 template <typename T>
 __global__ void sparseDotsSpatialApplyKernel(
-  const T* in, T* out, const float* gamma, const float* beta, const int* rowSeg, const int* segStart, int rows, int channels,
-  float epsilon, int activation, const float* sumSqBuf
+  const T* in, T* out, float* outFloat, const float* gamma, const float* beta, const int* rowSeg, const int* segStart,
+  int numVecs, int rowVecs, int channels, float epsilon, int activation, const float* sumSqBuf
 ) {
-  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i >= (long long)rows * channels)
+  const int v = blockIdx.x * blockDim.x + threadIdx.x;
+  if(v >= numVecs)
     return;
-  int r = (int)(i / channels);
-  int c = (int)(i % channels);
-  int n = rowSeg[r];
-  float numTokens = (float)(segStart[n + 1] - segStart[n]);
-  float inv = rsqrtf(sumSqBuf[n] / (numTokens * (float)channels) + epsilon);
-  out[i] = fromFloat<T>(activate(toFloat(in[i]) * inv * gamma[c] + beta[c], activation));
+  const int r = v / rowVecs;
+  const int c = (v - r * rowVecs) * VEC;
+  const int n = rowSeg[r];
+  const float numTokens = (float)(segStart[n + 1] - segStart[n]);
+  const float inv = rsqrtf(sumSqBuf[n] / (numTokens * (float)channels) + epsilon);
+  float x[VEC];
+  loadVec(in + (size_t)v * VEC, x);
+  #pragma unroll
+  for(int j = 0; j < VEC; j++)
+    x[j] = activate(x[j] * inv * gamma[c + j] + beta[c + j], activation);
+  storeVec(out + (size_t)v * VEC, x);
+  if(outFloat != nullptr) {
+    // The FP32 copy has the values rounded like out, as a separate conversion of out would
+    if constexpr(std::is_same<T, half>::value) {
+      #pragma unroll
+      for(int j = 0; j < VEC; j++)
+        x[j] = __half2float(__float2half(x[j]));
+    }
+    storeVec(outFloat + (size_t)v * VEC, x);
+  }
 }
 
 template <typename T>
 void sparseDotsSpatialRMSNorm(
-  const T* in, T* out, const float* gamma, const float* beta, const int* rowSeg, const int* segStart, int numSegs, int rows,
-  int channels, float epsilon, int activation, float* sumSqBuf, cudaStream_t stream
+  const T* in, T* out, float* outFloat, const float* gamma, const float* beta, const int* rowSeg, const int* segStart,
+  int numSegs, int rows, int channels, float epsilon, int activation, float* sumSqBuf, cudaStream_t stream
 ) {
   if(numSegs > 65535)
     throw std::runtime_error("sparseDotsSpatialRMSNorm: too many positions");
+  checkVec(rows, channels, "sparseDotsSpatialRMSNorm");
   if(rows <= 0)
     return;
   cudaMemsetAsync(sumSqBuf, 0, sizeof(float) * numSegs, stream);
   dim3 grid(SPATIAL_RMSNORM_BLOCKS_PER_SEG, numSegs);
   sparseDotsSpatialSumSqKernel<T><<<grid, 256, 0, stream>>>(in, segStart, channels, sumSqBuf);
-  long long n = (long long)rows * channels;
-  sparseDotsSpatialApplyKernel<T><<<numBlocksFor(n, 256), 256, 0, stream>>>(
-    in, out, gamma, beta, rowSeg, segStart, rows, channels, epsilon, activation, sumSqBuf);
+  const int numVecs = (int)((long long)rows * channels / VEC);
+  sparseDotsSpatialApplyKernel<T><<<numBlocksFor(numVecs, 256), 256, 0, stream>>>(
+    in, out, outFloat, gamma, beta, rowSeg, segStart, numVecs, channels / VEC, channels, epsilon, activation, sumSqBuf);
 }
 
 //------------------------------------------------------------------------------------------------------------------
+// RoPE: a thread rotates the VEC / 2 consecutive pairs of a head in one vector
+
+static void checkRope(int rows, int numHeads, int headDim, int rowStride, const char* name) {
+  if(headDim % VEC != 0 || rowStride % VEC != 0)
+    throw std::runtime_error(std::string(name) + ": head dim and row stride must be multiples of 8");
+  if((long long)rows * numHeads * (headDim / VEC) > INT_MAX)
+    throw std::runtime_error(std::string(name) + ": too many rows");
+}
+
+template <typename T>
+__device__ __forceinline__ void sparseDotsRotateVec(T* p, const float* c, const float* s) {
+  float x[VEC];
+  loadVec(p, x);
+  #pragma unroll
+  for(int j = 0; j < VEC / 2; j++) {
+    const float x0 = x[2 * j];
+    const float x1 = x[2 * j + 1];
+    x[2 * j] = x0 * c[j] - x1 * s[j];
+    x[2 * j + 1] = x0 * s[j] + x1 * c[j];
+  }
+  storeVec(p, x);
+}
+
+// The angles of the pairs [firstPair, firstPair + VEC / 2) of kv head kvh at the row position, zero if none
+__device__ __forceinline__ void sparseDotsRopeAngles(
+  const float* rowPos, const float* freqs, int kvh, int numPairs, int firstPair, float* c, float* s
+) {
+  const float* f = freqs + 2 * (kvh * numPairs + firstPair);
+  #pragma unroll
+  for(int j = 0; j < VEC / 2; j++) {
+    if(rowPos[2] != 0.0f) {
+      sincosf(rowPos[0] * f[2 * j] + rowPos[1] * f[2 * j + 1], &s[j], &c[j]);
+    }
+    else {
+      s[j] = 0.0f;
+      c[j] = 0.0f;
+    }
+  }
+}
 
 template <typename T>
 __global__ void sparseDotsApplyRopeKernel(
-  T* x, const float* freqs, const float* pos, int rows, int numHeads, int numKVHeads, int headDim, int rowStride
+  T* x, const float* freqs, const float* pos, int numVecs, int numHeads, int numKVHeads, int headDim, int rowStride
 ) {
-  int numPairs = headDim / 2;
-  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i >= (long long)rows * numHeads * numPairs)
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i >= numVecs)
     return;
-  int p = (int)(i % numPairs);
-  long long rh = i / numPairs;
-  int h = (int)(rh % numHeads);
-  long long r = rh / numHeads;
-  int kvh = h * numKVHeads / numHeads;
-  const float* rowPos = pos + r * 3;
-  T* pair = x + r * rowStride + (long long)h * headDim + 2 * p;
-  if(rowPos[2] == 0.0f) {
-    pair[0] = fromFloat<T>(0.0f);
-    pair[1] = fromFloat<T>(0.0f);
-    return;
-  }
-  const float* f = freqs + 2 * ((long long)kvh * numPairs + p);
-  float s, c;
-  sincosf(rowPos[0] * f[0] + rowPos[1] * f[1], &s, &c);
-  float x0 = toFloat(pair[0]);
-  float x1 = toFloat(pair[1]);
-  pair[0] = fromFloat<T>(x0 * c - x1 * s);
-  pair[1] = fromFloat<T>(x0 * s + x1 * c);
+  const int headVecs = headDim / VEC;
+  const int pv = i % headVecs;
+  const int rh = i / headVecs;
+  const int h = rh % numHeads;
+  const int r = rh / numHeads;
+  float c[VEC / 2], s[VEC / 2];
+  // Rows without a position become zero: c = s = 0
+  sparseDotsRopeAngles(pos + r * 3, freqs, h * numKVHeads / numHeads, headDim / 2, pv * VEC / 2, c, s);
+  sparseDotsRotateVec(x + (size_t)r * rowStride + h * headDim + pv * VEC, c, s);
 }
 
 template <typename T>
@@ -305,41 +463,31 @@ void sparseDotsApplyRope(
 ) {
   if(rows <= 0)
     return;
-  long long n = (long long)rows * numHeads * (headDim / 2);
-  sparseDotsApplyRopeKernel<T><<<numBlocksFor(n, 256), 256, 0, stream>>>(x, freqs, pos, rows, numHeads, numKVHeads, headDim, rowStride);
-}
-
-template <typename T>
-__device__ __forceinline__ void sparseDotsRotatePair(T* pair, float c, float s) {
-  float x0 = toFloat(pair[0]);
-  float x1 = toFloat(pair[1]);
-  pair[0] = fromFloat<T>(x0 * c - x1 * s);
-  pair[1] = fromFloat<T>(x0 * s + x1 * c);
+  checkRope(rows, numHeads, headDim, rowStride, "sparseDotsApplyRope");
+  const int numVecs = rows * numHeads * (headDim / VEC);
+  sparseDotsApplyRopeKernel<T><<<numBlocksFor(numVecs, 256), 256, 0, stream>>>(
+    x, freqs, pos, numVecs, numHeads, numKVHeads, headDim, rowStride);
 }
 
 template <typename T>
 __global__ void sparseDotsApplyRopeQKKernel(
-  T* q, T* k, const float* freqs, const float* pos, int rows, int numHeads, int numKVHeads, int headDim, int qStride,
+  T* q, T* k, const float* freqs, const float* pos, int numVecs, int numHeads, int numKVHeads, int headDim, int qStride,
   int kStride
 ) {
-  int numPairs = headDim / 2;
-  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i >= (long long)rows * numKVHeads * numPairs)
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if(i >= numVecs)
     return;
-  int p = (int)(i % numPairs);
-  long long rh = i / numPairs;
-  int kvh = (int)(rh % numKVHeads);
-  long long r = rh / numKVHeads;
-  const float* rowPos = pos + r * 3;
-  float s = 0.0f, c = 0.0f;
-  if(rowPos[2] != 0.0f) {
-    const float* f = freqs + 2 * ((long long)kvh * numPairs + p);
-    sincosf(rowPos[0] * f[0] + rowPos[1] * f[1], &s, &c);
-  }
-  sparseDotsRotatePair(k + r * kStride + (long long)kvh * headDim + 2 * p, c, s);
-  int rep = numHeads / numKVHeads;
+  const int headVecs = headDim / VEC;
+  const int pv = i % headVecs;
+  const int rh = i / headVecs;
+  const int kvh = rh % numKVHeads;
+  const int r = rh / numKVHeads;
+  float c[VEC / 2], s[VEC / 2];
+  sparseDotsRopeAngles(pos + r * 3, freqs, kvh, headDim / 2, pv * VEC / 2, c, s);
+  sparseDotsRotateVec(k + (size_t)r * kStride + kvh * headDim + pv * VEC, c, s);
+  const int rep = numHeads / numKVHeads;
   for(int j = 0; j < rep; j++)
-    sparseDotsRotatePair(q + r * qStride + (long long)(kvh * rep + j) * headDim + 2 * p, c, s);
+    sparseDotsRotateVec(q + (size_t)r * qStride + (kvh * rep + j) * headDim + pv * VEC, c, s);
 }
 
 template <typename T>
@@ -351,9 +499,11 @@ void sparseDotsApplyRopeQK(
     return;
   if(numHeads % numKVHeads != 0)
     throw std::runtime_error("sparseDotsApplyRopeQK: numHeads must divide by numKVHeads");
-  long long n = (long long)rows * numKVHeads * (headDim / 2);
-  sparseDotsApplyRopeQKKernel<T><<<numBlocksFor(n, 256), 256, 0, stream>>>(
-    q, k, freqs, pos, rows, numHeads, numKVHeads, headDim, qStride, kStride);
+  checkRope(rows, numHeads, headDim, qStride, "sparseDotsApplyRopeQK");
+  checkRope(rows, numKVHeads, headDim, kStride, "sparseDotsApplyRopeQK");
+  const int numVecs = rows * numKVHeads * (headDim / VEC);
+  sparseDotsApplyRopeQKKernel<T><<<numBlocksFor(numVecs, 256), 256, 0, stream>>>(
+    q, k, freqs, pos, numVecs, numHeads, numKVHeads, headDim, qStride, kStride);
 }
 
 //------------------------------------------------------------------------------------------------------------------
@@ -487,26 +637,39 @@ void sparseDotsAttention(
 
 //------------------------------------------------------------------------------------------------------------------
 
+// A block per position and 32 channels, the rows split over POOL_SLICES rows of threads
+constexpr int POOL_SLICES = 8;
+
 __global__ void sparseDotsPoolKernel(
-  const float* x, const int* segStart, const float* boardOffset, float* out, int numSegs, int channels, bool valueHeadMode
+  const float* x, const int* segStart, const float* boardOffset, float* out, int channels, bool valueHeadMode
 ) {
-  long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if(i >= (long long)numSegs * channels)
-    return;
-  int n = (int)(i / channels);
-  int c = (int)(i % channels);
-  float sum = 0.0f;
-  float maxV = -1e30f;
+  __shared__ float partialSum[POOL_SLICES][32];
+  __shared__ float partialMax[POOL_SLICES][32];
+  const int n = blockIdx.y;
+  const int c = blockIdx.x * 32 + threadIdx.x;
   const int begin = segStart[n];
   const int end = segStart[n + 1];
-  for(int r = begin; r < end; r++) {
-    float v = x[(long long)r * channels + c];
-    sum += v;
-    maxV = fmaxf(maxV, v);
+  float sum = 0.0f;
+  float maxV = -1e30f;
+  if(c < channels) {
+    for(int r = begin + threadIdx.y; r < end; r += POOL_SLICES) {
+      const float v = x[(size_t)r * channels + c];
+      sum += v;
+      maxV = fmaxf(maxV, v);
+    }
   }
-  float mean = sum / (float)(end - begin);
-  float off = boardOffset[n];
-  float* o = out + (long long)n * 3 * channels;
+  partialSum[threadIdx.y][threadIdx.x] = sum;
+  partialMax[threadIdx.y][threadIdx.x] = maxV;
+  __syncthreads();
+  if(threadIdx.y != 0 || c >= channels)
+    return;
+  for(int s = 1; s < POOL_SLICES; s++) {
+    sum += partialSum[s][threadIdx.x];
+    maxV = fmaxf(maxV, partialMax[s][threadIdx.x]);
+  }
+  const float mean = sum / (float)(end - begin);
+  const float off = boardOffset[n];
+  float* o = out + (size_t)n * 3 * channels;
   o[c] = mean;
   o[channels + c] = mean * (off / 10.0f);
   o[2 * channels + c] = valueHeadMode ? mean * (off * off / 100.0f - 0.1f) : maxV;
@@ -516,21 +679,70 @@ void sparseDotsPool(
   const float* x, const int* segStart, const float* boardOffset, float* out, int numSegs, int channels, bool valueHeadMode,
   cudaStream_t stream
 ) {
-  long long n = (long long)numSegs * channels;
-  if(n > 0)
-    sparseDotsPoolKernel<<<numBlocksFor(n, 128), 128, 0, stream>>>(x, segStart, boardOffset, out, numSegs, channels, valueHeadMode);
+  if(numSegs > 65535)
+    throw std::runtime_error("sparseDotsPool: too many positions");
+  if(numSegs <= 0)
+    return;
+  dim3 grid((channels + 31) / 32, numSegs);
+  dim3 block(32, POOL_SLICES);
+  sparseDotsPoolKernel<<<grid, block, 0, stream>>>(x, segStart, boardOffset, out, channels, valueHeadMode);
+}
+
+//------------------------------------------------------------------------------------------------------------------
+
+// A block per row and 32 output channels, the sum over the inputs split over SMALL_MATMUL_SLICES rows of threads
+constexpr int SMALL_MATMUL_SLICES = 8;
+
+__global__ void sparseDotsSmallMatMulKernel(
+  const float* in, const float* weight, const float* bias, float* out, int inC, int outC, int activation
+) {
+  __shared__ float partial[SMALL_MATMUL_SLICES][32];
+  const int r = blockIdx.y;
+  const int c = blockIdx.x * 32 + threadIdx.x;
+  float acc = 0.0f;
+  if(c < outC) {
+    for(int k = threadIdx.y; k < inC; k += SMALL_MATMUL_SLICES)
+      acc += in[(size_t)r * inC + k] * weight[(size_t)k * outC + c];
+  }
+  partial[threadIdx.y][threadIdx.x] = acc;
+  __syncthreads();
+  if(threadIdx.y == 0 && c < outC) {
+    float sum = bias != nullptr ? bias[c] : 0.0f;
+    for(int s = 0; s < SMALL_MATMUL_SLICES; s++)
+      sum += partial[s][threadIdx.x];
+    out[(size_t)r * outC + c] = activate(sum, activation);
+  }
+}
+
+void sparseDotsSmallMatMul(
+  const float* in, const float* weight, const float* bias, float* out, int rows, int inC, int outC, int activation,
+  cudaStream_t stream
+) {
+  if(rows > 65535)
+    throw std::runtime_error("sparseDotsSmallMatMul: too many rows");
+  if(rows <= 0)
+    return;
+  dim3 grid((outC + 31) / 32, rows);
+  dim3 block(32, SMALL_MATMUL_SLICES);
+  sparseDotsSmallMatMulKernel<<<grid, block, 0, stream>>>(in, weight, bias, out, inC, outC, activation);
 }
 
 //------------------------------------------------------------------------------------------------------------------
 
 #define SPARSE_DOTS_INSTANTIATE(T) \
+  template void sparseDotsEmbedTokens<T>( \
+    T*, const float*, const float*, const float*, int, const float*, const float*, const float*, int, const int*, \
+    const int*, int, int, cudaStream_t); \
+  template void sparseDotsEmbedQueries<T>( \
+    T*, const float*, const float*, const float*, int, const float*, const float*, const float*, const float*, \
+    const int*, const int*, int, int, cudaStream_t); \
   template void sparseDotsScaleBiasAct<T>(const T*, T*, const float*, const float*, long long, int, int, cudaStream_t); \
   template void sparseDotsBiasAct<T>(T*, const float*, long long, int, int, cudaStream_t); \
   template void sparseDotsRMSNorm<T>(const T*, T*, const float*, long long, int, float, cudaStream_t); \
-  template void sparseDotsResidualAdd<T>(T*, const T*, long long, int, cudaStream_t); \
   template void sparseDotsSwiGLU<T>(T*, long long, int, cudaStream_t); \
   template void sparseDotsSpatialRMSNorm<T>( \
-    const T*, T*, const float*, const float*, const int*, const int*, int, int, int, float, int, float*, cudaStream_t); \
+    const T*, T*, float*, const float*, const float*, const int*, const int*, int, int, int, float, int, float*, \
+    cudaStream_t); \
   template void sparseDotsApplyRope<T>(T*, const float*, const float*, int, int, int, int, int, cudaStream_t); \
   template void sparseDotsApplyRopeQK<T>(T*, T*, const float*, const float*, int, int, int, int, int, int, cudaStream_t); \
   template void sparseDotsAttention<T>( \
